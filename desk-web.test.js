@@ -55,6 +55,9 @@ import setup, {
 } from "./desk-web/index.js";
 import {
     addDays,
+    agentCostCard,
+    agentCostNote,
+    agentCostRows,
     barLayout,
     cellText,
     COLUMNS,
@@ -4091,4 +4094,115 @@ test("the Subscriptions card: a gauge with its label for fresh, the state text f
     );
     assert.equal((out.match(/<meter /g) ?? []).length, 1, "only the fresh row has a gauge");
     assert.match(out, /Account-wide: the filters do not apply\./);
+});
+
+// ─── The Cost by agent card ─────────────────────────────────────────────────
+
+/** 1 cost row's totals: the fields the card reads, and 0 for the rest. */
+const agentTotals = (cost, patch = {}) => ({
+    cost,
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    entries: 0,
+    unknownCost: 0,
+    ...patch,
+});
+
+const AGENTS = {
+    at: METER_AT,
+    partial: true,
+    pending: 2,
+    rows: [
+        {
+            kind: "agent",
+            agent: "odrade",
+            label: "Odrade",
+            sessions: 3,
+            today: agentTotals(11.5, { entries: 3 }),
+            days7: agentTotals(2263.4, {
+                input: 1_200_000,
+                output: 34_000,
+                entries: 40,
+            }),
+            providers: [
+                {
+                    provider: "openai",
+                    today: agentTotals(0),
+                    days7: agentTotals(3.1),
+                    models: [{ model: "gpt-5", today: agentTotals(0), days7: agentTotals(3.1) }],
+                },
+                {
+                    provider: "anthropic",
+                    today: agentTotals(11.5),
+                    days7: agentTotals(12.34),
+                    models: [
+                        {
+                            model: "claude-opus-5-5",
+                            today: agentTotals(11.5),
+                            days7: agentTotals(12.34),
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            kind: "unattributed",
+            label: "Unattributed",
+            sessions: 1,
+            today: agentTotals(0),
+            days7: agentTotals(0.004, { entries: 1 }),
+            providers: [],
+        },
+    ],
+};
+
+test("agentCostRows: money below and above $100, compact tokens, the providers and their models", () => {
+    const [odrade, unattributed] = agentCostRows(AGENTS);
+
+    assert.equal(odrade.today, "$11.50");
+    assert.equal(odrade.days7, "$2,263");
+    assert.equal(odrade.tokens, "1.2M / 34k");
+    assert.equal(odrade.providers, "openai $3.10 · anthropic $12.34");
+    assert.equal(odrade.providersTitle, "openai: gpt-5 $3.10 · anthropic: claude-opus-5-5 $12.34");
+    assert.equal(odrade.label, "Odrade");
+    assert.equal(odrade.kind, "agent");
+    assert.equal(unattributed.label, "Unattributed");
+    assert.equal(unattributed.days7, "$0.00");
+    assert.equal(unattributed.tokens, "0 / 0");
+
+    // A missing or bad value gives no rows.
+    assert.deepEqual(agentCostRows(undefined), []);
+    assert.deepEqual(agentCostRows(null), []);
+    assert.deepEqual(agentCostRows({ at: 1 }), []);
+    assert.deepEqual(agentCostRows({ rows: "no" }), []);
+
+    // The note names the ledger's coverage and the conversations that wait for an agent.
+    assert.match(
+        agentCostNote(AGENTS),
+        /to the hour\. \(partial\) 2 conversations not attributed yet\.$/,
+    );
+    assert.match(agentCostNote({ ...AGENTS, pending: 1 }), / 1 conversation not attributed yet\.$/);
+    assert.match(agentCostNote({ ...AGENTS, pending: 0, partial: false }), /to the hour\.$/);
+});
+
+test("the Cost by agent card: the table with its columns, the rows and the note", () => {
+    const out = agentCostCard(html, AGENTS).replace(/\s+/g, " ");
+
+    assert.match(out, /<article class="dash-card dash-agent-cost" aria-labelledby="dash-agents">/);
+    assert.match(out, /<h3 id="dash-agents">Cost by agent<\/h3>/);
+    assert.match(out, /<table class="dash-table dash-agents">/);
+
+    for (const column of ["Agent", "Today", "7 days", "Tokens in / out", "Providers"]) {
+        assert.ok(out.includes(`<th scope="col">${column}</th>`), column);
+    }
+
+    assert.match(
+        out,
+        /<tr data-kind=agent> <td class="dash-name" data-label="Agent">Odrade<\/td> <td data-label="Today">\$11\.50<\/td> <td data-label="7 days">\$2,263<\/td> <td data-label="Tokens in \/ out">1\.2M \/ 34k<\/td> <td data-label="Providers" title=openai: gpt-5 \$3\.10 · anthropic: claude-opus-5-5 \$12\.34> openai \$3\.10 · anthropic \$12\.34 <\/td> <\/tr>/,
+    );
+    assert.match(out, /<tr data-kind=unattributed> .*?Unattributed.*?<\/tr>/);
+    assert.match(out, /List price of each agent's answers, from the meter's ledger\./);
+    assert.match(out, /to the hour\. \(partial\) 2 conversations not attributed yet\./);
 });

@@ -43,6 +43,15 @@ const BURN_MIN_SPAN_MS = 60 * MINUTE_MS;
 /** A drop of at least this many points at the same `resetsAt` is a reset. */
 const RESET_DROP = 5;
 
+/** How long a session with no agent waits before the meter asks who it is again: 1 hour. */
+export const AGENT_RETRY_MS = HOUR_MS;
+
+/** The most persona reads in 1 attribution call. */
+export const AGENT_READS = 200;
+
+/** The most creator steps from a conversation to its root session. */
+export const OWNER_DEPTH = 32;
+
 export type MeterSettings = {
     providers: "anthropic"[];
     pollMinutes: number;
@@ -457,6 +466,8 @@ export type LedgerUsage = {
     cacheWrite: number;
     /** List price; absent when unknown. */
     cost?: number;
+    /** The conversation of the answer: the cost by agent reads it. */
+    conversation?: number;
 };
 
 /** 1 provider reading's percent, for the burn. */
@@ -496,6 +507,11 @@ export type MeterState = {
     providers: Record<string, ProviderMeter>;
     /** Bucket start (epoch ms, as a string) → provider → model → bucket. */
     buckets: Record<string, Record<string, Record<string, Bucket>>>;
+    /**
+     * Hour start (epoch ms, UTC, as a string) → conversation id → provider → model → bucket: the ledger's counters
+     * again, for each conversation, for the cost by agent.
+     */
+    conversations: Record<string, Record<string, Record<string, Record<string, Bucket>>>>;
     /** Ledger entries with no timestamp. */
     skipped: number;
     /** How far the ledger's backfill came: the caller writes it. */
@@ -514,6 +530,7 @@ export function emptyMeterState(): MeterState {
     return {
         providers: dict(),
         buckets: dict(),
+        conversations: dict(),
         skipped: 0,
         coverage: { complete: false, done: 0, total: 0 },
     };
@@ -632,20 +649,8 @@ function finiteOr0(value: number): number {
     return Number.isFinite(value) ? value : 0;
 }
 
-/** Adds 1 ledger entry to its 5-minute bucket; an entry with no timestamp counts only in `skipped`. */
-export function addLedger(state: MeterState, usage: LedgerUsage): void {
-    const timestamp = usage.timestamp;
-
-    if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
-        state.skipped += 1;
-
-        return;
-    }
-
-    const start = String(Math.floor(timestamp / BUCKET_MS) * BUCKET_MS);
-    const byProvider = (state.buckets[start] ??= dict());
-    const byModel = (byProvider[usage.provider] ??= dict());
-    const bucket = (byModel[usage.model] ??= {
+function emptyBucket(): Bucket {
+    return {
         entries: 0,
         input: 0,
         output: 0,
@@ -653,8 +658,11 @@ export function addLedger(state: MeterState, usage: LedgerUsage): void {
         cacheWrite: 0,
         cost: 0,
         unknownCost: 0,
-    });
+    };
+}
 
+/** Adds 1 entry's counters to a bucket: the tokens always, the cost only when it is a finite number of 0 or more. */
+function addBucket(bucket: Bucket, usage: LedgerUsage): void {
     bucket.entries += 1;
     bucket.input += finiteOr0(usage.input);
     bucket.output += finiteOr0(usage.output);
@@ -668,11 +676,55 @@ export function addLedger(state: MeterState, usage: LedgerUsage): void {
     }
 }
 
-/** Drops buckets older than 8 days, and samples and reset marks older than 24 hours. */
+/**
+ * Adds 1 ledger entry to its 5-minute bucket, and to its conversation's hour; an entry with no timestamp counts only in
+ * `skipped`, and an entry with no valid conversation counts in its bucket only.
+ */
+export function addLedger(state: MeterState, usage: LedgerUsage): void {
+    const timestamp = usage.timestamp;
+
+    if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
+        state.skipped += 1;
+
+        return;
+    }
+
+    const start = String(Math.floor(timestamp / BUCKET_MS) * BUCKET_MS);
+    const byProvider = (state.buckets[start] ??= dict());
+    const byModel = (byProvider[usage.provider] ??= dict());
+    const bucket = (byModel[usage.model] ??= emptyBucket());
+
+    addBucket(bucket, usage);
+
+    const conversation = usage.conversation;
+
+    if (
+        typeof conversation !== "number" ||
+        !Number.isSafeInteger(conversation) ||
+        conversation <= 0
+    ) {
+        return;
+    }
+
+    const hour = String(Math.floor(timestamp / HOUR_MS) * HOUR_MS);
+    const byConversation = (state.conversations[hour] ??= dict());
+    const ownProviders = (byConversation[String(conversation)] ??= dict());
+    const ownModels = (ownProviders[usage.provider] ??= dict());
+
+    addBucket((ownModels[usage.model] ??= emptyBucket()), usage);
+}
+
+/** Drops buckets and conversation hours older than 8 days, and samples and reset marks older than 24 hours. */
 export function pruneMeter(state: MeterState, now: number): void {
     for (const start of Object.keys(state.buckets)) {
         if (Number(start) < now - BUCKET_KEEP_MS) {
             delete state.buckets[start];
+        }
+    }
+
+    for (const hour of Object.keys(state.conversations)) {
+        if (Number(hour) < now - BUCKET_KEEP_MS) {
+            delete state.conversations[hour];
         }
     }
 
@@ -1404,4 +1456,450 @@ export function holdReason(
     }
 
     return reasons.length > 0 ? reasons.join("; ") : undefined;
+}
+
+// ─── The cost by agent ──────────────────────────────────────────────────────
+
+/**
+ * Who answered in 1 conversation, as the rollup counts it: an agent (`via` says how the meter found it), a session
+ * that the meter read and found no agent for, or a conversation whose agent is not known yet.
+ */
+export type AgentAttribution =
+    | { kind: "agent"; agent: string; via: "identity" | "desk" | "linked"; session: number }
+    | { kind: "unattributed"; session: number }
+    | { kind: "pending" };
+
+/** What a session resolved to, cached in the meter's memory by session id. */
+export type SessionAgent = {
+    agent?: string;
+    via?: "identity" | "desk" | "linked";
+    at: number;
+};
+
+export type AgentLinks = {
+    /** Conversation → the conversation that created it (a subagent's parent); null: a session (no creator). Absent: unknown. */
+    owners: ReadonlyMap<number, number | null>;
+    /** Session → the roster id the Desk links it to. */
+    desk: ReadonlyMap<number, string>;
+    /** Session → the session that started it (Pi Pocket's `linkedFrom`). */
+    linkedFrom: ReadonlyMap<number, number>;
+};
+
+export type AgentResolver = {
+    /** The roster id of the session's identity (Team's persona), or undefined. May throw. */
+    persona: (session: number) => Promise<string | undefined>;
+    links: AgentLinks;
+    cache: Map<number, SessionAgent>;
+    now: number;
+    maxReads: number;
+};
+
+/** What 1 session's read answered: an agent and how it was found, none, or a read that must wait. */
+type SessionAnswer =
+    { agent: string; via: "identity" | "desk" | "linked" } | { agent?: undefined } | "pending";
+
+function codeUnitOrder(a: string, b: string): number {
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** The conversation ids with a bucket whose hour start is >= now - 7 days, sorted ascending. */
+export function rollupConversations(state: MeterState, now: number): number[] {
+    const since = now - 7 * DAY_MS;
+    const ids = new Set<number>();
+
+    for (const [hour, byConversation] of Object.entries(state.conversations)) {
+        if (!(Number(hour) >= since)) {
+            continue;
+        }
+
+        for (const key of Object.keys(byConversation)) {
+            const id = Number(key);
+
+            if (Number.isSafeInteger(id) && id > 0) {
+                ids.add(id);
+            }
+        }
+    }
+
+    return [...ids].sort((a, b) => a - b);
+}
+
+/**
+ * Who answered in each of `ids` (plan: the cost by agent). The root of a conversation is the session its creator chain
+ * ends at: a subagent counts to the session that started it, and a conversation whose creator is not read yet is
+ * pending. A root session's agent is Team's identity, else the Desk's link, else the session that started it; the
+ * session that the last of those says nothing for is unattributed. 1 persona read is spent for each session that the
+ * cache does not answer, at most `maxReads` in a call, and each session resolves once in a call.
+ */
+export async function attributeConversations(
+    ids: Iterable<number>,
+    resolver: AgentResolver,
+): Promise<Map<number, AgentAttribution>> {
+    const found = new Map<number, AgentAttribution>();
+    /** What each session answered in this call, so a call resolves each session once. */
+    const asked = new Map<number, SessionAnswer>();
+    let reads = 0;
+
+    /** The root session of a conversation: its id, a creator that is not read yet, or a cycle that has no root. */
+    const rootOf = (id: number): number | { kind: "pending" } | { kind: "unattributed" } => {
+        let at = id;
+        let steps = 0;
+        const walked = new Set<number>();
+
+        for (;;) {
+            if (!resolver.links.owners.has(at)) {
+                return { kind: "pending" };
+            }
+
+            const owner = resolver.links.owners.get(at) ?? null;
+
+            if (owner === null) {
+                return at;
+            }
+
+            // A cycle, and a chain deeper than the limit, has no root session: the conversation stays unattributed.
+            if (walked.has(at) || steps >= OWNER_DEPTH) {
+                return { kind: "unattributed" };
+            }
+
+            walked.add(at);
+            steps += 1;
+            at = owner;
+        }
+    };
+
+    const resolveSession = async (
+        session: number,
+        chain: ReadonlySet<number>,
+    ): Promise<SessionAnswer> => {
+        const memo = asked.get(session);
+
+        if (memo !== undefined) {
+            return memo;
+        }
+
+        const cached = resolver.cache.get(session);
+
+        // An agent is kept; a session with none is read again only after AGENT_RETRY_MS.
+        if (
+            cached !== undefined &&
+            (cached.agent !== undefined || resolver.now - cached.at < AGENT_RETRY_MS)
+        ) {
+            const answer: SessionAnswer =
+                cached.agent === undefined
+                    ? {}
+                    : { agent: cached.agent, via: cached.via ?? "identity" };
+
+            asked.set(session, answer);
+
+            return answer;
+        }
+
+        if (reads >= resolver.maxReads) {
+            asked.set(session, "pending");
+
+            return "pending";
+        }
+
+        reads += 1;
+
+        const seen = new Set(chain);
+
+        seen.add(session);
+
+        let identity: string | undefined;
+
+        try {
+            identity = await resolver.persona(session);
+        } catch {
+            asked.set(session, "pending");
+
+            return "pending";
+        }
+
+        const keep = (value: SessionAgent, answer: SessionAnswer): SessionAnswer => {
+            resolver.cache.set(session, value);
+            asked.set(session, answer);
+
+            return answer;
+        };
+
+        if (typeof identity === "string" && identity !== "") {
+            return keep(
+                { agent: identity, via: "identity", at: resolver.now },
+                { agent: identity, via: "identity" },
+            );
+        }
+
+        const linked = resolver.links.desk.get(session);
+
+        if (linked !== undefined) {
+            return keep(
+                { agent: linked, via: "desk", at: resolver.now },
+                { agent: linked, via: "desk" },
+            );
+        }
+
+        const source = resolver.links.linkedFrom.get(session);
+
+        if (source !== undefined && !seen.has(source)) {
+            const answer = await resolveSession(source, seen);
+
+            // A pending source is not cached: the next call reads the chain again.
+            if (answer === "pending") {
+                asked.set(session, "pending");
+
+                return "pending";
+            }
+
+            if (answer.agent !== undefined) {
+                return keep(
+                    { agent: answer.agent, via: "linked", at: resolver.now },
+                    { agent: answer.agent, via: "linked" },
+                );
+            }
+        }
+
+        return keep({ at: resolver.now }, {});
+    };
+
+    for (const id of new Set(ids)) {
+        const root = rootOf(id);
+
+        if (typeof root !== "number") {
+            found.set(
+                id,
+                root.kind === "pending"
+                    ? { kind: "pending" }
+                    : { kind: "unattributed", session: id },
+            );
+
+            continue;
+        }
+
+        const answer = await resolveSession(root, new Set());
+
+        if (answer === "pending") {
+            found.set(id, { kind: "pending" });
+        } else if (answer.agent === undefined) {
+            found.set(id, { kind: "unattributed", session: root });
+        } else {
+            found.set(id, { kind: "agent", agent: answer.agent, via: answer.via, session: root });
+        }
+    }
+
+    return found;
+}
+
+export type AgentCostTotals = {
+    cost: number;
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    entries: number;
+    unknownCost: number;
+};
+
+export type AgentCostModel = {
+    model: string;
+    today: AgentCostTotals;
+    days7: AgentCostTotals;
+};
+
+export type AgentCostProvider = {
+    provider: string;
+    today: AgentCostTotals;
+    days7: AgentCostTotals;
+    models: AgentCostModel[];
+};
+
+export type AgentCostRow = {
+    kind: "agent" | "unattributed" | "pending";
+    /** The roster id: only for kind "agent". */
+    agent?: string;
+    /** The roster name, else the id; "Unattributed"; "Not attributed yet". */
+    label: string;
+    /** Distinct root sessions with usage in the last 7 days; for "pending", the conversations. */
+    sessions: number;
+    today: AgentCostTotals;
+    days7: AgentCostTotals;
+    providers: AgentCostProvider[];
+};
+
+export type AgentCostView = {
+    at: number;
+    /** The ledger does not cover 7 days yet: the same rule as `ledgerView`'s `partial`. */
+    partial: boolean;
+    /** Conversations with usage in the last 7 days whose agent is not known yet. */
+    pending: number;
+    rows: AgentCostRow[];
+};
+
+type Totals = { today: AgentCostTotals; days7: AgentCostTotals };
+
+type AgentAccumulated = {
+    kind: "agent" | "unattributed" | "pending";
+    agent?: string;
+    label: string;
+    totals: Totals;
+    /** The root sessions with usage in the last 7 days. */
+    sessions: Set<number>;
+    /** The conversations of a pending row: its count. */
+    conversations: Set<number>;
+    providers: Record<
+        string,
+        { today: AgentCostTotals; days7: AgentCostTotals; models: Record<string, Totals> }
+    >;
+};
+
+function noTotals(): AgentCostTotals {
+    return {
+        cost: 0,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        entries: 0,
+        unknownCost: 0,
+    };
+}
+
+function sumInto(total: AgentCostTotals, bucket: Bucket): void {
+    total.cost += bucket.cost;
+    total.input += bucket.input;
+    total.output += bucket.output;
+    total.cacheRead += bucket.cacheRead;
+    total.cacheWrite += bucket.cacheWrite;
+    total.entries += bucket.entries;
+    total.unknownCost += bucket.unknownCost;
+}
+
+/**
+ * The meter's ledger at list price, by agent (plan: the cost by agent): today since local midnight in `zone`, and the
+ * last 7 days to the hour. A conversation with no attribution in the map is pending. The rows hold only what has usage
+ * in the last 7 days, the highest cost first; the providers and their models follow the same order.
+ */
+export function agentCostView(
+    state: MeterState,
+    attributions: ReadonlyMap<number, AgentAttribution>,
+    names: ReadonlyMap<string, string>,
+    now: number,
+    zone: string,
+): AgentCostView {
+    const midnight = localMidnight(now, zone);
+    const since = now - 7 * DAY_MS;
+    const rows = dict<AgentAccumulated>();
+    let pending = 0;
+
+    for (const [hour, byConversation] of Object.entries(state.conversations)) {
+        const start = Number(hour);
+
+        if (!(start >= since)) {
+            continue;
+        }
+
+        const today = start >= midnight;
+
+        for (const [key, byProvider] of Object.entries(byConversation)) {
+            const id = Number(key);
+            const attribution: AgentAttribution = attributions.get(id) ?? { kind: "pending" };
+            const label =
+                attribution.kind === "agent"
+                    ? (names.get(attribution.agent) ?? attribution.agent)
+                    : attribution.kind === "unattributed"
+                      ? "Unattributed"
+                      : "Not attributed yet";
+            const rowKey =
+                attribution.kind === "agent" ? `agent:${attribution.agent}` : attribution.kind;
+            const row = (rows[rowKey] ??= {
+                kind: attribution.kind,
+                ...(attribution.kind === "agent" ? { agent: attribution.agent } : {}),
+                label,
+                totals: { today: noTotals(), days7: noTotals() },
+                sessions: new Set<number>(),
+                conversations: new Set<number>(),
+                providers: dict(),
+            });
+
+            if (attribution.kind === "pending") {
+                if (!row.conversations.has(id)) {
+                    row.conversations.add(id);
+                    pending += 1;
+                }
+            } else if (!row.sessions.has(attribution.session)) {
+                row.sessions.add(attribution.session);
+            }
+
+            for (const [provider, byModel] of Object.entries(byProvider)) {
+                const one = (row.providers[provider] ??= {
+                    today: noTotals(),
+                    days7: noTotals(),
+                    models: dict(),
+                });
+
+                for (const [model, bucket] of Object.entries(byModel)) {
+                    const each = (one.models[model] ??= {
+                        today: noTotals(),
+                        days7: noTotals(),
+                    });
+
+                    sumInto(row.totals.days7, bucket);
+                    sumInto(one.days7, bucket);
+                    sumInto(each.days7, bucket);
+
+                    if (today) {
+                        sumInto(row.totals.today, bucket);
+                        sumInto(one.today, bucket);
+                        sumInto(each.today, bucket);
+                    }
+                }
+            }
+        }
+    }
+
+    const view: AgentCostRow[] = [];
+
+    for (const row of Object.values(rows)) {
+        if (row.totals.days7.entries <= 0) {
+            continue;
+        }
+
+        const providers: AgentCostProvider[] = Object.entries(row.providers)
+            .map(([provider, one]) => ({
+                provider,
+                today: one.today,
+                days7: one.days7,
+                models: Object.entries(one.models)
+                    .map(([model, each]) => ({ model, today: each.today, days7: each.days7 }))
+                    .sort((a, b) => b.days7.cost - a.days7.cost || codeUnitOrder(a.model, b.model)),
+            }))
+            .sort((a, b) => b.days7.cost - a.days7.cost || codeUnitOrder(a.provider, b.provider));
+
+        view.push({
+            kind: row.kind,
+            ...(row.agent === undefined ? {} : { agent: row.agent }),
+            label: row.label,
+            sessions: row.kind === "pending" ? row.conversations.size : row.sessions.size,
+            today: row.totals.today,
+            days7: row.totals.days7,
+            providers,
+        });
+    }
+
+    view.sort(
+        (a, b) =>
+            b.days7.cost - a.days7.cost ||
+            b.today.cost - a.today.cost ||
+            codeUnitOrder(a.label, b.label),
+    );
+
+    const coverage = state.coverage;
+
+    return {
+        at: now,
+        partial: !coverage.complete || coverage.since === undefined || coverage.since > since,
+        pending,
+        rows: view,
+    };
 }

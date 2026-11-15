@@ -299,6 +299,7 @@ import {
     liveSupervisors,
     mergeReceiptText,
     MERGE_RECEIPT_KEEP_MS,
+    METER_HOLDER_VERSION,
     receiptSupervisors,
     recordMergeReceipt,
     REPORTS_OFF_TASK_STALE_MS,
@@ -26542,7 +26543,7 @@ describe("the desk in a Pi Pocket", () => {
 
                 assert(!("error" in reading));
                 recordAttempt(state, "anthropic", at, reading);
-                shared[holderKey] = { version: 1, state };
+                shared[holderKey] = { version: METER_HOLDER_VERSION, state };
 
                 return state;
             };

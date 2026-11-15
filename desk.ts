@@ -20176,16 +20176,18 @@ const METER_HOLDER = Symbol.for("pi-pocket-team.desk.meter");
  */
 export const METER_IO = Symbol.for("pi-pocket-team.desk.meter-io");
 /** The holder's shape version: a reload with another version starts the meter's memory again. */
-export const METER_HOLDER_VERSION = 1;
+export const METER_HOLDER_VERSION = 2;
 
 /**
- * The meter's memory: the provider readings and the ledger (`state`), and where the ledger's reads are (`ledger`).
- * Both are absent while the meter is off. It is not stored: a restart of the server starts it again.
+ * The meter's memory: the provider readings and the ledger (`state`), where the ledger's reads are (`ledger`), and what
+ * each session resolved to for the cost by agent (`agents`). All are absent while the meter is off. It is not stored: a
+ * restart of the server starts it again.
  */
 export type MeterHolder = {
     version: number;
     state?: MeterModule.MeterState;
     ledger?: DashboardModule.MeterLedger;
+    agents?: Map<number, MeterModule.SessionAgent>;
 };
 
 /**
@@ -20232,6 +20234,49 @@ export function meterHolder(): MeterHolder {
     shared[METER_HOLDER] = fresh;
 
     return fresh;
+}
+
+/**
+ * Pi Pocket's own session catalogue (`src/server/docs.ts`, `SessionsDoc`): the same stored kind, read only, never
+ * written here. A kind is stored data in Pi Pocket, so this copy keeps its kind, version, scope and checkpoint rule;
+ * `desk-metrics.test.ts` proves the read against the real Pi Pocket. The cost by agent reads each session's
+ * `linkedFrom` (the session that started it) and nothing else.
+ */
+const PocketSessions = defineDoc<{ items: Record<string, { linkedFrom?: { id: number } }> }>({
+    kind: "pocket.sessions",
+    version: 1,
+    scope: "session",
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ items: {} }),
+});
+
+/**
+ * The sessions that Pi Pocket's catalogue says another session started: each key that is a positive safe integer with
+ * a `linkedFrom.id` that is one too. Anything malformed is skipped.
+ */
+export function linkedFromOf(doc: unknown): Map<number, number> {
+    const found = new Map<number, number>();
+    const items = (doc as { items?: unknown } | undefined)?.items;
+
+    if (items === null || typeof items !== "object") {
+        return found;
+    }
+
+    for (const [key, value] of Object.entries(items as Record<string, unknown>)) {
+        const id = Number(key);
+
+        if (!Number.isSafeInteger(id) || id <= 0) {
+            continue;
+        }
+
+        const from = (value as { linkedFrom?: { id?: unknown } } | null)?.linkedFrom?.id;
+
+        if (typeof from === "number" && Number.isSafeInteger(from) && from > 0) {
+            found.set(id, from);
+        }
+    }
+
+    return found;
 }
 
 /**
@@ -22503,6 +22548,58 @@ export function deskSupervisors(state: DeskState | undefined): number[] {
     }
 
     return [...ids].sort((a, b) => a - b);
+}
+
+/**
+ * The sessions that the Desk links to an agent: a thread's session whose thread has exactly 1 agent, a plan consult's
+ * session, and a Clerk's session. A session that 2 different agents claim gets no entry. The cost by agent reads it,
+ * after Team's identity and before the session that started the session.
+ */
+export function deskAgentSessions(state: DeskState | undefined): Map<number, string> {
+    const claimed = new Map<number, string>();
+    const disputed = new Set<number>();
+
+    const claim = (session: unknown, agent: unknown): void => {
+        if (typeof session !== "number" || !Number.isSafeInteger(session) || session <= 0) {
+            return;
+        }
+
+        if (typeof agent !== "string" || agent === "") {
+            return;
+        }
+
+        const seen = claimed.get(session);
+
+        if (seen !== undefined && seen !== agent) {
+            disputed.add(session);
+
+            return;
+        }
+
+        claimed.set(session, agent);
+    };
+
+    for (const thread of Object.values(state?.threads ?? {})) {
+        if (Array.isArray(thread.agents) && thread.agents.length === 1) {
+            claim(thread.session, thread.agents[0]);
+        }
+    }
+
+    for (const plan of Object.values(state?.plans ?? {})) {
+        for (const consult of plan.consults ?? []) {
+            claim(consult.session, consult.agent);
+        }
+    }
+
+    for (const clerk of Object.values(state?.clerks ?? {})) {
+        claim(clerk.session, clerk.agent);
+    }
+
+    for (const session of disputed) {
+        claimed.delete(session);
+    }
+
+    return claimed;
 }
 
 /**
@@ -26829,6 +26926,7 @@ export default function createDesk(host: Host, web: Web) {
             if (drop) {
                 delete holder.state;
                 delete holder.ledger;
+                delete holder.agents;
             }
 
             return undefined;
@@ -26843,6 +26941,58 @@ export default function createDesk(host: Host, web: Web) {
     /** The meter's view at `now`, in the server's zone (plan S5). */
     const meterViewOf = (on: MeterOn, now: number): MeterModule.MeterView =>
         meterRules.meterView(on.state, on.settings, now, serverZone());
+
+    /**
+     * The cost of each agent's answers at list price (`_desk-meter.ts`'s `agentCostView`): the ledger's per-conversation
+     * hours, attributed to the agent of each conversation's root session. A subagent counts to the session that started
+     * it, and a linked session to the agent of the session that started it. Nothing is stored: the cache of each
+     * session's agent lives in the meter's memory, so a restart starts it again and the 8-day backfill fills it again.
+     * A failed read of the thread document throws, and the caller leaves the field out; a failed read of the catalogue
+     * or of the roster gives no link and no name.
+     */
+    const agentCostOf = async (
+        on: MeterOn,
+        request: WebRequest,
+        now: number,
+    ): Promise<MeterModule.AgentCostView> => {
+        const zone = serverZone();
+        const ids = meterRules.rollupConversations(on.state, now);
+
+        if (ids.length === 0) {
+            return meterRules.agentCostView(on.state, new Map(), new Map(), now, zone);
+        }
+
+        const state = await accessOfRequest(request).read();
+        const catalogue = await request
+            .snapshot(PocketSessions, request.context)
+            .catch(() => undefined);
+        const team = teamApi();
+        const roster = team === undefined ? undefined : await team.roster().catch(() => undefined);
+        const names = new Map<string, string>();
+
+        for (const member of roster ?? []) {
+            names.set(member.id, member.name);
+        }
+
+        const read = request as unknown as DocumentReader;
+        const resolver: MeterModule.AgentResolver = {
+            persona: async (session) =>
+                team === undefined
+                    ? undefined
+                    : (await team.persona(read, session as ConversationId, request.context))?.id,
+            links: {
+                owners: on.ledger.owners,
+                desk: deskAgentSessions(state),
+                linkedFrom: linkedFromOf(catalogue),
+            },
+            cache: (meterHolder().agents ??= new Map()),
+            now,
+            maxReads: meterRules.AGENT_READS,
+        };
+        const attributions = await meterRules.attributeConversations(ids, resolver);
+
+        return meterRules.agentCostView(on.state, attributions, names, now, zone);
+    };
 
     /** Pi's model runtime for the meter's token: made once, and made again after a failure. */
     let meterModels: Promise<import("@earendil-works/pi-coding-agent").ModelRuntime> | undefined;
@@ -32024,12 +32174,22 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             // The subscription meter's view (plan S4), only when it is on: no field at all when it is off. It holds no
-            // token and no header.
+            // token and no header. The cost by agent (`agents`) comes beside it, from the same memory.
             const metered = await meterOn();
 
-            return metered === undefined
-                ? answer
-                : { ...answer, meter: meterViewOf(metered, Date.now()) };
+            if (metered === undefined) {
+                return answer;
+            }
+
+            const now = Date.now();
+            const view = { ...answer, meter: meterViewOf(metered, now) };
+
+            try {
+                return { ...view, agents: await agentCostOf(metered, request, now) };
+            } catch {
+                // A rollup that cannot be read leaves its field out: the rest of the answer stays.
+                return view;
+            }
         },
         { access: "owner" },
     );

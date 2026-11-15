@@ -44,6 +44,7 @@ phone one shows the bketelsen owner row with partial tokens, an unknown cost ("�
     - The source: a partial usage source, and a failed one after a good read, keep their collected facts, with a notice
       that they can be low.
 - **Subscriptions**, above the other cards, only when the answer has `meter` ([The Subscriptions card](#the-subscriptions-card)).
+- **Cost by agent**, right after the Subscriptions card, only when the answer has `agents` ([The Cost by agent card](#the-cost-by-agent-card)).
 - **Cards**, in this order: thread completion rate, successful closures and velocity, thread cycle time, time to solve,
   current workload ("now"), tracked PRs, dated tokens, reported model cost (USD). Each card has "How is this counted?".
 - **Daily trend.** The successful closures by UTC day, as bars (each with its text for screen readers), with a summary
@@ -89,6 +90,28 @@ report (<reason>)" (none). Then the server's `line` (its times are in the server
 projection and the other windows), the granted resets ("resets granted: Weekly ×2 (first expires in 26d)", or "grants:
 not readable (surface)"), and the ledger ("list price: $70 last hour, $228 today, $2,263 in 7 days (partial); top: …").
 The card is account-wide: the range and scope filters do not apply to it. On a narrow screen the rows stack.
+
+## The Cost by agent card
+
+With the meter on, the answer of `GET dashboard` also has `agents` (the `AgentCostView` of `_desk-meter.ts`; its rules
+are in [modules/desk.md](modules/desk.md)): `at`, `partial` when the ledger does not cover 7 days yet, `pending` (the
+conversations with usage in the last 7 days whose agent is not known yet), and `rows`. A row is 1 agent, or the
+unattributed answers, or the ones not attributed yet: `kind`, `agent` (the roster id, only for an agent), `label` (the
+roster's name, else the id, "Unattributed", or "Not attributed yet"), `sessions` (the root sessions with usage in the last
+7 days, or the conversations of a pending row), `today` and `days7` (cost, input, output, cache reads, cache writes,
+answers, and the answers with no cost), and `providers`, each with the same 2 periods and its `models`. The rows come
+highest 7-day cost first; the providers and their models follow the same order. With the meter off, the answer has
+neither field.
+
+The card (`agentCostCard`, `agentCostRows` and `agentCostNote` in `desk-web/dashboard.js`) shows the table "Cost by
+agent": the label, today's cost, the 7-day cost, the 7-day tokens in (input plus cached input and cached writes) over the tokens
+out, in compact words ("1.2M / 34k"), and the 7-day cost of each provider ("anthropic $12.34 · openai $3.10"), with each
+provider's models in the cell's title. Money has 2 decimals below $100 and whole dollars with thousands above that
+("$3.10", "$1,234"). Under the table a note says that these are list prices from the meter's ledger, that subagents and
+linked sessions count to the agent of the session that started them, and that today runs from local midnight in the
+server's zone while 7 days run to the hour; it adds "(partial)" while the ledger does not cover 7 days, and the count of
+conversations not attributed yet. Like the Subscriptions card, it is account-wide: the range and scope filters do not
+apply to it. On a phone each row is a small card.
 
 ## The drill-down route
 

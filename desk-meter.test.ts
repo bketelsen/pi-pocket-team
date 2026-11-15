@@ -7,11 +7,19 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
     addLedger,
+    AGENT_READS,
+    AGENT_RETRY_MS,
+    agentCostView,
+    attributeConversations,
+    type AgentAttribution,
+    type AgentLinks,
+    type AgentResolver,
     CLAUDE_CLI_VERSION,
     emptyMeterState,
     grantsLine,
     holdReason,
     ledgerLine,
+    type LedgerUsage,
     mainWindow,
     type MeterSettings,
     type MeterState,
@@ -21,6 +29,7 @@ import {
     meterStatusLine,
     meterView,
     nextReadAt,
+    OWNER_DEPTH,
     parseAnthropicUsage,
     type ProviderReading,
     pruneMeter,
@@ -766,4 +775,519 @@ test("the module has no run-time import and reads no clock", () => {
     }
 
     assert.ok(!text.includes("Date.now("));
+});
+
+// ─── The cost by agent ──────────────────────────────────────────────────────
+
+const NOW = Date.parse("2026-11-20T12:00:00Z");
+/** New York's midnight of the test's day: 05:00 UTC in EST. */
+const MIDNIGHT = Date.parse("2026-11-20T05:00:00Z");
+
+/** The sum of 1 counter over every bucket of the ledger. */
+const ledgerTotal = (state: MeterState, key: "entries" | "unknownCost"): number =>
+    Object.values(state.buckets).reduce(
+        (sum, byProvider) =>
+            sum +
+            Object.values(byProvider).reduce(
+                (each, byModel) =>
+                    each + Object.values(byModel).reduce((one, bucket) => one + bucket[key], 0),
+                0,
+            ),
+        0,
+    );
+
+/** 1 ledger entry of `conversation`, at `at`, with `cost` (absent: no cost). */
+const entryOf = (
+    conversation: number | undefined,
+    at: number,
+    cost: number | undefined,
+    provider = "anthropic",
+    model = "claude-opus-5-5",
+): LedgerUsage => ({
+    provider,
+    model,
+    timestamp: at,
+    input: 100,
+    output: 10,
+    cacheRead: 1000,
+    cacheWrite: 0,
+    ...(cost === undefined ? {} : { cost }),
+    ...(conversation === undefined ? {} : { conversation }),
+});
+
+test("addLedger: each answer counts in its conversation's hour, and only with a valid conversation", () => {
+    const state = emptyMeterState();
+    const hour = String(Date.parse("2026-11-20T12:00:00Z"));
+    const next = String(Date.parse("2026-11-20T13:00:00Z"));
+
+    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:01:00Z"), 2));
+    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:59:00Z"), 3));
+    addLedger(state, entryOf(7, Date.parse("2026-11-20T13:00:00Z"), 5));
+    addLedger(state, entryOf(8, Date.parse("2026-11-20T12:02:00Z"), 9));
+
+    assert.deepEqual(state.conversations[hour]?.["7"]?.anthropic?.["claude-opus-5-5"], {
+        entries: 2,
+        input: 200,
+        output: 20,
+        cacheRead: 2000,
+        cacheWrite: 0,
+        cost: 5,
+        unknownCost: 0,
+    });
+    assert.equal(state.conversations[hour]?.["8"]?.anthropic?.["claude-opus-5-5"]?.cost, 9);
+    assert.equal(state.conversations[next]?.["7"]?.anthropic?.["claude-opus-5-5"]?.cost, 5);
+
+    // The 5-minute buckets sum the same answers, whatever their conversation.
+    assert.equal(ledgerTotal(state, "entries"), 4);
+
+    // A cost the answer did not give counts in `unknownCost` on both sides.
+    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:40:00Z"), undefined));
+    assert.equal(state.conversations[hour]?.["7"]?.anthropic?.["claude-opus-5-5"]?.unknownCost, 1);
+    assert.equal(ledgerTotal(state, "unknownCost"), 1);
+
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+        addLedger(state, entryOf(bad, Date.parse("2026-11-20T12:45:00Z"), 1));
+    }
+
+    addLedger(state, entryOf(undefined, Date.parse("2026-11-20T12:45:00Z"), 1));
+
+    assert.deepEqual(
+        Object.keys(state.conversations[hour] ?? {}).sort(),
+        ["7", "8"],
+        "no other conversation, and no name such as NaN",
+    );
+    assert.equal(ledgerTotal(state, "entries"), 11);
+
+    // An answer with no timestamp counts nowhere, and no hour is made for it.
+    const hours = Object.keys(state.conversations).length;
+
+    addLedger(state, { ...entryOf(9, NOW, 1), timestamp: undefined });
+    assert.equal(state.skipped, 1);
+    assert.equal(Object.keys(state.conversations).length, hours);
+});
+
+test("pruneMeter: the conversation hours older than 8 days go", () => {
+    const state = emptyMeterState();
+    const old = Date.parse("2026-11-11T12:00:00Z");
+
+    addLedger(state, entryOf(1, old, 1));
+    addLedger(state, entryOf(2, NOW - DAY, 1));
+    pruneMeter(state, NOW);
+
+    assert.equal(state.conversations[String(old)], undefined);
+    assert.ok(state.conversations[String(NOW - DAY)] !== undefined);
+    assert.equal(Object.keys(state.conversations).length, 1);
+});
+
+/** The attribution of 1 conversation, as `attributeConversations` gives it. */
+async function attributed(
+    links: Partial<AgentLinks>,
+    personas: Record<number, string | undefined>,
+    ids: number[],
+    patch: Partial<AgentResolver> = {},
+): Promise<{ found: Map<number, AgentAttribution>; reads: number[]; cache: Map<number, unknown> }> {
+    const reads: number[] = [];
+    const resolver: AgentResolver = {
+        persona: async (session) => {
+            reads.push(session);
+
+            return personas[session];
+        },
+        links: {
+            owners: new Map(),
+            desk: new Map(),
+            linkedFrom: new Map(),
+            ...links,
+        },
+        cache: new Map(),
+        now: NOW,
+        maxReads: AGENT_READS,
+        ...patch,
+    };
+    const found = await attributeConversations(ids, resolver);
+
+    return { found, reads, cache: resolver.cache };
+}
+
+test("attributeConversations: the identity, the Desk's link, and the session that started it", async () => {
+    const owners = new Map<number, number | null>([
+        [1, null],
+        [2, null],
+        [3, null],
+        [9, null],
+    ]);
+
+    // The session's own identity (Team's persona) comes first.
+    const identity = await attributed(
+        { owners, desk: new Map([[1, "clerk"]]), linkedFrom: new Map([[1, 9]]) },
+        { 1: "odrade" },
+        [1],
+    );
+
+    assert.deepEqual(identity.found.get(1), {
+        kind: "agent",
+        agent: "odrade",
+        via: "identity",
+        session: 1,
+    });
+    assert.deepEqual(identity.reads, [1]);
+
+    // Then the Desk's link, when no identity answers.
+    const desk = await attributed({ owners, desk: new Map([[2, "clerk"]]) }, {}, [2]);
+
+    assert.deepEqual(desk.found.get(2), {
+        kind: "agent",
+        agent: "clerk",
+        via: "desk",
+        session: 2,
+    });
+
+    // Then the session that started it: the agent is that session's, and only 1 session is read twice.
+    const linked = await attributed(
+        { owners, linkedFrom: new Map([[3, 9]]) },
+        { 9: "duncan" },
+        [3],
+    );
+
+    assert.deepEqual(linked.found.get(3), {
+        kind: "agent",
+        agent: "duncan",
+        via: "linked",
+        session: 3,
+    });
+    assert.deepEqual(linked.reads, [3, 9]);
+});
+
+test("attributeConversations: a subagent gets its root session's agent, 2 levels deep, also under a linked session", async () => {
+    const owners = new Map<number, number | null>([
+        [3, null],
+        [9, null],
+        [10, 3],
+        [11, 10],
+        [20, 9],
+    ]);
+
+    const deep = await attributed({ owners }, { 3: "odrade" }, [10, 11]);
+
+    assert.deepEqual(deep.found.get(10), {
+        kind: "agent",
+        agent: "odrade",
+        via: "identity",
+        session: 3,
+    });
+    assert.deepEqual(deep.found.get(11), {
+        kind: "agent",
+        agent: "odrade",
+        via: "identity",
+        session: 3,
+    });
+    assert.deepEqual(deep.reads, [3], "the root session is read once");
+
+    const underLinked = await attributed(
+        { owners, linkedFrom: new Map([[9, 3]]) },
+        { 3: "odrade" },
+        [20],
+    );
+
+    assert.deepEqual(underLinked.found.get(20), {
+        kind: "agent",
+        agent: "odrade",
+        via: "linked",
+        session: 9,
+    });
+});
+
+test("attributeConversations: unattributed, pending, a spent read budget, and a persona that throws", async () => {
+    // A session that nothing names is unattributed, and its answer is cached.
+    const none = await attributed({ owners: new Map([[4, null]]) }, {}, [4]);
+
+    assert.deepEqual(none.found.get(4), { kind: "unattributed", session: 4 });
+    assert.deepEqual(none.cache.get(4), { at: NOW });
+
+    // A creator that is not read yet is pending, and no persona is read for it.
+    const pending = await attributed({}, { 5: "odrade" }, [5]);
+
+    assert.deepEqual(pending.found.get(5), { kind: "pending" });
+    assert.deepEqual(pending.reads, []);
+
+    // A call that spent its reads leaves the rest pending, and caches nothing of them.
+    const spent = await attributed(
+        {
+            owners: new Map([
+                [6, null],
+                [7, null],
+            ]),
+        },
+        { 6: "odrade", 7: "clerk" },
+        [6, 7],
+        { maxReads: 1 },
+    );
+
+    assert.deepEqual(spent.found.get(6), {
+        kind: "agent",
+        agent: "odrade",
+        via: "identity",
+        session: 6,
+    });
+    assert.deepEqual(spent.found.get(7), { kind: "pending" });
+    assert.equal(spent.cache.has(7), false);
+    assert.deepEqual(spent.reads, [6]);
+
+    // A persona that throws is pending too, and is not cached: the next call reads it again.
+    let calls = 0;
+    const throwing: AgentResolver = {
+        persona: async () => {
+            calls += 1;
+
+            throw new Error("the roster read failed");
+        },
+        links: { owners: new Map([[8, null]]), desk: new Map(), linkedFrom: new Map() },
+        cache: new Map(),
+        now: NOW,
+        maxReads: AGENT_READS,
+    };
+
+    assert.deepEqual((await attributeConversations([8], throwing)).get(8), { kind: "pending" });
+    assert.equal(throwing.cache.has(8), false);
+    assert.deepEqual((await attributeConversations([8], throwing)).get(8), { kind: "pending" });
+    assert.equal(calls, 2);
+});
+
+test("attributeConversations: a cycle in the creators or in the starting sessions has no agent", async () => {
+    const cycle = new Map<number, number | null>([
+        [7, 8],
+        [8, 7],
+    ]);
+
+    const both = await attributed({ owners: cycle }, { 7: "odrade", 8: "odrade" }, [7, 8]);
+
+    assert.deepEqual(both.found.get(7), { kind: "unattributed", session: 7 });
+    assert.deepEqual(both.found.get(8), { kind: "unattributed", session: 8 });
+    assert.deepEqual(both.reads, [], "a cycle reads no persona");
+
+    const self = await attributed({ owners: new Map([[9, 9]]) }, {}, [9]);
+
+    assert.deepEqual(self.found.get(9), { kind: "unattributed", session: 9 });
+
+    // More than OWNER_DEPTH steps has no root either.
+    const chain = new Map<number, number | null>();
+
+    for (let id = 1; id <= OWNER_DEPTH + 2; id += 1) {
+        chain.set(id, id + 1);
+    }
+
+    chain.set(OWNER_DEPTH + 3, null);
+
+    const deep = await attributed({ owners: chain }, { [OWNER_DEPTH + 3]: "odrade" }, [1]);
+
+    assert.deepEqual(deep.found.get(1), { kind: "unattributed", session: 1 });
+
+    // A cycle of linked sessions stays a session that nobody names.
+    const linked = await attributed(
+        {
+            owners: new Map([
+                [40, null],
+                [41, null],
+            ]),
+            linkedFrom: new Map([
+                [40, 41],
+                [41, 40],
+            ]),
+        },
+        {},
+        [40, 41],
+    );
+
+    assert.deepEqual(linked.found.get(40), { kind: "unattributed", session: 40 });
+    assert.deepEqual(linked.found.get(41), { kind: "unattributed", session: 41 });
+});
+
+test("attributeConversations: the cache keeps an agent for good, and reads a session with none again after an hour", async () => {
+    const reads: number[] = [];
+    const cache = new Map<number, { agent?: string; at: number }>();
+    const resolver: AgentResolver = {
+        persona: async (session) => {
+            reads.push(session);
+
+            return undefined;
+        },
+        links: {
+            owners: new Map([
+                [1, null],
+                [2, null],
+            ]),
+            desk: new Map(),
+            linkedFrom: new Map(),
+        },
+        cache,
+        now: NOW,
+        maxReads: AGENT_READS,
+    };
+
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), {
+        kind: "unattributed",
+        session: 1,
+    });
+    assert.deepEqual(reads, [1]);
+
+    // Still fresh: no read.
+    resolver.now = NOW + AGENT_RETRY_MS - 1;
+    await attributeConversations([1], resolver);
+    assert.deepEqual(reads, [1]);
+
+    // An hour later: read again.
+    resolver.now = NOW + AGENT_RETRY_MS;
+    await attributeConversations([1], resolver);
+    assert.deepEqual(reads, [1, 1]);
+
+    // An agent is kept, whatever the time.
+    cache.set(2, { agent: "odrade", via: "identity", at: NOW });
+    resolver.now = NOW + 30 * DAY;
+    assert.deepEqual((await attributeConversations([2], resolver)).get(2), {
+        kind: "agent",
+        agent: "odrade",
+        via: "identity",
+        session: 2,
+    });
+    assert.deepEqual(reads, [1, 1]);
+});
+
+test("agentCostView: the providers and their models, today at local midnight, the unattributed and the pending", () => {
+    const state = emptyMeterState();
+
+    state.coverage = { since: NOW - 8 * DAY, complete: true, done: 4, total: 4 };
+
+    // Conversation 1 (odrade): $10 today, $30 two days ago on another provider, and 1 answer with no cost today.
+    addLedger(state, entryOf(1, MIDNIGHT + HOUR, 10));
+    addLedger(state, entryOf(1, NOW - 2 * DAY, 30, "openai", "gpt-5"));
+    addLedger(state, entryOf(1, MIDNIGHT + 2 * HOUR, undefined));
+
+    // Conversation 2 (unattributed): $5 today.
+    addLedger(state, entryOf(2, MIDNIGHT + HOUR, 5));
+
+    // Conversation 3 (pending): $2 before local midnight, $1 after it.
+    addLedger(state, entryOf(3, MIDNIGHT - HOUR, 2));
+    addLedger(state, entryOf(3, MIDNIGHT + HOUR, 1));
+
+    // Conversation 5 (odrade again, the same root session): $1 today.
+    addLedger(state, entryOf(5, MIDNIGHT + HOUR, 1));
+
+    // Conversation 6 (lucilla, by the Desk's link): $20 today.
+    addLedger(state, entryOf(6, MIDNIGHT + HOUR, 20));
+
+    // Conversation 7: older than 7 days: no row sees it.
+    addLedger(state, entryOf(7, NOW - 8 * DAY, 1000));
+
+    const attributions = new Map<number, AgentAttribution>([
+        [1, { kind: "agent", agent: "odrade", via: "identity", session: 100 }],
+        [2, { kind: "unattributed", session: 200 }],
+        [5, { kind: "agent", agent: "odrade", via: "identity", session: 100 }],
+        [6, { kind: "agent", agent: "lucilla", via: "desk", session: 300 }],
+        [7, { kind: "unattributed", session: 700 }],
+    ]);
+    const names = new Map([
+        ["odrade", "Odrade"],
+        ["lucilla", "Lucilla"],
+    ]);
+    const view = agentCostView(state, attributions, names, NOW, ZONE);
+
+    assert.equal(view.at, NOW);
+    assert.equal(view.partial, false);
+    assert.equal(view.pending, 1);
+    assert.deepEqual(
+        view.rows.map((row) => [row.kind, row.label, row.sessions, row.today.cost, row.days7.cost]),
+        [
+            ["agent", "Odrade", 1, 11, 41],
+            ["agent", "Lucilla", 1, 20, 20],
+            ["unattributed", "Unattributed", 1, 5, 5],
+            ["pending", "Not attributed yet", 1, 1, 3],
+        ],
+    );
+
+    const odrade = view.rows[0];
+
+    assert.ok(odrade !== undefined);
+    assert.equal(odrade.agent, "odrade");
+    assert.equal(odrade.days7.entries, 4);
+    assert.equal(odrade.days7.input, 400);
+    assert.equal(odrade.days7.output, 40);
+    assert.equal(odrade.days7.cacheRead, 4000);
+    assert.equal(odrade.days7.cacheWrite, 0);
+    assert.equal(odrade.today.entries, 3);
+    assert.equal(odrade.today.unknownCost, 1);
+    assert.equal(odrade.days7.unknownCost, 1);
+
+    // The providers come highest 7-day cost first, and each one's models too.
+    assert.deepEqual(
+        odrade.providers.map((each) => [each.provider, each.days7.cost, each.today.cost]),
+        [
+            ["openai", 30, 0],
+            ["anthropic", 11, 11],
+        ],
+    );
+    assert.deepEqual(
+        odrade.providers[0]?.models.map((model) => [
+            model.model,
+            model.days7.cost,
+            model.today.cost,
+        ]),
+        [["gpt-5", 30, 0]],
+    );
+
+    // A pending row counts conversations; an agent's row counts its root sessions.
+    const pending = view.rows[3];
+
+    assert.ok(pending !== undefined);
+    assert.equal(pending.providers.length, 1);
+    assert.equal(pending.providers[0]?.provider, "anthropic");
+    assert.equal(pending.days7.entries, 2);
+
+    // The ledger's coverage rule gives `partial`, and nothing has usage yet without it.
+    const partial = emptyMeterState();
+
+    addLedger(partial, entryOf(1, NOW, 1));
+    assert.equal(agentCostView(partial, new Map(), names, NOW, ZONE).partial, true);
+
+    const empty = agentCostView(emptyMeterState(), new Map(), names, NOW, ZONE);
+
+    assert.deepEqual(empty.rows, []);
+    assert.equal(empty.pending, 0);
+
+    // 1 conversation with no attribution at all is pending too.
+    const unknown = agentCostView(partial, new Map(), names, NOW, ZONE);
+
+    assert.deepEqual(
+        unknown.rows.map((row) => [row.kind, row.label]),
+        [["pending", "Not attributed yet"]],
+    );
+    assert.equal(unknown.pending, 1);
+});
+
+test("agentCostView: rows at the same cost sort by today's cost, then by their label", () => {
+    const state = emptyMeterState();
+    const attributions = new Map<number, AgentAttribution>([
+        [1, { kind: "agent", agent: "zed", via: "identity", session: 1 }],
+        [2, { kind: "agent", agent: "amy", via: "identity", session: 2 }],
+        [3, { kind: "agent", agent: "bob", via: "identity", session: 3 }],
+    ]);
+
+    addLedger(state, entryOf(1, NOW - DAY, 5));
+    addLedger(state, entryOf(2, NOW - DAY, 5));
+    addLedger(state, entryOf(3, MIDNIGHT + HOUR, 5));
+
+    const view = agentCostView(state, attributions, new Map(), NOW, ZONE);
+
+    assert.deepEqual(
+        view.rows.map((row) => [row.label, row.today.cost, row.days7.cost]),
+        [
+            ["bob", 5, 5],
+            ["amy", 0, 5],
+            ["zed", 0, 5],
+        ],
+    );
+    assert.deepEqual(
+        view.rows.slice(1).map((row) => row.label),
+        ["amy", "zed"],
+        "at the same 7-day cost and the same today cost, the label decides",
+    );
 });
