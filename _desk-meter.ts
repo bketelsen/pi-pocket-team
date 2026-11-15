@@ -17,9 +17,22 @@
 
 /**
  * The Claude Code version that pi-ai sends in `user-agent: claude-cli/<version>` on each Claude request. pi-ai does
- * not export it, so `desk-meter.test.ts` reads it from pi-ai's file and fails when the 2 differ.
+ * not export it, so this is the fallback: `claudeCliVersionIn` reads the version from pi-ai's own file, and this one
+ * applies when that file cannot be read (or holds no version of the accepted form).
  */
 export const CLAUDE_CLI_VERSION = "2.1.280";
+
+/**
+ * The Claude Code version in the text of pi-ai's source (`const claudeCodeVersion = "<version>"`), or
+ * `CLAUDE_CLI_VERSION` when the text is absent, has no such constant, or has a value that is not 1 to 4 dot-separated
+ * numbers. The value goes into an HTTP header, so a text with anything else in it gives the fallback.
+ */
+export function claudeCliVersionIn(text: string | undefined): string {
+    const value =
+        text === undefined ? undefined : /const claudeCodeVersion = "([^"]+)"/.exec(text)?.[1];
+
+    return value !== undefined && /^\d+(\.\d+){1,3}$/.test(value) ? value : CLAUDE_CLI_VERSION;
+}
 
 /**
  * The slack of a read's time: the caller reads when `now >= nextReadAt(...) - READ_SLACK_MS`, so a pass that comes
