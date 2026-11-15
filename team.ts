@@ -22,6 +22,7 @@ import {
     ToolTask,
     type ConversationId,
     type DocumentReader,
+    type JsonObject,
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
@@ -51,6 +52,12 @@ type Persona = {
     workspace?: string;
     /** The agent's home folder: plans, notes and reports, apart from every repository. */
     home?: string;
+    /**
+     * The MCP servers the agent may use, by name (`mcp:` in the profile). `roster` always sets it, `[]` when the profile
+     * has none. An Identity doc keeps an older copy of the persona that can lack it or be out of date: the MCP guard
+     * reads it from the current roster by id, never from that copy.
+     */
+    mcp?: string[];
 };
 
 /** Where another module finds this one's live API. */
@@ -664,6 +671,27 @@ function applyIdentity(
 const profileFiles = (names: string[]): string[] =>
     names.sort().filter((file) => /^[a-z0-9][a-z0-9_-]*\.md$/.test(file));
 
+/**
+ * A profile's `mcp:` field: a list of MCP server names, `[]` when absent. Any other value makes the profile invalid,
+ * as a bad `home` does: the roster read fails, and the MCP guard blocks (it never guesses a list).
+ */
+export function mcpServers(value: unknown, file: string): string[] {
+    if (value === undefined || value === null) {
+        return [];
+    }
+
+    if (
+        !Array.isArray(value) ||
+        value.some((name) => typeof name !== "string" || name.trim() === "")
+    ) {
+        throw new Error(
+            `${file}: mcp must be a list of MCP server names, such as mcp: [truenas], or absent.`,
+        );
+    }
+
+    return [...new Set(value as string[])];
+}
+
 export async function roster(directory: string): Promise<Persona[]> {
     const names = await readdir(directory).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") {
@@ -702,6 +730,7 @@ export async function roster(directory: string): Promise<Persona[]> {
                 ? {}
                 : { workspace: localFolder(frontmatter.workspace) }),
             ...(frontmatter.home === undefined ? {} : { home: localFolder(frontmatter.home) }),
+            mcp: mcpServers(frontmatter.mcp, file),
         });
     }
 
@@ -818,6 +847,318 @@ export async function resolveIdentity(
     const persona = await agentAtFolder(cwd, await roster(directory));
 
     return persona === undefined ? { cwd } : { persona, implicit: true, cwd };
+}
+
+/**
+ * Pi Pocket's own session catalogue (`src/server/docs.ts`, `SessionsDoc`): the same stored kind, read only, never
+ * written here. It lists the sessions (ownerless conversations) and not the subagents; `linkedFrom` is the session
+ * that started a linked session. A kind is stored data in Pi Pocket, so this copy keeps its kind, version, scope and
+ * checkpoint rule (as desk.ts's copy does).
+ */
+const PocketSessions = defineDoc<{ items: JsonObject }>({
+    kind: "pocket.sessions",
+    version: 1,
+    scope: "session",
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ items: {} }),
+});
+
+/**
+ * Pi Pocket's subagents of a conversation (`src/server/docs.ts`, `SubagentsDoc`), read only, never written here: the
+ * parent's record of each subagent's conversation is the edge from a subagent to the session that spawned it. The copy
+ * keeps the stored kind, version, scope, history, fork and checkpoint rule.
+ */
+const PocketSubagents = defineDoc<{ agents: JsonObject; reporters: JsonObject }>({
+    kind: "pocket.subagents",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ agents: {}, reporters: {} }),
+});
+
+/** The 3 tools of the `mcp` gallery module (TannerMidd/pocket-mcp): each names an MCP server in `server`. */
+export const MCP_TOOLS: readonly string[] = ["mcp_tools", "mcp_call", "mcp_call_read_only"];
+
+/** The sessions the MCP guard climbs at most, the session itself included, before it gives up and blocks. */
+export const MCP_WALK_STEPS = 20;
+
+/** The subagent records the MCP guard reads at most to find a subagent's parent, before it gives up and blocks. */
+export const MCP_PARENT_READS = 5000;
+
+/**
+ * Whose MCP servers apply in a session (docs/modules/team.md, "MCP servers"): a named agent's list from the current
+ * roster, every server in Brian's own session (a verified root), or none, with the reason, when the walk fails.
+ */
+export type McpScope =
+    | { kind: "agent"; id: string; name: string; servers: string[] }
+    | { kind: "root" }
+    | { kind: "blocked"; reason: string };
+
+/**
+ * Where the walk learns a subagent's parent fast: a hint it checks, the edges it found, and the conversations it found
+ * no parent for. Both never change: Pocket writes a subagent's record in the commit that creates the subagent.
+ */
+export type McpParents = {
+    hint?: (conversation: number) => number | undefined;
+    found: Map<number, number>;
+    missing?: Set<number>;
+};
+
+/** A field of a stored value that may be malformed: undefined when the value is no object or lacks the field. */
+const fieldOf = (value: unknown, key: string): unknown =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)[key]
+        : undefined;
+
+const positiveId = (value: unknown): value is number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+
+/** The scope of a named agent: its `mcp` from the current roster by id, never from a stored copy of its persona. */
+async function agentMcpScope(id: string, directory: string): Promise<McpScope> {
+    let agents: Persona[];
+
+    try {
+        // No last good roster here (guardRoster keeps one): a profile that cannot be read must not keep an old grant.
+        agents = await cachedRoster(directory);
+    } catch {
+        return {
+            kind: "blocked",
+            reason: `the profiles cannot be read, so the MCP servers of ${id} are not known`,
+        };
+    }
+
+    if (agents.length === 0) {
+        return {
+            kind: "blocked",
+            reason: `the roster is empty, so the MCP servers of ${id} are not known`,
+        };
+    }
+
+    const agent = agents.find((each) => each.id === id);
+
+    if (agent === undefined) {
+        return {
+            kind: "blocked",
+            reason: `this session belongs to the agent ${id}, which has no profile now`,
+        };
+    }
+
+    return { kind: "agent", id: agent.id, name: agent.name, servers: [...(agent.mcp ?? [])] };
+}
+
+/**
+ * The session that spawned a subagent: the session whose subagent records hold this conversation. The hint (the
+ * session of the subagent's last run) is read first, then the sessions in the subagent's folder, then the rest, at most
+ * `MCP_PARENT_READS` records. A subagent spawns no subagents, so its parent is a session.
+ */
+async function subagentParent(
+    read: Pick<DocumentReader, "snapshot">,
+    child: number,
+    cwd: string | undefined,
+    sessions: Readonly<JsonObject>,
+    context: Context,
+    parents: McpParents,
+): Promise<number | undefined> {
+    const known = parents.found.get(child);
+
+    if (known !== undefined) {
+        return known;
+    }
+
+    if (parents.missing?.has(child) === true) {
+        return undefined;
+    }
+
+    const ids = Object.keys(sessions)
+        .map(Number)
+        .filter((id) => positiveId(id) && id !== child);
+    const hint = parents.hint?.(child);
+    const order = [
+        ...(hint !== undefined && positiveId(hint) ? [hint] : []),
+        ...ids.filter((id) => cwd !== undefined && fieldOf(sessions[String(id)], "cwd") === cwd),
+        ...ids,
+    ];
+    const tried = new Set<number>();
+
+    for (const id of order) {
+        if (tried.has(id)) {
+            continue;
+        }
+
+        if (tried.size >= MCP_PARENT_READS) {
+            break;
+        }
+
+        tried.add(id);
+        const doc = await read.snapshot(PocketSubagents, id as ConversationId, context);
+        const records = Object.values(doc?.agents ?? {});
+
+        if (records.some((record) => fieldOf(record, "conversationId") === child)) {
+            parents.found.set(child, id);
+
+            return id;
+        }
+    }
+
+    parents.missing?.add(child);
+
+    return undefined;
+}
+
+/**
+ * Whose MCP servers apply in a conversation. The walk goes from the conversation up its chain, at most
+ * `MCP_WALK_STEPS` sessions: the first with a named agent (its Identity doc, else the agent of its folder) gives the
+ * agent's id, and the current roster gives that agent's list. The parent of a linked session is its `linkedFrom`; the
+ * parent of a subagent is the session whose subagent records hold it. A session with no `linkedFrom` and no named agent
+ * on the way is Brian's own: every server. A cycle, too many steps, a missing parent, a bad `linkedFrom`, or a failed
+ * read blocks (fail closed).
+ */
+export async function mcpScope(
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+    directory: string,
+    parents: McpParents = { found: new Map() },
+): Promise<McpScope> {
+    const seen = new Set<number>();
+    let sessions: Readonly<JsonObject> = {};
+    let loaded = false;
+    let current = Number(conversationId);
+
+    for (let step = 0; step < MCP_WALK_STEPS; step++) {
+        if (seen.has(current)) {
+            return {
+                kind: "blocked",
+                reason: "the chain of sessions that started this one is a cycle",
+            };
+        }
+
+        seen.add(current);
+        let identity: Resolved;
+
+        try {
+            identity = await resolveIdentity(read, current as ConversationId, context, directory);
+
+            if (!loaded) {
+                sessions = (await read.snapshot(PocketSessions, context))?.items ?? {};
+                loaded = true;
+            }
+        } catch {
+            return {
+                kind: "blocked",
+                reason: "a read failed, so the agent of this session is not known",
+            };
+        }
+
+        if (identity.persona !== undefined) {
+            return agentMcpScope(identity.persona.id, directory);
+        }
+
+        const item = sessions[String(current)];
+
+        if (item !== undefined) {
+            if (item === null || typeof item !== "object" || Array.isArray(item)) {
+                return {
+                    kind: "blocked",
+                    reason: "the session list has no valid record of this session",
+                };
+            }
+
+            const linkedFrom = fieldOf(item, "linkedFrom");
+
+            if (linkedFrom === undefined) {
+                return { kind: "root" };
+            }
+
+            const from = fieldOf(linkedFrom, "id");
+
+            if (!positiveId(from)) {
+                return {
+                    kind: "blocked",
+                    reason: "the session that started this one has no valid id (linkedFrom)",
+                };
+            }
+
+            current = from;
+            continue;
+        }
+
+        let parent: number | undefined;
+
+        try {
+            parent = await subagentParent(read, current, identity.cwd, sessions, context, parents);
+        } catch {
+            return {
+                kind: "blocked",
+                reason: "a read failed, so the agent of this session is not known",
+            };
+        }
+
+        if (parent === undefined) {
+            return {
+                kind: "blocked",
+                reason: "the session that started this one cannot be found",
+            };
+        }
+
+        current = parent;
+    }
+
+    return {
+        kind: "blocked",
+        reason: `the chain of sessions that started this one is longer than ${String(MCP_WALK_STEPS)}`,
+    };
+}
+
+/** The block text of 1 MCP tool call in a scope, or undefined when the call may go. */
+export function mcpBlock(name: string, args: unknown, scope: McpScope): string | undefined {
+    if (!name.startsWith("mcp_") || scope.kind === "root") {
+        return undefined;
+    }
+
+    if (scope.kind === "blocked") {
+        return `MCP tools are blocked in this session: ${scope.reason}. ${name} is blocked.`;
+    }
+
+    const who = `${scope.name} (${scope.id})`;
+    const allowed = scope.servers.join(", ");
+
+    if (scope.servers.length === 0) {
+        return `No MCP server is given to ${who}: ${name} is blocked. Ask the agent that owns the server, through your supervisor.`;
+    }
+
+    if (!MCP_TOOLS.includes(name)) {
+        return `${who} may use MCP only through mcp_tools, mcp_call and mcp_call_read_only, with the servers: ${allowed}. ${name} is blocked.`;
+    }
+
+    const server = (args as { server?: unknown } | null | undefined)?.server;
+
+    if (typeof server !== "string") {
+        return `${who} may use only the MCP servers: ${allowed}. Give server: one of ${allowed}.`;
+    }
+
+    if (!scope.servers.includes(server)) {
+        return `${who} may use only the MCP servers: ${allowed}. The server ${JSON.stringify(server.slice(0, 80))} is blocked.`;
+    }
+
+    return undefined;
+}
+
+/** The team's prompt line on MCP in a scope: none in Brian's own session. */
+export function mcpText(scope: McpScope): string | undefined {
+    if (scope.kind === "root") {
+        return undefined;
+    }
+
+    if (scope.kind === "blocked") {
+        return `MCP tools are blocked in this session: ${scope.reason}. Do not call mcp_tools or mcp_call.`;
+    }
+
+    return scope.servers.length === 0
+        ? "No MCP server is given to you: do not call mcp_tools or mcp_call."
+        : `Of the MCP servers above, you may use only: ${scope.servers.join(", ")}. Give server in each call of mcp_tools, mcp_call and mcp_call_read_only.`;
 }
 
 /** What a home session must do before it touches a repository: paths only, never a file's contents. */
@@ -4596,10 +4937,65 @@ export default function createTeam(host: Host, web: Web) {
         },
     });
 
+    /**
+     * The session of each subagent's last run (`run.started`): only a hint, which the walk checks against the parent's
+     * subagent records before it uses it. Without it (an older Pocket, or a run from before this module loaded), the
+     * walk searches the records.
+     */
+    const runSessions = new Map<number, number>();
+    const mcpParents: McpParents = {
+        hint: (conversation) => runSessions.get(conversation),
+        found: new Map(),
+        missing: new Set(),
+    };
+
+    if (typeof host.on === "function") {
+        web.onDispose(
+            host.on("run.started", ({ conversationId, session }) => {
+                if (conversationId !== session) {
+                    runSessions.set(conversationId, session);
+                }
+            }),
+        );
+    }
+
+    /** The MCP scope of a conversation; a throw is a block, never every server. */
+    const scopeOf = (
+        read: Pick<DocumentReader, "snapshot">,
+        conversationId: ConversationId,
+        context: Context,
+    ): Promise<McpScope> =>
+        mcpScope(read, conversationId, context, directory, mcpParents).catch(() => ({
+            kind: "blocked" as const,
+            reason: "a read failed, so the agent of this session is not known",
+        }));
+
+    /**
+     * A named agent may use only the MCP servers of its profile (docs/modules/team.md, "MCP servers"). The `mcp`
+     * module serves every server in every session; this hook narrows its 3 tools by their `server` argument, also in
+     * calls from codemode scripts. It is a scope guard against wrong or injected calls, not a wall: every agent runs as
+     * 1 Unix user.
+     */
+    const mcpGuard = hook(ToolTask, {
+        beforeTool: async (call, api, context) => {
+            if (!call.name.startsWith("mcp_")) {
+                return undefined;
+            }
+
+            const block = mcpBlock(
+                call.name,
+                call.arguments,
+                await scopeOf(api, api.conversationId, context),
+            );
+
+            return block === undefined ? undefined : { block };
+        },
+    });
+
     return defineExtension({
         name: "named-team",
         tools: [delegateTool, work, message, list, teamMemory],
-        hooks: [homeGuard],
+        hooks: [homeGuard, mcpGuard],
         sections: [
             section("named_team", async (input, context) => {
                 const identity = await resolveIdentity(
@@ -4645,6 +5041,10 @@ export default function createTeam(host: Host, web: Web) {
                     `\n\n${lessonsText(persona, lessons, (text) => host.text.defang(text))}`
                 );
             }),
+            // Its own section, so a subagent or a linked session with no identity of its own gets it too.
+            section("team_mcp", async (input, context) =>
+                mcpText(await scopeOf(input.read, input.conversationId, context)),
+            ),
         ],
     });
 }

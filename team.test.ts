@@ -621,6 +621,45 @@ test("2 delegations to 1 repository work in 2 worktrees, and the task says where
     }
 });
 
+test("roster: mcp is a list of server names, [] when absent, and another type makes the profile invalid", async () => {
+    const folder = join(root, "mcp-agents");
+
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "moneo.md"), "---\nmcp: [truenas]\n---\n# Moneo\nOwn the NAS.");
+    writeFileSync(
+        join(folder, "chani.md"),
+        "---\nmcp:\n  - frostnotes\n  - frostmail\n---\n# Chani\n",
+    );
+    writeFileSync(join(folder, "duncan.md"), "---\nmodel: faux/faux-2\n---\n# Duncan Idaho\n");
+    const of = async (id: string) =>
+        (await roster(folder)).find((each) => each.id === id) ?? assert.fail(id);
+
+    // A list: the names, in order.
+    assert.deepEqual((await of("moneo")).mcp, ["truenas"]);
+    assert.deepEqual((await of("chani")).mcp, ["frostnotes", "frostmail"]);
+    // Absent: no MCP server.
+    assert.deepEqual((await of("duncan")).mcp, []);
+
+    // Another type: the profile is invalid, so the roster read fails and names the file.
+    for (const bad of [
+        "mcp: truenas",
+        "mcp: 5",
+        "mcp: [truenas, 5]",
+        'mcp: [""]',
+        "mcp:\n  name: truenas",
+    ]) {
+        writeFileSync(join(folder, "bad.md"), `---\n${bad}\n---\n# Bad\n`);
+        await assert.rejects(
+            roster(folder),
+            /bad\.md: mcp must be a list of MCP server names/,
+            bad,
+        );
+    }
+
+    rmSync(join(folder, "bad.md"));
+    assert.equal((await roster(folder)).length, 3);
+});
+
 test("pickSupervisor: the newest bound session that the person sees, not archived first", () => {
     const bound = [
         { supervisor: 9, lastEventAt: 300, asks: 1 },
