@@ -36,6 +36,7 @@ import {
     buildQuery,
     classifyFailure,
     CLOSED_REFRESH_MS,
+    claudeCliVersion,
     collectPass,
     collectorLive,
     COLLECTOR_TASK,
@@ -81,6 +82,25 @@ import {
     type PrLink,
     type Thread,
 } from "./desk.ts";
+
+/**
+ * The Claude Code version in the pi-ai that this checkout links, read the way `_desk-dashboard.ts` reads it: the meter
+ * sends it as `user-agent: claude-cli/<version>`, and each Pi Pocket release bundles its own pi-ai version.
+ */
+const PI_AI_VERSION = (() => {
+    const file = readFileSync(
+        join(
+            import.meta.dirname,
+            "node_modules/@earendil-works/pi-ai/dist/api/anthropic-messages.js",
+        ),
+        "utf8",
+    );
+    const match = /const claudeCodeVersion = "([^"]+)"/.exec(file);
+
+    assert.ok(match !== null, "pi-ai has no claudeCodeVersion");
+
+    return match[1] ?? "";
+})();
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -3180,7 +3200,7 @@ describe("the subscription meter's step", () => {
         assert.deepEqual(calls[0]?.init.headers, {
             authorization: `Bearer ${FAKE_TOKEN}`,
             "anthropic-beta": "oauth-2025-04-20",
-            "user-agent": "claude-cli/2.1.280",
+            "user-agent": `claude-cli/${PI_AI_VERSION}`,
             "x-app": "cli",
         });
         assert.ok(calls[0]?.init.signal instanceof AbortSignal);
@@ -3195,6 +3215,33 @@ describe("the subscription meter's step", () => {
         await meterPass(deps, METER_NOW + 4.5 * MINUTE);
         assert.equal(calls.length, 2);
         assert.equal(nextReadAt(deps.state, "anthropic", METER_ON), METER_NOW + 9.5 * MINUTE);
+    });
+
+    test("the provider read sends the Claude Code version it is given", async () => {
+        const calls: RequestInit[] = [];
+        const reader = anthropicReader({
+            token: async () => FAKE_TOKEN,
+            fetch: (async (_url: string, init: RequestInit) => {
+                calls.push(init);
+
+                return respond(200, JSON.stringify(R4_BODY));
+            }) as unknown as typeof fetch,
+            now: () => METER_NOW,
+            claudeCliVersion: "1.0.0",
+        });
+
+        await reader("anthropic", new AbortController().signal);
+        assert.deepEqual(calls[0]?.headers, {
+            authorization: `Bearer ${FAKE_TOKEN}`,
+            "anthropic-beta": "oauth-2025-04-20",
+            "user-agent": "claude-cli/1.0.0",
+            "x-app": "cli",
+        });
+    });
+
+    test("claudeCliVersion reads pi-ai's own version", () => {
+        // A Pi Pocket release that bundles another pi-ai sends that version, not a constant of this project.
+        assert.equal(claudeCliVersion(), PI_AI_VERSION);
     });
 
     test("a 200 answer that reflects the token in any string the reading copies is refused with fixed words, and the meter keeps nothing of it", async () => {

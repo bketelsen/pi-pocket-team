@@ -31,9 +31,10 @@ of a server who works with a team of named agents. It is written for Brian Ketel
 ## Requirements
 
 Pi Pocket v0.21.0 or later (extension API 2), on Node.js 24, and a Pi Pocket checkout beside this repository
-(`../pi-pocket-live` by default when it is a checkout, else `../pi-pocket`) for the links and the tests. CI tests upstream v0.27.0 and the fork tag v0.28.1-bk.1 of
-[bketelsen/pi-pocket](https://github.com/bketelsen/pi-pocket), the release the owner's server runs. On a Pi Pocket
-that has the run-end switch (the fork's `bk` tags), the desk turns off automatic run-end answers on supervisor
+(`../pi-pocket-live` by default when it is a checkout, else `../pi-pocket`) for the links and the tests. CI tests
+upstream v0.27.0, the fork tag v0.28.1-bk.1 of [bketelsen/pi-pocket](https://github.com/bketelsen/pi-pocket)
+(the rollback target) and upstream v0.29.0, the release the owner's server runs. On a Pi Pocket that has the run-end
+switch (0.29.0 and later, and the fork's 0.28 `bk` tags), the desk turns off automatic run-end answers on supervisor
 sessions.
 
 ## Install
