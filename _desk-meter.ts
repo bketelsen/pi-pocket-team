@@ -1642,13 +1642,14 @@ export async function attributeConversations(
                 return answer;
             }
 
-            // A session with an agent or with none is read again only after AGENT_RETRY_MS; a session that knows the
-            // session that started it goes straight there, and spends no persona read on itself.
-            if (resolver.now - cached.at < AGENT_RETRY_MS) {
-                if (cached.source !== undefined) {
-                    return await follow(cached.source);
-                }
+            // A session that knows the session that started it goes straight there, at any age, and spends no persona
+            // read on itself: the entry holds the progress of a chain that is still pending, and the chain's answer
+            // replaces it. A session with no agent is read again only after AGENT_RETRY_MS.
+            if (cached.source !== undefined) {
+                return await follow(cached.source);
+            }
 
+            if (resolver.now - cached.at < AGENT_RETRY_MS) {
                 const answer: SessionAnswer = {};
 
                 asked.set(session, answer);

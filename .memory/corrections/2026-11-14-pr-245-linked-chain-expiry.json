@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-meter.ts",
+  "correction": "a cached linked-session source was followed only for AGENT_RETRY_MS, so a chain longer than 1 call's persona reads, with calls an hour apart, read the same first sessions again and stayed pending; a cached source is now followed at any age until the chain's answer replaces it",
+  "evidence": "bketelsen/pi-pocket-team#245, re-review 1 by openai/gpt-6.1-sol at 689661dcf6cf0324420c1ef78a7eeb8c4c6cd585",
+  "promoted_to": "desk-meter.test.ts: attributeConversations: a linked chain keeps its progress also when each call comes after AGENT_RETRY_MS"
+}

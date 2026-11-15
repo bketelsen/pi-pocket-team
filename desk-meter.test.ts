@@ -1157,6 +1157,68 @@ test("attributeConversations: the cache keeps an agent for good, and reads a ses
     assert.deepEqual(reads, [1, 1]);
 });
 
+test("attributeConversations: a linked chain keeps its progress also when each call comes after AGENT_RETRY_MS", async () => {
+    const reads: number[] = [];
+    const cache = new Map<number, SessionAgent>();
+    const resolver: AgentResolver = {
+        persona: async (session) => {
+            reads.push(session);
+
+            return session === 3 ? "duncan" : undefined;
+        },
+        links: {
+            owners: new Map<number, number | null>([
+                [1, null],
+                [2, null],
+                [3, null],
+            ]),
+            desk: new Map(),
+            linkedFrom: new Map([
+                [1, 2],
+                [2, 3],
+            ]),
+        },
+        cache,
+        now: NOW,
+        maxReads: 1,
+    };
+
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), { kind: "pending" });
+    resolver.now = NOW + AGENT_RETRY_MS;
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), { kind: "pending" });
+    resolver.now = NOW + 2 * AGENT_RETRY_MS;
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), {
+        kind: "agent",
+        agent: "duncan",
+        via: "linked",
+        session: 1,
+    });
+    assert.deepEqual(reads, [1, 2, 3]);
+
+    // A chain that ends with no agent drops its progress: the "none" answer waits AGENT_RETRY_MS as before.
+    cache.clear();
+    reads.length = 0;
+
+    resolver.persona = async (session) => {
+        reads.push(session);
+
+        return undefined;
+    };
+
+    resolver.maxReads = 3;
+    resolver.now = NOW;
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), {
+        kind: "unattributed",
+        session: 1,
+    });
+    assert.deepEqual(cache.get(1), { at: NOW });
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), {
+        kind: "unattributed",
+        session: 1,
+    });
+    assert.deepEqual(reads, [1, 2, 3]);
+});
+
 test("attributeConversations: a chain of 3 linked sessions resolves in 3 calls, 1 persona read each", async () => {
     const reads: number[] = [];
     const cache = new Map<number, SessionAgent>();
