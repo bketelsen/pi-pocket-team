@@ -28,7 +28,7 @@ Profiles are Markdown files in `~/.config/pi-pocket-team/agents/`; `PI_POCKET_TE
 | `mcp`          | The MCP servers the agent may use, such as `[truenas]`. |
 | `private`      | `true` for a personal agent: nobody delegates to it.    |
 
-A private agent (`private: true`) is your own person. In the panel, **Start session** opens a plain session of yours in its home, linked to no other session. Nobody delegates to it, the desk makes no found thread of its work, and its session sends nothing to another session or the desk.
+A private agent (`private: true`) is your own person. In the panel, **Open a session in <home>** opens an empty session of yours in its home, linked to no other session; you type the first message there. Nobody delegates to it, the desk makes no found thread of its work, and its session sends nothing to another session or the desk. The panel needs Pi Pocket 0.28.0 or later.
 
 An agent with several repositories gets its lessons split between them. Repository mappings are read fresh for each delegation, so an existing conversation sees an edit without reselecting the identity.
 

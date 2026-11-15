@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-15",
+  "scope": "team.ts",
+  "correction": "the Team panel's private start used host.sessions.start, which acts for the last writer of the source session, so the start could fail when nobody wrote there or send the owner's message in another person's name, also after a preflight check of that person (a race); the private start now uses the route request's createSession and sends no message",
+  "evidence": "bketelsen/pi-pocket-team#247, cross-review by openai/gpt-6.1-sol at 5483d69d8d4d554ee4326a94157fcfc73ec2a9b0 and 630c8f08057524e58f857f0b116f287a53130e6e",
+  "promoted_to": "team-private.test.ts: a private agent's start opens an empty session in its home, and the folder gives it the identity"
+}

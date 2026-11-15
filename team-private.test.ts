@@ -26,8 +26,9 @@ import { createHandler } from "./_pocket/src/server/http.ts";
 import createTeam, { Identity, privateToolBlock, roster } from "./team.ts";
 
 /**
- * Pi Pocket 0.28.0 adds `host.sessions`, which starts an ordinary session: an older release has none, and the Team panel
- * refuses a private agent's start with the way that works there. The tests of that start skip on the old release.
+ * Pi Pocket 0.28.0 adds the route request's `createSession`, which opens an ordinary session for the person who asks: an
+ * older release has none, and the Team panel refuses a private agent's start with the way that works there. The tests of
+ * that start skip on the old release.
  */
 const pocketVersion = (): string =>
     (
@@ -35,7 +36,7 @@ const pocketVersion = (): string =>
             version: string;
         }
     ).version;
-const startsPlainSessions = Number(pocketVersion().split(".")[1] ?? "0") >= 28;
+const opensSessions = Number(pocketVersion().split(".")[1] ?? "0") >= 28;
 
 test("roster: private is true, false, or absent, and another value makes the profile invalid", async () => {
     const folder = join(root, "private-agents");
@@ -236,16 +237,11 @@ async function call(path: string, body?: object) {
 }
 
 test(
-    "a private agent's start makes a plain session in its home: no link, the person's words only, and 1 session for a key",
-    { skip: !startsPlainSessions && "Pi Pocket before 0.28.0 has no host.sessions" },
+    "a private agent's start opens an empty session in its home, and the folder gives it the identity",
+    { skip: !opensSessions && "Pi Pocket before 0.28.0 cannot open a session from a route" },
     async () => {
         const sessions = app.sessions().length;
-        const request = {
-            agent: "chani",
-            message: "Sort my notes.\nThen rest.",
-            key: "private-start-0001",
-        };
-        const started = await call(`session/${source}/start`, request);
+        const started = await call(`session/${source}/start`, { agent: "chani" });
 
         assert.equal(started.status, 200, JSON.stringify(started.data));
         const child = started.data.session as ConversationId;
@@ -253,7 +249,8 @@ test(
         assert.equal("address" in started.data, false, "no return address: nothing links to it");
         assert.equal(app.cwdOf(child), chaniHome, "the session opens in the agent's home");
         assert.equal(app.sessions().length, sessions + 1);
-        // The session is no linked session: it is Brian's own, at the top.
+        // It is the owner's own session, at the top: no link, and no thread on the desk.
+        assert.equal(app.sessionMeta(child)?.createdBy, owner(app).id, "opened for the owner");
         assert.equal(
             app.sessions().find((each) => Number(each.id) === Number(child))?.linkedFrom,
             undefined,
@@ -267,78 +264,53 @@ test(
             false,
             "the source session has no linked session",
         );
-
-        await until(() => !app.isBusy(child), "the private session settled");
-        const texts = (await modelTexts(app, child)).join("\n");
-
-        assert.match(texts, /Sort my notes\./);
-        assert.doesNotMatch(texts, /Named identity/, "the first message has no identity preface");
-        // The identity is kept for later turns, and the prompt is the private one: no report to anyone.
+        // It is empty: the panel sends no message, so the session makes no model turn.
+        assert.deepEqual(await modelTexts(app, child), [], "no message in the new session");
+        assert.equal(app.isBusy(child), false);
+        // The identity is stored for the turns that follow.
         assert.equal((await app.harness.snapshot(Identity, child, context))?.persona?.id, "chani");
+
+        // The first message is Brian's, typed in the session: its prompt is the private one, with no report to anyone.
+        await say(app, child, "Sort my notes.");
+        assert.match((await modelTexts(app, child)).join("\n"), /Sort my notes\./);
+
         const here = promptWith("Sort my notes.");
 
         assert.match(here, /You work for Brian directly, in sessions he starts\./);
         assert.doesNotMatch(here, /return address/);
         assert.doesNotMatch(here, /report the result once with team_message/);
+    },
+);
 
-        // A repeat of the same key returns the same session, and sends no second message.
-        const again = await call(`session/${source}/start`, request);
+test(
+    "a private agent's start opens a session from a source session where nobody wrote yet",
+    { skip: !opensSessions && "Pi Pocket before 0.28.0 cannot open a session from a route" },
+    async () => {
+        // The start is the request's own session, not one made in the name of the last writer: a source with no message
+        // is enough.
+        const fresh = await newSession(app);
+        const sessions = app.sessions().length;
+        const started = await call(`session/${fresh}/start`, { agent: "chani" });
 
-        assert.equal(again.data.session, child);
+        assert.equal(started.status, 200, JSON.stringify(started.data));
+        assert.equal(app.cwdOf(started.data.session as ConversationId), chaniHome);
         assert.equal(app.sessions().length, sessions + 1);
     },
 );
 
 test(
-    "a private agent's start refuses a source session where nobody wrote yet, and starts nothing",
-    { skip: !startsPlainSessions && "Pi Pocket before 0.28.0 has no host.sessions" },
+    "each click opens a new session for a private agent",
+    { skip: !opensSessions && "Pi Pocket before 0.28.0 cannot open a session from a route" },
     async () => {
-        // A plain session acts for the person who wrote last there: with no such person, the start has no one to act
-        // for, and it must say so before it starts anything.
-        const fresh = await newSession(app);
+        // As New session: no key, so 2 clicks are 2 sessions, and nothing replays.
         const sessions = app.sessions().length;
-        const started = await call(`session/${fresh}/start`, {
-            agent: "chani",
-            message: "Sort my notes.",
-            key: "private-no-person-0001",
-        });
+        const first = await call(`session/${source}/start`, { agent: "chani" });
+        const second = await call(`session/${source}/start`, { agent: "chani" });
 
-        assert.equal(started.status, 409, JSON.stringify(started.data));
-        assert.match(
-            String(started.data.error),
-            /Chani's session starts for the person who wrote last in this session, and nobody wrote here yet: send a message here first, or start Chani with New session in .*\./,
-        );
-        assert.equal(app.sessions().length, sessions, "no session started");
-    },
-);
-
-test(
-    "a private agent's start refuses a source session where another person wrote last, and starts nothing",
-    { skip: !startsPlainSessions && "Pi Pocket before 0.28.0 has no host.sessions" },
-    async () => {
-        const guest = app.config.addUser("Guest", "guest").user;
-        const theirs = await newSession(app);
-        const submitted = await app.commands.submit(theirs, guest, {
-            text: "Please sort the notes.",
-            requestId: crypto.randomUUID(),
-        });
-
-        await (await app.harness.submission(submitted.submissionId, context))!.wait(context);
-
-        const sessions = app.sessions().length;
-        // The owner asks, but the guest wrote last: the session would start in the guest's name.
-        const started = await call(`session/${theirs}/start`, {
-            agent: "chani",
-            message: "Sort my notes.",
-            key: "private-other-person-0001",
-        });
-
-        assert.equal(started.status, 409, JSON.stringify(started.data));
-        assert.match(
-            String(started.data.error),
-            /Another person wrote last in this session, so Chani's session would start in their name: start Chani with New session in .*\./,
-        );
-        assert.equal(app.sessions().length, sessions, "no session started");
+        assert.equal(first.status, 200, JSON.stringify(first.data));
+        assert.equal(second.status, 200, JSON.stringify(second.data));
+        assert.notEqual(first.data.session, second.data.session);
+        assert.equal(app.sessions().length, sessions + 2);
     },
 );
 
@@ -418,20 +390,17 @@ test("team_delegate to a private agent is refused, and starts nothing", async ()
 test(
     "in a private agent's session the tools that reach another session or the desk are blocked",
     {
-        skip: !startsPlainSessions && "Pi Pocket before 0.28.0 has no host.sessions",
+        skip: !opensSessions && "Pi Pocket before 0.28.0 cannot open a session from a route",
     },
     async () => {
-        // A session of Chani's own: the start of the panel, which every Pocket since 0.28.0 makes.
-        const started = await call(`session/${source}/start`, {
-            agent: "chani",
-            message: "Hello.",
-            key: "private-guard-0001",
-        });
+        // A session of Chani's own: the empty session the panel opens.
+        const started = await call(`session/${source}/start`, { agent: "chani" });
 
         assert.equal(started.status, 200, JSON.stringify(started.data));
         const child = started.data.session as ConversationId;
 
-        await until(() => !app.isBusy(child), "the private session settled");
+        // The first message is the person's, typed in the session itself.
+        await say(app, child, "Hello.");
 
         // Each call's own refusal: the count goes up at each step, so a later step cannot pass on an earlier block.
         for (const words of [

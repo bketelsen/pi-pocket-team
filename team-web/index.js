@@ -8,13 +8,18 @@ export function newTaskKey(random = globalThis.crypto) {
 }
 
 /** What the panel's start button says: a private agent's session is Brian's own, not a linked task. */
-export const startLabel = (agent) => (agent?.private ? "Start session" : "Start linked task");
+export const startLabel = (agent) =>
+    agent?.private
+        ? agent.home
+            ? `Open a session in ${agent.home}`
+            : "Open a session"
+        : "Start linked task";
 
-/** What the panel says the start makes: a linked task of this session, or a plain session in the agent's home. */
+/** What the panel says the start makes: a linked task of this session, or an empty session in the agent's home. */
 export const startHelp = (agent, preferred) =>
     agent?.private
         ? agent.home
-            ? `The session opens in ${agent.home} as a plain session of yours, linked to no other session, with ${preferred ? "the preferred model" : "the default model of a new session"}. Your message is its first message, and the folder gives it ${agent.name}'s identity.`
+            ? `Opens a new session of yours in ${agent.home}, linked to no other session. Type your first message there; the folder gives it ${agent.name}'s identity.`
             : `${agent.name} is a private agent and its profile has no home: a session for it opens in its home, so add home to ${agent.id}.md first.`
         : `The task opens in the folder shown above with ${preferred ? "the preferred model" : "this session's model"}, plus the agent's identity and your brief. Start linked tasks from the original conversation; a linked task cannot start another.`;
 
@@ -305,13 +310,13 @@ export default function setup(pocket) {
             ? []
             : [...repositories.map(([name]) => name), ...(agent?.home ? ["home"] : [])];
         const chosenRepository = choices.includes(repository) ? repository : (choices[0] ?? "");
-        const taskCwd = agent?.private
-            ? agent?.home
-            : chosenRepository === "home"
-              ? agent?.home
-              : (agent?.repositories?.[chosenRepository] ??
-                agent?.workspace ??
-                session?.conversation.cwd);
+        // The task folder of a linked task: a private agent's card shows no task, so it is only read for the others.
+        const taskCwd =
+            chosenRepository === "home"
+                ? agent?.home
+                : (agent?.repositories?.[chosenRepository] ??
+                  agent?.workspace ??
+                  session?.conversation.cwd);
 
         const perform = async (action) => {
             setBusy(true);
@@ -337,6 +342,16 @@ export default function setup(pocket) {
             });
         const start = () =>
             perform(async () => {
+                // A private agent's session is empty: nothing to send, and no key to replay, because each click opens
+                // a new session, as New session does.
+                if (agent?.private) {
+                    const made = await pocket.api(`session/${source}/start`, { agent: selected });
+
+                    pocket.openConversation(made.session);
+
+                    return;
+                }
+
                 const key = requestKey ?? newTaskKey();
 
                 setRequestKey(key);
@@ -464,7 +479,10 @@ export default function setup(pocket) {
                         </label>
                     `
                     }
-                    <p class="small muted">Task folder: <span class="mono">${taskCwd ?? "Choose a source session"}</span></p>
+                    ${
+                        // A private agent's session opens empty: there is no task to write here, and no model to pick.
+                        !agent.private &&
+                        html`<p class="small muted">Task folder: <span class="mono">${taskCwd ?? "Choose a source session"}</span></p>
                     <label class="named-team-task"
                         >Start a separate task for ${agent.name}
                         <textarea
@@ -490,10 +508,11 @@ export default function setup(pocket) {
                             }}
                         />
                         Use the preferred model (must be allowed in Providers → Models for subagents)
-                    </label>
+                    </label>`
+                    }
                     <button
                         class="button"
-                        disabled=${busy || !source || !task.trim() || (agent.private === true && !agent.home)}
+                        disabled=${busy || !source || (agent.private === true ? !agent.home : !task.trim())}
                         onClick=${start}
                     >
                         ${busy ? "Working…" : startLabel(agent)}

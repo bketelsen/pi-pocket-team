@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-15",
+  "scope": "team.ts",
+  "correction": "the private guard read the Identity doc outside a catch, and a thrown beforeTool blocks the call, so a failed read could block team_message or desk in any session; privateToolBlock now catches every read and blocks only a private agent that a good read finds",
+  "evidence": "bketelsen/pi-pocket-team#247, cross-review by openai/gpt-6.1-sol at 5483d69d8d4d554ee4326a94157fcfc73ec2a9b0",
+  "promoted_to": "team-private.test.ts: a guard whose identity read fails blocks nothing, and a private identity blocks"
+}

@@ -2134,23 +2134,6 @@ export default function createTeam(host: Host, web: Web) {
         return agent;
     };
 
-    /** Ordinary sessions, since Pi Pocket 0.28.0: an older Pocket has none, and a private start says so. */
-    type PlainSessions = {
-        start: (
-            source: ConversationId,
-            request: { title?: string; cwd?: string; model?: string; message?: string },
-            key: string,
-        ) => Promise<{ session: ConversationId }>;
-    };
-
-    const plainSessions = (): PlainSessions | undefined => {
-        const sessions = (host as unknown as { sessions?: unknown }).sessions;
-
-        return typeof (sessions as PlainSessions | undefined)?.start === "function"
-            ? (sessions as PlainSessions)
-            : undefined;
-    };
-
     /** Every repository name on the roster, for the router's features: none when the roster cannot be read. */
     const rosterRepositories = async (): Promise<string[]> => {
         try {
@@ -3229,15 +3212,48 @@ export default function createTeam(host: Host, web: Web) {
         "session/:source/start",
         async (req) => {
             const persona = await find(req.body.agent);
-            const personal = persona.private === true;
+
+            // A private agent's session is Brian's own: the panel opens an empty session in the agent's home, bound to
+            // the person who asks, and linked to no other session. He types the first message there, so the panel sends
+            // no message and needs no key: nothing here can act for the last writer of the source.
+            if (persona.private === true) {
+                if (persona.home === undefined) {
+                    throw web.error(
+                        400,
+                        `${persona.name} is a private agent, and its profile has no home: a session for it opens in its home, so Brian adds home to ${persona.id}.md.`,
+                    );
+                }
+
+                const create = (
+                    req as unknown as {
+                        createSession?: (request: { cwd: string }) => Promise<{ id: number }>;
+                    }
+                ).createSession;
+
+                if (typeof create !== "function") {
+                    throw web.error(
+                        400,
+                        `Start ${persona.name} with New session in ${persona.home}: this Pi Pocket cannot start a plain session from the Team panel.`,
+                    );
+                }
+
+                const made = await create.call(req, { cwd: persona.home });
+
+                // The document keeps the identity for the turns that follow, as a linked start does.
+                await req.commit(async (tx) => {
+                    (await tx.doc(Identity, made.id as ConversationId)).persona ??= persona;
+                });
+
+                // No `address`: nothing links to this session, so there is nothing to answer.
+                return { session: made.id };
+            }
+
             let cwd: string | undefined;
 
-            if (!personal) {
-                try {
-                    cwd = taskTarget(persona, req.body.repository).folder;
-                } catch (error) {
-                    throw web.error(400, (error as Error).message);
-                }
+            try {
+                cwd = taskTarget(persona, req.body.repository).folder;
+            } catch (error) {
+                throw web.error(400, (error as Error).message);
             }
 
             const message = typeof req.body.message === "string" ? req.body.message.trim() : "";
@@ -3251,63 +3267,6 @@ export default function createTeam(host: Host, web: Web) {
                 req.body.usePreferredModel === true && persona.model
                     ? { model: persona.model }
                     : {};
-
-            // A private agent's session is Brian's own: it opens in the agent's home, linked to no other session, and
-            // its first message is his words only, with no identity preface and no task from a source session.
-            if (personal) {
-                if (persona.home === undefined) {
-                    throw web.error(
-                        400,
-                        `${persona.name} is a private agent, and its profile has no home: a session for it opens in its home, so Brian adds home to ${persona.id}.md.`,
-                    );
-                }
-
-                const sessions = plainSessions();
-
-                if (sessions === undefined) {
-                    throw web.error(
-                        400,
-                        `Start ${persona.name} with New session in ${persona.home}: this Pi Pocket cannot start a plain session from the Team panel.`,
-                    );
-                }
-
-                // A plain session acts for the person who wrote last in the source, not for the person who clicked. A
-                // private agent's session is Brian's own, so it starts only when that person is the one who asks now.
-                const by = host.requesterOf(req.conversation.id);
-
-                if (by === undefined) {
-                    throw web.error(
-                        409,
-                        `${persona.name}'s session starts for the person who wrote last in this session, and nobody wrote here yet: send a message here first, or start ${persona.name} with New session in ${persona.home}.`,
-                    );
-                }
-
-                if (by !== req.user.id) {
-                    throw web.error(
-                        409,
-                        `Another person wrote last in this session, so ${persona.name}'s session would start in their name: start ${persona.name} with New session in ${persona.home}.`,
-                    );
-                }
-
-                const plain = await sessions.start(
-                    req.conversation.id,
-                    {
-                        title: `${persona.name}: ${message.split("\n")[0]}`.slice(0, 120),
-                        cwd: persona.home,
-                        message,
-                        ...model,
-                    },
-                    `x.team.human:${key}`,
-                );
-
-                // The same durable step as a linked start: the document keeps the identity for later turns.
-                await req.commit(async (tx) => {
-                    (await tx.doc(Identity, plain.session)).persona ??= persona;
-                });
-
-                // No `address`: nothing links to this session, so there is nothing to answer.
-                return { session: plain.session };
-            }
 
             const started = await req.linkedSessions.start(
                 {

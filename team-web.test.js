@@ -73,14 +73,18 @@ test("the supervisor button: its name, its badge of open asks, and a tap that op
     assert.equal("open" in none, false);
 });
 
-test("a private agent's button starts a plain session, not a linked task", () => {
+test("a private agent's button opens an empty session, not a linked task", () => {
     const chan = { id: "chani", name: "Chani", private: true, home: "/home/team/chani" };
     const duncan = { id: "duncan", name: "Duncan Idaho" };
 
-    assert.equal(startLabel(chan), "Start session");
+    assert.equal(startLabel(chan), "Open a session in /home/team/chani");
+    assert.equal(startLabel({ ...chan, home: undefined }), "Open a session");
     assert.equal(startLabel(duncan), "Start linked task");
-    assert.match(startHelp(chan, false), /as a plain session of yours, linked to no other session/);
-    assert.match(startHelp(chan, false), /\/home\/team\/chani/);
+    // The panel opens the session and Brian types the first message there: no message goes from the panel.
+    assert.equal(
+        startHelp(chan, false),
+        "Opens a new session of yours in /home/team/chani, linked to no other session. Type your first message there; the folder gives it Chani's identity.",
+    );
     assert.doesNotMatch(startHelp(chan, false), /linked task cannot start another/);
     // A private agent with no home: the panel says what the profile needs.
     assert.match(
