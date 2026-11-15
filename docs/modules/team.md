@@ -124,13 +124,13 @@ An agent can have a home: 1 folder of its own, such as `~/agents/duncan`, with a
 
 Pi Pocket's `mcp` module (gallery entry `mcp`, source TannerMidd/pocket-mcp) reads 1 file, `~/.pi/agent/mcp.json`, and serves every server that the owner turned on to every session, with 3 tools: `mcp_tools`, `mcp_call` and `mcp_call_read_only`, each with a `server` argument. Team narrows them for named agents. Nothing in the `mcp` module changes: Team adds 1 hook and 1 prompt section.
 
-**The profile field.** `mcp:` is a YAML list of server names from `mcp.json`, for example `mcp: [truenas]`. Names only, never a secret. The roster gives it as `mcp` (`[]` when the field is absent: no MCP server). Any other value (a string, a number, a map, an empty name) makes the profile invalid, as a bad `home` does: the roster read fails and names the file.
+**The profile field.** `mcp:` is a YAML list of server names from `mcp.json`, for example `mcp: [truenas]`. Names only, never a secret. The roster gives it as `mcp` (`[]` when the field is absent: no MCP server). Any other value (a string, a number, a map, an empty name, or `mcp:` with no value) makes the profile invalid, as a bad `home` does: the roster read fails and names the file.
 
 **Whose list applies.** At each call of a tool whose name starts with `mcp_`, a `beforeTool` hook walks from the session up its chain, at most 20 sessions (`MCP_WALK_STEPS`):
 
 1. The first session on the chain with a named agent gives the agent's id: its Identity doc, else the agent whose home holds its folder (`resolveIdentity`; an explicit clear names no agent).
 2. Else the walk goes to the parent. A linked session's parent is its `linkedFrom.id` in Pi Pocket's session list (`pocket.sessions`). A subagent is not in that list: its parent is the session whose subagent records (`pocket.subagents`) hold it. The hook reads the session of the subagent's last run first (from `run.started`, a hint it checks), then the sessions in the subagent's folder, then the rest, at most 5000 records (`MCP_PARENT_READS`). A parent found, or not found, is kept in memory: Pocket writes a subagent's record in the commit that makes it.
-3. The hook then reads the agent's `mcp` from the **current** roster by id (`cachedRoster`, which reads a profile again when its file time changes), never from the persona copy in the Identity doc: that copy can be old. So a server granted or revoked in a profile reaches a running session at its next call.
+3. The hook then reads the agent's `mcp` from the **current** roster by id (`roster`: every profile read again at each call, with no cache), never from the persona copy in the Identity doc: that copy can be old. So a server granted or revoked in a profile reaches a running session at its next call.
 
 | Result of the walk                                                                                          | MCP tools                       |
 | ----------------------------------------------------------------------------------------------------------- | ------------------------------- |

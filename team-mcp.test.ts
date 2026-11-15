@@ -19,7 +19,7 @@ import {
     work,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import type { ConversationId } from "@earendil-works/pi-durable";
@@ -333,6 +333,24 @@ describe("the MCP scope of a session", () => {
             kind: "blocked",
             reason: "the profiles cannot be read, so the MCP servers of moneo are not known",
         });
+        // A profile that cannot be read, with its file time unchanged (a mode change): no cached grant survives.
+        const locked = join(root, "locked-agents");
+        const file = join(locked, "moneo.md");
+
+        mkdirSync(locked, { recursive: true });
+        writeFileSync(file, "---\nmcp: [truenas]\n---\n# Moneo\n");
+        assert.equal((await scopeOf(moneo, 61, undefined, locked)).kind, "agent");
+        chmodSync(file, 0o000);
+
+        try {
+            assert.deepEqual(await scopeOf(moneo, 61, undefined, locked), {
+                kind: "blocked",
+                reason: "the profiles cannot be read, so the MCP servers of moneo are not known",
+            });
+        } finally {
+            chmodSync(file, 0o600);
+        }
+
         // Brian's own session reads the roster for its folder's agent: a broken roster blocks there too.
         assert.equal(
             (

@@ -637,8 +637,11 @@ test("roster: mcp is a list of server names, [] when absent, and another type ma
     // A list: the names, in order.
     assert.deepEqual((await of("moneo")).mcp, ["truenas"]);
     assert.deepEqual((await of("chani")).mcp, ["frostnotes", "frostmail"]);
-    // Absent: no MCP server.
+    // Absent, or an empty list: no MCP server.
     assert.deepEqual((await of("duncan")).mcp, []);
+    writeFileSync(join(folder, "none.md"), "---\nmcp: []\n---\n# None\n");
+    assert.deepEqual((await of("none")).mcp, []);
+    rmSync(join(folder, "none.md"));
 
     // Another type: the profile is invalid, so the roster read fails and names the file.
     for (const bad of [
@@ -647,6 +650,9 @@ test("roster: mcp is a list of server names, [] when absent, and another type ma
         "mcp: [truenas, 5]",
         'mcp: [""]',
         "mcp:\n  name: truenas",
+        "mcp:",
+        "mcp: null",
+        "mcp: ~",
     ]) {
         writeFileSync(join(folder, "bad.md"), `---\n${bad}\n---\n# Bad\n`);
         await assert.rejects(

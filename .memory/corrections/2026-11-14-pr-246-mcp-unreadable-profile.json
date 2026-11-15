@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "team.ts",
+  "correction": "the MCP guard read an agent's mcp list through cachedRoster, whose key is the file times only, so a profile made unreadable by a mode change (the time unchanged) kept its old grant; the guard now reads every profile again at each call with roster(), with no cache and no last good roster",
+  "evidence": "bketelsen/pi-pocket-team#246, cross-review by openai/gpt-6.1-sol at 7f5699f3fd056c4ad0dc0ac903de33d32d991663",
+  "promoted_to": "team-mcp.test.ts: a profile removed, an empty roster, or a roster that cannot be read blocks a named agent"
+}

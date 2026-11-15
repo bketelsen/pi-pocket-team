@@ -672,11 +672,12 @@ const profileFiles = (names: string[]): string[] =>
     names.sort().filter((file) => /^[a-z0-9][a-z0-9_-]*\.md$/.test(file));
 
 /**
- * A profile's `mcp:` field: a list of MCP server names, `[]` when absent. Any other value makes the profile invalid,
- * as a bad `home` does: the roster read fails, and the MCP guard blocks (it never guesses a list).
+ * A profile's `mcp:` field: a list of MCP server names, `[]` when absent. Any other value (a YAML null too: `mcp:` with
+ * no value) makes the profile invalid, as a bad `home` does: the roster read fails, and the MCP guard blocks (it never
+ * guesses a list).
  */
 export function mcpServers(value: unknown, file: string): string[] {
-    if (value === undefined || value === null) {
+    if (value === undefined) {
         return [];
     }
 
@@ -685,7 +686,7 @@ export function mcpServers(value: unknown, file: string): string[] {
         value.some((name) => typeof name !== "string" || name.trim() === "")
     ) {
         throw new Error(
-            `${file}: mcp must be a list of MCP server names, such as mcp: [truenas], or absent.`,
+            `${file}: mcp must be a list of MCP server names, such as mcp: [truenas] (mcp: [] for none), or absent.`,
         );
     }
 
@@ -920,8 +921,9 @@ async function agentMcpScope(id: string, directory: string): Promise<McpScope> {
     let agents: Persona[];
 
     try {
-        // No last good roster here (guardRoster keeps one): a profile that cannot be read must not keep an old grant.
-        agents = await cachedRoster(directory);
+        // Every profile read again, with no cache and no last good roster (guardRoster keeps one): a profile that cannot
+        // be read now, also one whose file time did not change (a mode change), must not keep an old grant.
+        agents = await roster(directory);
     } catch {
         return {
             kind: "blocked",

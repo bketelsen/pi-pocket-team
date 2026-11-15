@@ -43,7 +43,7 @@ The Desk's goal board starts its shift rows through Team too, with `startShift`:
 
 ## MCP servers
 
-Pi Pocket's `mcp` module gives every session every MCP server that the owner turned on. Team narrows that for named agents: a profile's `mcp:` list names the servers the agent may use, and no list means none. A list that is not a list of names makes the profile invalid.
+Pi Pocket's `mcp` module gives every session every MCP server that the owner turned on. Team narrows that for named agents: a profile's `mcp:` list names the servers the agent may use, and no field means none (`mcp: []` too). Any other value, `mcp:` with no value too, makes the profile invalid.
 
 At each call of `mcp_tools`, `mcp_call` or `mcp_call_read_only`, a hook finds the session's agent: its own identity, else the agent of its folder, else the session that started it (a linked session's source, a subagent's parent), at most 20 sessions up. It reads that agent's list from the current profile, so a change reaches a running session at its next call. The hook blocks a server not on the list, `mcp_tools` with no `server`, and any other `mcp_` tool; calls from a codemode script too. A session with no named agent on its chain is the owner's own and gets every server. A chain it cannot follow, or an agent with no profile now, gets none.
 
