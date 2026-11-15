@@ -2,7 +2,7 @@
 
 Team gives Pi Pocket named people. An identity is a Markdown profile: a name, a model, the repositories that person owns, and a home folder. In a session that carries the identity, Pi becomes that person. A supervisor delegates self-contained tasks into the agents' repositories, and each agent keeps its own lessons across every repository it tends.
 
-Files: `team.ts` and `team-web/`. The module also adds a prompt section, the `team_delegate`, `team_work` and `team_memory` tools, and the "Your team" rail page.
+Files: `team.ts` and `team-web/`. The module also adds 2 prompt sections, the `team_delegate`, `team_work` and `team_memory` tools, and the "Your team" rail page.
 
 ## Turn it on, and use it
 
@@ -18,13 +18,14 @@ Selecting a person stores their identity in that conversation. It persists acros
 
 Profiles are Markdown files in `~/.config/pi-pocket-team/agents/`; `PI_POCKET_TEAM_AGENTS` selects another folder. The file name is the agent id: lowercase, and it must match `[a-z0-9][a-z0-9_-]*.md`. The body is the identity text, and its first `#` heading is the display name.
 
-| Field          | Meaning                                               |
-| -------------- | ----------------------------------------------------- |
-| `model`        | `provider/model`. A list uses only the first model.   |
-| `role`         | `supervisor`, `clerk`, or `agent`. Default: `agent`.  |
-| `repositories` | Map of repository name to an absolute or `~/` folder. |
-| `workspace`    | One folder, for non-repository work.                  |
-| `home`         | The agent's home folder: absolute or `~/`.            |
+| Field          | Meaning                                                 |
+| -------------- | ------------------------------------------------------- |
+| `model`        | `provider/model`. A list uses only the first model.     |
+| `role`         | `supervisor`, `clerk`, or `agent`. Default: `agent`.    |
+| `repositories` | Map of repository name to an absolute or `~/` folder.   |
+| `workspace`    | One folder, for non-repository work.                    |
+| `home`         | The agent's home folder: absolute or `~/`.              |
+| `mcp`          | The MCP servers the agent may use, such as `[truenas]`. |
 
 An agent with several repositories gets its lessons split between them. Repository mappings are read fresh for each delegation, so an existing conversation sees an edit without reselecting the identity.
 
@@ -40,6 +41,14 @@ Before each desk-tracked start (a task, a shift, the Clerk, a plan, a plan consu
 
 The Desk's goal board starts its shift rows through Team too, with `startShift`: the same start as `team_delegate` with `shift`, from the supervisor's session, under the board's key, with the row's end as the shift's absolute stop (`until_at`): a wait before round 1 never moves it. A model's `team_delegate` cannot set `until_at`. A replay of the key starts nothing again. The board's start never takes the desk's last free slots or Brian's OKs, and a start whose result is unknown (Pocket's start threw) is never tried again by itself.
 
+## MCP servers
+
+Pi Pocket's `mcp` module gives every session every MCP server that the owner turned on. Team narrows that for named agents: a profile's `mcp:` list names the servers the agent may use, and no field means none (`mcp: []` too). Any other value, `mcp:` with no value too, makes the profile invalid.
+
+At each call of `mcp_tools`, `mcp_call` or `mcp_call_read_only`, a hook finds the session's agent: its own identity, else the agent of its folder, else the session that started it (a linked session's source, a subagent's parent), at most 20 sessions up. It reads that agent's list from the current profile, so a change reaches a running session at its next call. The hook blocks a server not on the list, `mcp_tools` with no `server`, and any other `mcp_` tool; calls from a codemode script too. A session with no named agent on its chain is the owner's own and gets every server. A chain it cannot follow, or an agent with no profile now, gets none.
+
+A prompt section tells the agent its servers, or that it has none. The hook is a scope guard against wrong calls, not a wall: every agent runs as the same Unix user, and can read the server's secrets.
+
 ## Agent memory
 
 Pi Pocket's memory has 2 scopes: a project, and everywhere. Team adds a third layer: lessons for 1 named agent, which apply in every session that carries that identity, linked tasks included.
@@ -53,12 +62,12 @@ Pi Pocket's memory has 2 scopes: a project, and everywhere. Team adds a third la
 - The owner must enable the drop-in: Pi Pocket's extension policy reserves that action for the owner. Installing the files does not enable it or restart the server.
 - Automatic delegation runs the specialist on the model in its profile when Pi Pocket allows that model under **Providers → Models for subagents**; otherwise it runs on the supervisor's model, and the tool result says so. There is no automatic fallback: if the model cannot be used now, the tool fails and tells Pi to stop.
 - A specialist reports back through `team_message`. That report is model-driven, not an automatic completion hook. A report also lists its PRs in `prs`, as `{ repo, number }`: the desk puts each one on the thread.
-- There is no automatic review workflow, no scheduled duties, no imported MCP setup, and no shared notebook. This is a test of whether named people and task delegation are enough.
+- There is no automatic review workflow, no scheduled duties, no imported MCP setup, and no shared notebook. This is a test of whether named people and task delegation are enough. Team only narrows the MCP servers of Pi Pocket's `mcp` module for each agent.
 - All memory routes (`/api/x/team/memory…`) are owner-only. The durable documents `x.team.identity` and `x.team.memory` hold stored data: never rename a kind or change what a field means.
 - Disable **Team** in Extensions to remove the UI, tools and prompt section. Stored identities remain available if it is re-enabled.
 
 ## Read more
 
-The full detail is in the reference page: [Team](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md), [writing an agent profile](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#writing-an-agent-profile), [repository ownership](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#repository-ownership), [agent homes](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-homes), [agent memory](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-memory) and [prototype boundaries](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#prototype-boundaries).
+The full detail is in the reference page: [Team](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md), [writing an agent profile](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#writing-an-agent-profile), [repository ownership](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#repository-ownership), [agent homes](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-homes), [MCP servers](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#mcp-servers), [agent memory](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-memory) and [prototype boundaries](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#prototype-boundaries).
 
 The Desk is where a delegation's thread lives: see [Desk](desk.md).

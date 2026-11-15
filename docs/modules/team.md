@@ -16,13 +16,14 @@ Profiles are Markdown files in `~/.config/pi-pocket-team/agents/` (override with
 
 Frontmatter fields:
 
-| Field          | Meaning                                                                     |
-| -------------- | --------------------------------------------------------------------------- |
-| `model`        | `provider/model`. A list uses only the first model.                         |
-| `role`         | `supervisor`, `clerk`, or `agent`. Default: `agent`.                        |
-| `repositories` | Map of repository name to an absolute or `~/` folder.                       |
-| `workspace`    | One folder, for non-repository work.                                        |
-| `home`         | The agent's home folder: absolute or `~/`. See [Agent homes](#agent-homes). |
+| Field          | Meaning                                                                      |
+| -------------- | ---------------------------------------------------------------------------- |
+| `model`        | `provider/model`. A list uses only the first model.                          |
+| `role`         | `supervisor`, `clerk`, or `agent`. Default: `agent`.                         |
+| `repositories` | Map of repository name to an absolute or `~/` folder.                        |
+| `workspace`    | One folder, for non-repository work.                                         |
+| `home`         | The agent's home folder: absolute or `~/`. See [Agent homes](#agent-homes).  |
+| `mcp`          | The MCP servers the agent may use, by name. See [MCP servers](#mcp-servers). |
 
 A supervisor, `lead.md`, named "Lead", with no repositories:
 
@@ -119,6 +120,33 @@ An agent can have a home: 1 folder of its own, such as `~/agents/duncan`, with a
 
 **`repository: "home"`.** `team_delegate`, and the Team page's **Start linked task**, take `repository: "home"`: the task starts in the agent's home itself, with no worktree, and its desk thread has no repository and `cwd` = the home. It refuses an agent whose profile has no home. Without a repository, an only repository or a workspace, the home is the default target. With 2 or more repositories and none named, the error lists them and `home`. Code work with a repository still gets its worktree, also when the supervisor's own session is in a home. A Clerk keeps its `workspace`. On the Team page each agent card shows `Home: <folder>` and the hint "Star this folder in New session to get a launcher entry", and the repository picker offers `home`.
 
+## MCP servers
+
+Pi Pocket's `mcp` module (gallery entry `mcp`, source TannerMidd/pocket-mcp) reads 1 file, `~/.pi/agent/mcp.json`, and serves every server that the owner turned on to every session, with 3 tools: `mcp_tools`, `mcp_call` and `mcp_call_read_only`, each with a `server` argument. Team narrows them for named agents. Nothing in the `mcp` module changes: Team adds 1 hook and 1 prompt section.
+
+**The profile field.** `mcp:` is a YAML list of server names from `mcp.json`, for example `mcp: [truenas]`. Names only, never a secret. The roster gives it as `mcp` (`[]` when the field is absent: no MCP server). Any other value (a string, a number, a map, an empty name, or `mcp:` with no value) makes the profile invalid, as a bad `home` does: the roster read fails and names the file.
+
+**Whose list applies.** At each call of a tool whose name starts with `mcp_`, a `beforeTool` hook walks from the session up its chain, at most 20 sessions (`MCP_WALK_STEPS`):
+
+1. The first session on the chain with a named agent gives the agent's id: its Identity doc, else the agent whose home holds its folder (`resolveIdentity`; an explicit clear names no agent).
+2. Else the walk goes to the parent. A linked session's parent is its `linkedFrom.id` in Pi Pocket's session list (`pocket.sessions`). A subagent is not in that list: its parent is the session whose subagent records (`pocket.subagents`) hold it. The hook reads the session of the subagent's last run first (from `run.started`, a hint it checks), then the sessions in the subagent's folder, then the rest, at most 5000 records (`MCP_PARENT_READS`). A parent found, or not found, is kept in memory: Pocket writes a subagent's record in the commit that makes it.
+3. The hook then reads the agent's `mcp` from the **current** roster by id (`roster`: every profile read again at each call, with no cache), never from the persona copy in the Identity doc: that copy can be old. So a server granted or revoked in a profile reaches a running session at its next call.
+
+| Result of the walk                                                                                          | MCP tools                       |
+| ----------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| A named agent whose profile is in the current roster                                                        | Only the servers in its `mcp`   |
+| A named agent with no profile now, an empty roster, or a roster that cannot be read                         | Blocked                         |
+| A session with no `linkedFrom` and no named agent on the way (Brian's own session, its subagents and links) | Every server, every `mcp_` tool |
+| A cycle, more than 20 sessions, a missing parent, a bad `linkedFrom`, or a failed read                      | Blocked                         |
+
+The hook keeps no last good roster (the edit guard does): a profile folder that cannot be read must not keep an old grant. A broken profile therefore blocks MCP also in Brian's own session when its folder needs the roster.
+
+**What it blocks.** For a named agent: `mcp_call` and `mcp_call_read_only` with a `server` not in its list; `mcp_tools` with a `server` not in its list, or with no `server` (its full answer would show every server's tools); each of the 3 when the list is empty; and any other tool whose name starts with `mcp_`. Each block names the agent and its servers ("Moneo (moneo) may use only the MCP servers: truenas. Give server: one of truenas."). Calls from a codemode script go through the same hook, and are blocked the same way.
+
+**The prompt section.** The section `team_mcp` says, in a named agent's session and in its subagents and linked sessions: "Of the MCP servers above, you may use only: truenas. Give server in each call of mcp_tools, mcp_call and mcp_call_read_only.", or "No MCP server is given to you: do not call mcp_tools or mcp_call." When the walk blocks, it says why. Brian's own session gets no such section. The `mcp` module's own section still lists every server that is on.
+
+**A scope guard, not a wall.** Every agent's `bash` runs as the same Unix user as Pocket, so it can read the secrets that `mcp.json` reads and the tokens under `~/.pi-pocket/mcp/`. The hook stops wrong or injected MCP tool calls; it does not keep a server's data from another agent.
+
 ## Brian's team (an example)
 
 Brian's own team has Dune names. It is only an example; write your own profiles as above.
@@ -144,7 +172,7 @@ Pi Pocket sets the child's actual working directory before the first request: pr
 - Direct identity selection keeps the existing model, folder, and history. Use a fresh session for a fresh task; select the model in Pi Pocket's native picker.
 - Automatic delegation (`team_delegate`) runs the specialist on the model in its profile when Pi Pocket allows that model under **Providers → Models for subagents**; otherwise it runs on the supervisor's model, and the tool result says so. Odrade's roster shows each agent's model. Thinking stays at the supervisor's level or lower. If core refuses the start (the model can't be used now), the tool fails and tells Pi to stop and tell the user, not to try another model. Delegation selects the specialist's repository folder. The Team panel's start can also opt into a person's preferred model. Only the first model in an old fallback list is imported; there is no automatic fallback.
 - This uses Pi Pocket's linked-session rules, including its limits. A specialist reports back through `team_message`; that report is model-driven, not an automatic completion hook. The supervisor can do work directly or delegate one level.
-- There is no automatic review workflow, scheduled duties, imported MCP setup, or shared notebook. This is a test of whether named people and task delegation are enough, before deciding what else is worth carrying over.
+- There is no automatic review workflow, scheduled duties, imported MCP setup, or shared notebook. Team only narrows the MCP servers of Pi Pocket's `mcp` module for each agent ([MCP servers](#mcp-servers)). This is a test of whether named people and task delegation are enough, before deciding what else is worth carrying over.
 - Moving the app locally does not change a provider's content policies.
 
 ## Shifts from the Desk's goal board
@@ -176,7 +204,7 @@ The rail has a second Team button, with the supervisor's name ("Odrade") and a c
 
 ## Team files
 
-Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity` (`persona`, and `cleared` for an explicit none); UI routes are in the owner-only `/api/x/team/` namespace.
+Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity` (`persona`, and `cleared` for an explicit none); UI routes are in the owner-only `/api/x/team/` namespace. The MCP guard also reads 2 of Pi Pocket's own documents, never writing them: `pocket.sessions` (each session's `linkedFrom` and folder) and `pocket.subagents` (each subagent's conversation).
 
 Runtime imports use Pi Pocket's public extension API and installed Pi packages. Test and preview scripts (`team.test.ts`, `team-memory.test.ts`, `preview.ts`) use the checkout's internal test harness, isolated temporary data, and a fake model. They are not installed.
 

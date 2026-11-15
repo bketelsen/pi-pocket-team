@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "team.ts",
+  "correction": "the profile field mcp took a YAML null (mcp: with no value, null or ~) as an empty list, where only an absent field may mean none and every other value must make the profile invalid; mcpServers now rejects null",
+  "evidence": "bketelsen/pi-pocket-team#246, cross-review by openai/gpt-6.1-sol at 7f5699f3fd056c4ad0dc0ac903de33d32d991663",
+  "promoted_to": "team.test.ts: roster: mcp is a list of server names, [] when absent, and another type makes the profile invalid"
+}
