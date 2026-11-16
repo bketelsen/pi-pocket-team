@@ -939,6 +939,12 @@ export function natsTransport(gateway: string): Transport {
             throw error;
         }
 
+        // nats.js settles `closed()` with the error that ended the connection, or with nothing.
+        const ended = nc.closed().then(
+            () => "closed" as const,
+            () => "closed" as const,
+        );
+
         return {
             async pull(stream, consumer, wait) {
                 if (nc.isClosed()) {
@@ -946,11 +952,27 @@ export function natsTransport(gateway: string): Transport {
                 }
 
                 try {
-                    const msg = await nc.request(
+                    // `noMux`: 1 inbox of its own for each pull. JetStream sends an event to the reply inbox under
+                    // the event's own subject (`marks.bookmark...`), not the inbox's, and the shared request inbox
+                    // matches a reply by its subject: it would drop the event, the pull would time out, and the event
+                    // would come again at each pull with no ack. A status (404, 408, 409) does come with the inbox as
+                    // its subject, so only real events were lost.
+                    const request = nc.request(
                         `$JS.API.CONSUMER.MSG.NEXT.${stream}.${consumer}`,
                         JSON.stringify({ batch: 1, expires: wait * 1_000_000 }),
-                        { timeout: wait + 5_000 },
+                        { timeout: wait + 5_000, noMux: true },
                     );
+
+                    // A request with its own inbox never settles when the connection ends (nats.js closes its
+                    // subscription with no callback): the end of the connection ends the pull.
+                    request.catch(() => undefined);
+
+                    const msg = await Promise.race([request, ended]);
+
+                    if (msg === "closed") {
+                        return { kind: "closed" };
+                    }
+
                     const code = msg.headers?.code ?? 0;
 
                     if (code === 0 || code === 200) {
@@ -995,7 +1017,7 @@ export function natsTransport(gateway: string): Transport {
                 nc.publish(reply, "+ACK");
                 await nc.flush();
             },
-            closed: nc.closed().then(() => undefined),
+            closed: ended.then(() => undefined),
             close: () => nc.close(),
         };
     };
