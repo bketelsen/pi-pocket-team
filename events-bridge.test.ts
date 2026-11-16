@@ -24,6 +24,9 @@ import {
     gatewayEntries,
     Hider,
     hideTokenFiles,
+    pendingAnswer,
+    REPEAT_NOTE,
+    TAKEN_KEEP,
     gatewayOf,
     type Lodge,
     type LodgeAnswer,
@@ -220,6 +223,10 @@ class FakeConnection implements BrokerConnection {
     readonly closed = new Promise<void>((resolve) => (this.#close = resolve));
     #ended = false;
 
+    get ended(): boolean {
+        return this.#ended;
+    }
+
     push(consumer: string, data: Uint8Array): void {
         const waiter = this.waiting.get(consumer);
 
@@ -302,6 +309,10 @@ type Rig = {
     dir: string;
     clock: { now: number };
     connections: FakeConnection[];
+    /** Holds the opening of a connection until the test opens it. */
+    transportGate: Promise<void> | undefined;
+    /** Connections that started to open. */
+    opening: number;
     /** A new bridge on the same store, lodge and sessions: a restart. */
     restart: () => Promise<AgentBridge>;
 };
@@ -323,7 +334,12 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
     const file = new GatedFile(dir, "moneo");
     const connections: FakeConnection[] = [];
 
+    const gates: { rig?: Rig } = {};
+
     const transport: Transport = async () => {
+        gates.rig!.opening++;
+        await gates.rig!.transportGate;
+
         const connection = new FakeConnection();
 
         connections.push(connection);
@@ -361,7 +377,7 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
 
     const bridge = await make();
 
-    return {
+    gates.rig = {
         bridge,
         lodge,
         sessions,
@@ -370,8 +386,12 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
         dir,
         clock,
         connections,
+        transportGate: undefined,
+        opening: 0,
         restart: make,
     };
+
+    return gates.rig;
 }
 
 /** The bridge stays idle: subscribe with the pulls stopped. */
@@ -1270,6 +1290,110 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         assert.deepEqual(r.bridge.state.batches, {});
         assert.equal(r.bridge.pendingCount(), 1);
         assert.equal(Object.values(r.bridge.state.pending)[0]?.again, true);
+
+        // events_pending shows the mark and its note, as the inbox message does.
+        const answer = pendingAnswer(await r.bridge.takePending(10, "9:call-1"), (line) => line);
+
+        assert.match(answer, /repeat=maybe/);
+        assert.ok(answer.includes(REPEAT_NOTE));
+    });
+
+    test("a batch that may have woken the agent keeps its wake in the hour, also after a restart", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        // The 1st batch went, but every answer was lost: it ends in the digest, and its wake still counts.
+        await receive(r.bridge, sub.name, event());
+
+        for (let n = 0; n <= RETRIES; n++) {
+            r.sessions.script.push("crash");
+        }
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+
+        for (const wait of RETRY_MS) {
+            r.clock.now += wait;
+            await r.bridge.tick();
+        }
+
+        for (let wake = 1; wake < WAKES_PER_HOUR; wake++) {
+            await receive(r.bridge, sub.name, event());
+            r.clock.now += BATCH_MS;
+            await r.bridge.tick();
+        }
+
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        await receive(again, sub.name, event());
+        r.clock.now += BATCH_MS;
+        await again.tick();
+        assert.equal(r.sessions.delivered.length - RETRIES, WAKES_PER_HOUR);
+        assert.equal(r.sessions.sent().length, WAKES_PER_HOUR);
+    });
+
+    test("a try that may have gone, then no new session, then a new one: the events say repeat=maybe", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+        r.sessions.script.push("crash");
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        // The session moves out of the agent's home; the next session cannot be made yet.
+        r.sessions.folders.set(first, "/home/agents/duncan");
+
+        let open: () => void = () => undefined;
+
+        r.sessions.gate = Promise.reject(new Error("Pocket refused the new session"));
+        r.sessions.gate.catch(() => undefined);
+        r.clock.now += RETRY_MS[0];
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 1);
+
+        r.sessions.gate = new Promise((resolve) => (open = resolve));
+        open();
+        r.clock.now += RETRY_MS[1];
+        await r.bridge.tick();
+        await r.bridge.tick();
+
+        const last = r.sessions.sent().at(-1)!;
+
+        assert.notEqual(last.target, first);
+        assert.match(last.delivery.payload, new RegExp(`id=${e.id} repeat=maybe`));
+    });
+
+    test("a digest that may have gone, then no new session, then a new one: the events say repeat=maybe", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const first = r.bridge.state.session!.id;
+        const e = event();
+
+        // The day's digest time is past at T0: the first tick only marks today.
+        await r.bridge.tick();
+        await receive(r.bridge, sub.name, e);
+        r.sessions.script.push("crash");
+        r.clock.now = digestTime("2026-11-17");
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 1);
+        r.sessions.folders.set(first, "/home/agents/duncan");
+        r.sessions.gate = Promise.reject(new Error("Pocket refused the new session"));
+        r.sessions.gate.catch(() => undefined);
+        r.clock.now += 3_600_000;
+        await r.bridge.tick();
+        r.sessions.gate = undefined;
+        r.clock.now += 3_600_000;
+        await r.bridge.tick();
+        await r.bridge.tick();
+
+        const last = r.sessions.sent().at(-1)!;
+
+        assert.notEqual(last.target, first);
+        assert.match(last.delivery.payload, new RegExp(`id=${e.id} repeat=maybe`));
     });
 
     test("a wake that goes late counts in the hour from when it went", async () => {
@@ -1303,6 +1427,52 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         await receive(r.bridge, sub.name, event());
         assert.deepEqual(await r.bridge.takePending(10, "9:call-old"), taken);
     });
+
+    test("events_pending keeps its newest answers always, and an older one for 8 days: the bound of a replay", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.takePending(10, "9:call-old");
+
+        for (let n = 0; n < TAKEN_KEEP; n++) {
+            r.clock.now += 1_000;
+            await r.bridge.takePending(10, `9:call-${String(n)}`);
+        }
+
+        // 100 newer answers, but within 8 days: the old one stays.
+        await receive(r.bridge, sub.name, event());
+        assert.ok(r.bridge.state.taken?.["9:call-old"] !== undefined);
+
+        // After 8 days, with 100 newer answers: it goes; the newest 100 stay.
+        r.clock.now += 8 * 24 * 3_600_000 + 1;
+        await receive(r.bridge, sub.name, event());
+        assert.equal(r.bridge.state.taken?.["9:call-old"], undefined);
+        assert.equal(Object.keys(r.bridge.state.taken ?? {}).length, TAKEN_KEEP);
+    });
+
+    test(
+        "a stop while a connection opens closes that connection, and the stop ends",
+        { timeout: 10_000 },
+        async () => {
+            const r = await rig({ running: true });
+            const sub = await subscribe(r);
+            let opened: () => void = () => undefined;
+
+            r.transportGate = new Promise((resolve) => (opened = resolve));
+            r.bridge.start();
+            await until(() => r.opening > 0);
+            await r.bridge.unsubscribe(sub.name);
+
+            let stopped = false;
+            const stopping = r.bridge.stop().then(() => (stopped = true));
+
+            opened();
+            await stopping;
+            assert.equal(stopped, true);
+            assert.equal(r.connections.at(-1)?.ended, true);
+        },
+    );
 
     test("a stop waits for a worker that waits on lodge, and that worker writes nothing after it", async () => {
         const r = await rig({ running: true });

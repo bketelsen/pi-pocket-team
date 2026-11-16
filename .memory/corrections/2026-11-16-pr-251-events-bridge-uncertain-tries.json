@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "events-bridge.ts",
+  "correction": "a failed session start erased a try's may-have-gone mark, events_pending dropped the repeat=maybe mark, a batch that may have woken the agent gave back its wake, and a stop during a connection's opening hung: the mark now stays until the batch ends (uncertain), events_pending shows repeat=maybe and its note, such a batch keeps its wake in the hour, and a round closes a connection that opened after a stop",
+  "evidence": "bketelsen/pi-pocket-team#251: re-review 2 (openai/gpt-6.1-sol) of dd12680 found 6 blocking points; the delivery contract (at least once) and the replay bound of events_pending go to the owner",
+  "promoted_to": "events-bridge.test.ts: a try that may have gone, then no new session, then a new one says repeat=maybe (batch and digest); a batch whose tries all end with no answer shows repeat=maybe in events_pending; a batch that may have woken the agent keeps its wake after a restart; a stop while a connection opens ends; events_pending keeps its newest answers always"
+}
