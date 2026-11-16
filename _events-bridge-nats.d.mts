@@ -21,7 +21,8 @@ export interface NatsConnection {
     request(
         subject: string,
         payload?: string | Uint8Array,
-        opts?: { timeout: number },
+        /** `noMux`: the request has an inbox of its own, which takes a reply under any subject. */
+        opts?: { timeout: number; noMux?: boolean },
     ): Promise<Msg>;
     publish(subject: string, payload?: string | Uint8Array): void;
     flush(): Promise<void>;

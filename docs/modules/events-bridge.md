@@ -59,7 +59,7 @@ An event is in the store before its JetStream ack. A delivery's key is stable (`
 
 ## The broker
 
-The bridge connects with NATS over WebSocket at `wss://<lodge>/nats`, with the access token, and an inbox prefix of `_INBOX.<broker name>` (`o` and the client ID's bytes in lower-case base32). It pulls 1 message at a time from each consumer that lodge made (`$JS.API.CONSUMER.MSG.NEXT`), waits 30 s per pull, and acks with `+ACK`. It reconnects with a fresh token, with a growing wait (up to 60 s) when connections keep failing. A refused token makes it ask lodge's HTTP side whether it was a revoke.
+The bridge connects with NATS over WebSocket at `wss://<lodge>/nats`, with the access token, and an inbox prefix of `_INBOX.<broker name>` (`o` and the client ID's bytes in lower-case base32). It pulls 1 message at a time from each consumer that lodge made (`$JS.API.CONSUMER.MSG.NEXT`), waits 30 s per pull, and acks with `+ACK`. Each pull has its own reply inbox (nats.js `noMux`): JetStream sends an event under the event's own subject, which nats.js's shared request inbox does not match, and the end of the connection ends a pull that waits. `events-bridge-nats.test.ts` checks this against a fake NATS server over WebSocket, and against a real nats-server with JetStream when `NATS_SERVER` names its binary. It reconnects with a fresh token, with a growing wait (up to 60 s) when connections keep failing. A refused token makes it ask lodge's HTTP side whether it was a revoke.
 
 ## The vendored client
 
