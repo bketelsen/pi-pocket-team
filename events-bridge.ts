@@ -81,6 +81,8 @@ export const DIGEST_CAP = 1000;
 export const SEEN_MS = 8 * 24 * 3_600_000;
 /** The most text of 1 message's event lines: Pocket cuts a payload at 8,000 characters. */
 export const PAYLOAD_BUDGET = 7_000;
+/** events_pending's newest answers that are always kept, for a replay of their call. */
+export const TAKEN_KEEP = 100;
 /** A pause notice that did not go is tried again after this wait, doubled each time, 1 hour at most. */
 export const NOTICE_RETRY_MS = 30_000;
 /** A pull waits this long for an event; lodge allows 60 s at most. */
@@ -124,6 +126,11 @@ export type Pending = {
     received: number;
     state: "batched" | "digest";
     batch?: string;
+    /**
+     * It may have reached the agent before: a try of it ended with no answer, and the next one could not go to the same
+     * session. Its line says so; the agent de-duplicates by the event's id (delivery is at least once).
+     */
+    again?: true;
 };
 
 /** A `now` batch: open until `closeAt`; then delivering, with its tries, until it goes or moves to the digest. */
@@ -1081,6 +1088,12 @@ export class AgentBridge {
 
     /** Runs a change of the store: on a copy, saved, then kept. Changes run 1 at a time. */
     #change<T>(change: (state: AgentState) => T): Promise<T> {
+        // A stopped bridge writes nothing more: after a reload, only the new bridge writes the store. An event whose
+        // write is refused is not acked, so the broker brings it again.
+        if (this.#stopped) {
+            return Promise.reject(new Error(`the events bridge of ${this.agent} has stopped`));
+        }
+
         const run = this.#queue.then(async () => {
             const next = structuredClone(this.#state!);
             const result = change(next);
@@ -1106,8 +1119,11 @@ export class AgentBridge {
             }
         }
 
-        for (const [key, taken] of Object.entries(state.taken ?? {})) {
-            if (now - taken.at > 24 * HOUR) {
+        // An answer is kept while a replay of its call can still come: the newest 100 always, the others 8 days.
+        const answers = Object.entries(state.taken ?? {}).sort((a, b) => b[1].at - a[1].at);
+
+        for (const [key, taken] of answers.slice(TAKEN_KEEP)) {
+            if (now - taken.at > SEEN_MS) {
                 delete state.taken![key];
             }
         }
@@ -1140,7 +1156,7 @@ export class AgentBridge {
         this.#cancelTimer = undefined;
         this.#changed.fire();
         await this.#connection?.close().catch(() => undefined);
-        await this.#running;
+        await this.#running?.catch(() => undefined);
         await this.#ticking;
         await this.#queue;
     }
@@ -1155,79 +1171,103 @@ export class AgentBridge {
         return this.#state!.paused === undefined ? Object.values(this.#state!.subs) : [];
     }
 
+    /** The pulls, until the stop. A round that fails (a store write, a refused change) waits, then the next one runs. */
     async #run(): Promise<void> {
-        let attempt = 0;
+        const state = { attempt: 0 };
 
         while (!this.#stopped) {
-            if (this.#active().length === 0) {
-                await this.#changed.promise;
-                continue;
-            }
-
-            let connection: BrokerConnection;
-
             try {
-                const token = await this.#deps.lodge.token();
-
-                connection = await this.#deps.transport({
-                    token,
-                    inboxPrefix: await this.#deps.lodge.inboxPrefix(),
-                });
+                await this.#round(state);
             } catch (error) {
-                if (error instanceof AuthRequired) {
-                    await this.#authFailed(error);
-                    continue;
+                if (this.#stopped) {
+                    return;
                 }
 
-                if (error instanceof BrokerAuthError) {
-                    // lodge's HTTP side tells a refused token (401, a refresh, a revoke) from a passing one.
-                    await this.#checkLodge();
-                }
+                this.#deps.notice("error", `Events bridge (${this.agent}): ${messageOf(error)}`);
+                await this.#sleep(this.#deps.backoff?.(1) ?? 5_000);
+            }
+        }
+    }
 
-                attempt++;
-                await this.#sleep(
-                    this.#deps.backoff?.(attempt) ?? Math.min(60_000, 1_000 * 2 ** attempt),
-                );
-                continue;
+    /** 1 round of the pulls: a connection and its workers, or a wait. */
+    async #round(round: { attempt: number }): Promise<void> {
+        if (this.#active().length === 0) {
+            await this.#changed.promise;
+
+            return;
+        }
+
+        let connection: BrokerConnection;
+
+        try {
+            const token = await this.#deps.lodge.token();
+
+            connection = await this.#deps.transport({
+                token,
+                inboxPrefix: await this.#deps.lodge.inboxPrefix(),
+            });
+        } catch (error) {
+            if (error instanceof AuthRequired) {
+                await this.#authFailed(error);
+
+                return;
             }
 
-            this.#connection = connection;
-            this.#connected = true;
-
-            const opened = this.#now();
-            const subs = this.#active();
-            const why = await Promise.race([
-                connection.closed.then(() => "ended" as const),
-                this.#changed.promise.then(() => "changed" as const),
-                ...subs.map((sub) =>
-                    this.#pullLoop(connection, sub).then(
-                        () => "ended" as const,
-                        (error: unknown) => {
-                            this.#deps.notice(
-                                "error",
-                                `Events bridge (${this.agent}): ${messageOf(error)}`,
-                            );
-
-                            return "ended" as const;
-                        },
-                    ),
-                ),
-            ]);
-
-            this.#connected = false;
-            this.#connection = undefined;
-            await connection.close().catch(() => undefined);
-
-            // lodge ends a connection at a subscription change and when its token runs out: connect again soon. A
-            // connection that ends at once, again and again, waits longer each time.
-            if (why === "ended" && !this.#stopped) {
-                attempt = this.#now() - opened < 30_000 ? attempt + 1 : 1;
-                await this.#sleep(
-                    this.#deps.backoff?.(attempt) ?? Math.min(60_000, 1_000 * 2 ** (attempt - 1)),
-                );
-            } else {
-                attempt = 0;
+            if (error instanceof BrokerAuthError) {
+                // lodge's HTTP side tells a refused token (401, a refresh, a revoke) from a passing one.
+                await this.#checkLodge();
             }
+
+            round.attempt++;
+            await this.#sleep(
+                this.#deps.backoff?.(round.attempt) ?? Math.min(60_000, 1_000 * 2 ** round.attempt),
+            );
+
+            return;
+        }
+
+        this.#connection = connection;
+        this.#connected = true;
+
+        const opened = this.#now();
+        const subs = this.#active();
+        const workers = subs.map((sub) =>
+            this.#pullLoop(connection, sub).then(
+                () => "ended" as const,
+                (error: unknown) => {
+                    if (!this.#stopped) {
+                        this.#deps.notice(
+                            "error",
+                            `Events bridge (${this.agent}): ${messageOf(error)}`,
+                        );
+                    }
+
+                    return "ended" as const;
+                },
+            ),
+        );
+        const why = await Promise.race([
+            connection.closed.then(() => "ended" as const),
+            this.#changed.promise.then(() => "changed" as const),
+            ...workers,
+        ]);
+
+        this.#connected = false;
+        this.#connection = undefined;
+        await connection.close().catch(() => undefined);
+        // Every worker ends before the next connection or the stop: none is left to write later.
+        await Promise.all(workers);
+
+        // lodge ends a connection at a subscription change and when its token runs out: connect again soon. A
+        // connection that ends at once, again and again, waits longer each time.
+        if (why === "ended" && !this.#stopped) {
+            round.attempt = this.#now() - opened < 30_000 ? round.attempt + 1 : 1;
+            await this.#sleep(
+                this.#deps.backoff?.(round.attempt) ??
+                    Math.min(60_000, 1_000 * 2 ** (round.attempt - 1)),
+            );
+        } else {
+            round.attempt = 0;
         }
     }
 
@@ -1366,6 +1406,11 @@ export class AgentBridge {
 
         if (batch !== undefined) {
             this.#release(state, batch);
+
+            // A try that may have gone: the digest may show its events a second time.
+            if (batch.inflight === true) {
+                this.#mayRepeat(state, batch.events);
+            }
         }
 
         for (const id of batch?.events ?? []) {
@@ -1885,7 +1930,12 @@ export class AgentBridge {
                     await this.#due();
                 } while (this.#again && !this.#stopped);
             } catch (error) {
-                this.#deps.notice("error", `Events bridge (${this.agent}): ${messageOf(error)}`);
+                if (!this.#stopped) {
+                    this.#deps.notice(
+                        "error",
+                        `Events bridge (${this.agent}): ${messageOf(error)}`,
+                    );
+                }
             } finally {
                 this.#ticking = undefined;
                 this.#schedule();
@@ -1926,8 +1976,15 @@ export class AgentBridge {
         return `Lodge events for ${name}'s subscriptions (the events bridge). Each line between the tags is 1 event: its time, its type, the object's id (subject), its path (selector), who made it (author) and the event's id. An event carries no content: read the object through your lodge gateway tools before you act. Do what your standing instructions for these events say; with none, say in 1 line what happened. The type org.frostyard.lodge.resync means that events were lost: read the state again through the app's tools.`;
     }
 
-    #payload(header: string, events: readonly ThinEvent[], more: number): string {
-        const lines = events.map((event) => eventLine(event));
+    #payload(header: string, events: readonly Pending[], more: number): string {
+        const lines = events.map(
+            (each) => `${eventLine(each.event)}${each.again === true ? " repeat=maybe" : ""}`,
+        );
+
+        if (events.some((each) => each.again === true)) {
+            header +=
+                " Lines with repeat=maybe may have come before (a delivery was cut off): check their ids.";
+        }
 
         if (more > 0) {
             lines.push(
@@ -1959,15 +2016,35 @@ export class AgentBridge {
         };
     }
 
+    /** A session that can take a wake now: in the agent's home, and not one the bridge found gone. */
+    #usable(session: number): boolean {
+        const current = this.#state!.session;
+
+        return this.#ours(session) && !(current?.id === session && current.gone === true);
+    }
+
     /**
      * The session of a try. A try before it that ended with no answer (`inflight`) may have gone: this one goes to the
-     * same session, so Pocket's key, which counts in 1 session, sends nothing twice. Else the standing events session,
-     * checked now.
+     * same session when it can still take a wake, so Pocket's key, which counts in 1 session, sends nothing twice. Else
+     * the standing events session, checked now; the caller then marks the events `again`.
      */
     async #target(previous: { target?: number; inflight?: true }): Promise<number> {
-        return previous.inflight === true && previous.target !== undefined
+        return previous.inflight === true &&
+            previous.target !== undefined &&
+            this.#usable(previous.target)
             ? previous.target
             : this.#session();
+    }
+
+    /** The events of a try that may have gone to another session: each may come again, and says so. */
+    #mayRepeat(state: AgentState, ids: readonly string[]): void {
+        for (const id of ids) {
+            const pending = state.pending[id];
+
+            if (pending !== undefined) {
+                pending.again = true;
+            }
+        }
     }
 
     /**
@@ -2040,7 +2117,6 @@ export class AgentBridge {
         }
 
         const before = this.#state!.batches[batchId]!;
-        const resumed = before.inflight === true && before.target !== undefined;
         let target: number;
 
         try {
@@ -2051,6 +2127,8 @@ export class AgentBridge {
             return;
         }
 
+        // The same session as a try that may have gone: Pocket's key holds there.
+        const resumed = before.inflight === true && before.target === target;
         // After the waits: the batch as the store has it now, and the try marked before it starts.
         const go = await this.#change((state) => {
             const batch = state.batches[batchId];
@@ -2070,11 +2148,16 @@ export class AgentBridge {
                 return undefined;
             }
 
+            // A try that may have gone, to another session than this one: its events may come twice.
+            if (batch.inflight === true && batch.target !== target) {
+                this.#mayRepeat(state, ids);
+            }
+
             batch.events = ids;
             batch.target = target;
             batch.inflight = true;
 
-            return { sub, events: ids.map((id) => state.pending[id]!.event) };
+            return { sub, events: ids.map((id) => structuredClone(state.pending[id]!)) };
         });
 
         if (go === undefined) {
@@ -2112,27 +2195,17 @@ export class AgentBridge {
                 return;
             }
 
-            if (status === 410 && resumed) {
-                // The try that may have gone went to a session that is gone now: it counts as delivered, so a new
-                // session does not get the same events again.
-                await this.#change((state) => {
-                    this.#delivered(state, state.batches[batchId]?.events ?? []);
-                    delete state.batches[batchId];
-                });
-                this.#deps.notice(
-                    "warning",
-                    `Events bridge (${this.agent}): a batch that may have gone to session ${String(target)} counts as delivered; that session is gone.`,
-                );
-
-                return;
-            }
-
             if (status === 410 && before.remade < 2) {
                 await this.#sessionGone(target);
                 await this.#change((state) => {
                     const batch = state.batches[batchId];
 
                     if (batch !== undefined) {
+                        // A try cut off before may have reached the session that is gone: the new one may see them twice.
+                        if (resumed) {
+                            this.#mayRepeat(state, batch.events);
+                        }
+
                         batch.remade++;
                         batch.nextAt = this.#now();
                         delete batch.target;
@@ -2146,6 +2219,11 @@ export class AgentBridge {
 
             if (status === 410) {
                 await this.#sessionGone(target);
+                await this.#change((state) => {
+                    if (resumed) {
+                        this.#mayRepeat(state, state.batches[batchId]?.events ?? []);
+                    }
+                });
             }
 
             await this.#retry(batchId, messageOf(error), false);
@@ -2153,11 +2231,23 @@ export class AgentBridge {
             return;
         }
 
-        // `sent: false` is a try before this one that went: delivered, once.
+        // `sent: false` is a try before this one that went: delivered, once. The wake counts from now in the hour.
+        const sentAt = this.#now();
+
         await this.#change((state) => {
             const batch = state.batches[batchId];
 
             if (batch !== undefined) {
+                const times = state.wakes[batch.sub] ?? [];
+                const at = batch.wake === undefined ? -1 : times.indexOf(batch.wake);
+
+                if (at !== -1) {
+                    times[at] = sentAt;
+                } else {
+                    times.push(sentAt);
+                }
+
+                state.wakes[batch.sub] = times;
                 this.#delivered(state, batch.events);
                 delete state.batches[batchId];
             }
@@ -2248,7 +2338,6 @@ export class AgentBridge {
         }
 
         const before = this.#state!.digest.attempt!;
-        const resumed = before.inflight === true && before.target !== undefined;
         let target: number;
 
         try {
@@ -2259,6 +2348,7 @@ export class AgentBridge {
             return;
         }
 
+        const resumed = before.inflight === true && before.target === target;
         const go = await this.#change((state) => {
             const attempt = state.digest.attempt;
 
@@ -2275,6 +2365,10 @@ export class AgentBridge {
                 return undefined;
             }
 
+            if (attempt.inflight === true && attempt.target !== target) {
+                this.#mayRepeat(state, attempt.ids);
+            }
+
             attempt.target = target;
             attempt.inflight = true;
 
@@ -2285,7 +2379,7 @@ export class AgentBridge {
             return {
                 day: attempt.day,
                 ids: [...attempt.ids],
-                events: attempt.ids.map((id) => state.pending[id]!.event),
+                events: attempt.ids.map((id) => structuredClone(state.pending[id]!)),
                 waiting,
                 dropped: state.digest.dropped,
             };
@@ -2319,29 +2413,16 @@ export class AgentBridge {
                 return;
             }
 
-            if (status === 410 && resumed) {
-                await this.#change((state) => {
-                    this.#delivered(state, state.digest.attempt?.ids ?? []);
-                    state.digest.day = go.day;
-                    state.digest.tries = 0;
-                    state.digest.dropped = 0;
-                    delete state.digest.nextAt;
-                    delete state.digest.attempt;
-                });
-                this.#deps.notice(
-                    "warning",
-                    `Events bridge (${this.agent}): a digest that may have gone to session ${String(target)} counts as delivered; that session is gone.`,
-                );
-
-                return;
-            }
-
             if (status === 410 && before.remade < 2) {
                 await this.#sessionGone(target);
                 await this.#change((state) => {
                     const attempt = state.digest.attempt;
 
                     if (attempt !== undefined) {
+                        if (resumed) {
+                            this.#mayRepeat(state, attempt.ids);
+                        }
+
                         attempt.remade++;
                         delete attempt.target;
                         delete attempt.inflight;
@@ -2354,6 +2435,11 @@ export class AgentBridge {
 
             if (status === 410) {
                 await this.#sessionGone(target);
+                await this.#change((state) => {
+                    if (resumed) {
+                        this.#mayRepeat(state, state.digest.attempt?.ids ?? []);
+                    }
+                });
             }
 
             await this.#digestRetry(messageOf(error), false);
@@ -2616,10 +2702,48 @@ export type ModuleOptions = {
     fetch?: typeof fetch;
 };
 
+/**
+ * Hides the tokens of every agent's token file. A file whose tokens cannot be hidden (the host refuses, or the file
+ * does not parse) is deleted, fail closed: that agent's bridge must be signed in again.
+ */
+export async function hideTokenFiles(
+    dir: string,
+    tokensOf: (agentId: string) => TokenFile,
+    notice: (level: "info" | "warning" | "error", message: string) => void,
+): Promise<void> {
+    let files: string[] = [];
+
+    try {
+        files = (await readdir(dir)).filter(
+            (name) => name.endsWith(".json") && !name.endsWith(".events.json"),
+        );
+    } catch {
+        return;
+    }
+
+    for (const file of files) {
+        const agentId = file.slice(0, -".json".length);
+
+        try {
+            await tokensOf(agentId).load();
+        } catch (error) {
+            await rm(join(dir, file), { force: true });
+            notice(
+                "error",
+                `Events bridge (${agentId}): its tokens could not be hidden (${messageOf(error)}), so their file is deleted: sign it in to lodge again.`,
+            );
+        }
+    }
+}
+
 /** Its tools return `output`, so it needs version 2 of the extension API. */
 export const pocketApi = 2;
 
-export default function createEventsBridge(host: Host, web: Web, options: ModuleOptions = {}) {
+export default async function createEventsBridge(
+    host: Host,
+    web: Web,
+    options: ModuleOptions = {},
+) {
     const dir = options.dir ?? bridgeDir();
     const mcpFile = options.mcpFile ?? join(host.agentDir, "mcp.json");
     const transportFor = options.transport ?? natsTransport;
@@ -2832,32 +2956,11 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
         }
     };
 
-    /** The tokens of every agent's file, hidden at load: no tool reads them, also before a bridge runs. */
-    const hideStored = async () => {
-        let files: string[] = [];
+    const hideStored = () => hideTokenFiles(dir, tokensOfAgent, notice);
 
-        try {
-            files = (await readdir(dir)).filter(
-                (name) => name.endsWith(".json") && !name.endsWith(".events.json"),
-            );
-        } catch {
-            return;
-        }
-
-        for (const file of files) {
-            await tokensOfAgent(file.slice(0, -".json".length))
-                .load()
-                .catch((error: unknown) =>
-                    notice(
-                        "error",
-                        `Events bridge: the tokens of ${file} are not hidden: ${messageOf(error)}`,
-                    ),
-                );
-        }
-    };
-
+    // Before the module counts as loaded: no tool reads a stored token unhidden.
     if (ready) {
-        void hideStored();
+        await hideStored();
     }
 
     const first = setTimeout(() => void sweep(), 1_000);

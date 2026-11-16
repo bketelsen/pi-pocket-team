@@ -42,8 +42,12 @@ The drop-in `events-bridge.ts` does it, for each named agent whose profile
   written before its JetStream ack. A delivery key is stable (the first event's
   id for a batch, the day for a digest), and the store fixes each message's
   events and its target session before a try. Pocket counts a key in 1 session,
-  so a try cut off by a crash goes again to the same session: a restart neither
-  loses nor repeats a wake.
+  so a try cut off by a crash goes again to the same session while that session
+  is still the agent's and takes wakes: then a restart neither loses nor repeats
+  a wake. Pocket has no receipt to ask, so when that session is gone or moved,
+  the events go again (to a new session or the digest), each line marked
+  `repeat=maybe`: delivery is at least once, never lost, and the agent
+  de-duplicates by event id.
 - **Wakes.** Mode `now`: 60 s batches, at most 6 wakes an hour for each agent and
   subscription, through `host.inbox.deliver`; a 429 moves the batch to the
   digest; a 409 retries the same key, at most 5 times. Mode `digest`: 1 message

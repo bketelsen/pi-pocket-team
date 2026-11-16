@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "events-bridge.ts",
+  "correction": "a try with no answer could count as delivered or go into a session that moved, a stopped bridge could still write, stored tokens were hidden after load, a late wake left the hour early, and events_pending answers expired by age: such events now go again marked repeat=maybe, stop joins every worker and refuses writes, load hides or deletes each token file first, a wake counts from when it went, and the newest 100 answers stay",
+  "evidence": "bketelsen/pi-pocket-team#251: re-review 1 (openai/gpt-6.1-sol) of 5564a39 found 8 blocking points (R1 to R8)",
+  "promoted_to": "events-bridge.test.ts: at load every token file is hidden or deleted; a try cut off goes to a new session marked repeat=maybe when its session moved; a try cut off before Pocket then its session gone is never lost; a 410 from that same session is never counted as sent; exhausted tries go to the digest marked repeat=maybe; a late wake counts from when it went; an events_pending answer outlives a day; a stop waits for a worker that waits on lodge; an event whose write is under way when a batch starts is never lost"
+}

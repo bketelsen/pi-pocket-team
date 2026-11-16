@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
@@ -23,6 +23,7 @@ import {
     eventLine,
     gatewayEntries,
     Hider,
+    hideTokenFiles,
     gatewayOf,
     type Lodge,
     type LodgeAnswer,
@@ -130,7 +131,14 @@ class FakeLodge implements Lodge {
         return { ok: true, value: undefined };
     }
 
+    /** Holds `list` until the test opens it. */
+    listGate: Promise<void> | undefined;
+    listing = 0;
+
     async list(): Promise<LodgeAnswer<LodgeSub[]>> {
+        this.listing++;
+        await this.listGate;
+
         if (this.tokenError !== undefined) {
             throw this.tokenError;
         }
@@ -270,12 +278,27 @@ class FakeConnection implements BrokerConnection {
     }
 }
 
+/** The store, with a save that the test can hold open. */
+class GatedFile extends StateFile {
+    gate: Promise<void> | undefined;
+    holding = 0;
+
+    override async save(state: AgentState): Promise<void> {
+        if (this.gate !== undefined) {
+            this.holding++;
+            await this.gate;
+        }
+
+        return super.save(state);
+    }
+}
+
 type Rig = {
     bridge: AgentBridge;
     lodge: FakeLodge;
     sessions: FakeSessions;
     notices: string[];
-    file: StateFile;
+    file: GatedFile;
     dir: string;
     clock: { now: number };
     connections: FakeConnection[];
@@ -297,7 +320,7 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
     const sessions = new FakeSessions();
     const notices: string[] = [];
     const clock = { now: T0 };
-    const file = new StateFile(dir, "moneo");
+    const file = new GatedFile(dir, "moneo");
     const connections: FakeConnection[] = [];
 
     const transport: Transport = async () => {
@@ -496,6 +519,40 @@ describe("events bridge: pure parts", () => {
         await assert.rejects(tokens.save(tokenState("next")), /2000 values/);
         assert.match(readFileSync(tokens.path, "utf8"), /lgo_at_499/);
         assert.doesNotMatch(readFileSync(tokens.path, "utf8"), /lgo_at_next/);
+    });
+
+    test("at load, every token file is hidden before the module counts as loaded; one that cannot be is deleted", async () => {
+        const dir = scratch();
+        const live = new Set<string>();
+        const refused = new Set(["lgo_at_chani"]);
+        const hiderFor = () =>
+            new Hider((value) => {
+                if (refused.has(value)) {
+                    throw new Error("host.hide: 2000 values are hidden already");
+                }
+
+                live.add(value);
+
+                return () => live.delete(value);
+            });
+        const quiet = new Hider(() => () => undefined);
+
+        await new TokenFile(dir, "moneo", quiet).save(tokenState("moneo"));
+        await new TokenFile(dir, "chani", quiet).save(tokenState("chani"));
+        await writePrivate(join(dir, "moneo.events.json"), "{}");
+
+        const notices: string[] = [];
+
+        await hideTokenFiles(
+            dir,
+            (agent) => new TokenFile(dir, agent, hiderFor()),
+            (_level, message) => notices.push(message),
+        );
+
+        assert.deepEqual([...live].sort(), ["lgo_at_moneo", "lgo_rt_moneo"]);
+        assert.equal(existsSync(join(dir, "moneo.json")), true);
+        assert.equal(existsSync(join(dir, "chani.json")), false);
+        assert.match(notices.join("\n"), /chani.*deleted: sign it in to lodge again/);
     });
 
     test("a reload waits until the old bridge has stopped", async () => {
@@ -1036,18 +1093,30 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         assert.equal(r.bridge.pendingCount(), 30 - lines);
     });
 
-    test("an event that comes while a batch starts its delivery is never lost", async () => {
+    test("an event whose write is under way when a batch starts its delivery is never lost", async () => {
         const r = await rig();
         const sub = await subscribe(r);
         const first = event();
+        const late = event();
 
         await receive(r.bridge, sub.name, first);
         r.clock.now += BATCH_MS;
 
-        // The delivery and a receive at once: the receive's write can land before or after the batch is fixed.
-        const late = event();
+        // The late event's write is held open; the delivery starts meanwhile, then the write lands.
+        let land: () => void = () => undefined;
 
-        await Promise.all([r.bridge.tick(), receive(r.bridge, sub.name, late)]);
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const receiving = receive(r.bridge, sub.name, late);
+
+        await until(() => r.file.holding === 1);
+
+        const ticking = r.bridge.tick();
+
+        await new Promise((resolve) => setImmediate(resolve));
+        r.file.gate = undefined;
+        land();
+        await Promise.all([receiving, ticking]);
         r.clock.now += BATCH_MS;
         await r.bridge.tick();
 
@@ -1057,10 +1126,7 @@ describe("events bridge: deliveries keep their events, their key and their sessi
             .join("\n");
 
         for (const each of [first, late]) {
-            assert.ok(
-                shown.includes(`id=${each.id}`) || each.id in r.bridge.state.pending,
-                each.id,
-            );
+            assert.ok(shown.includes(`id=${each.id}`), each.id);
         }
 
         assert.deepEqual(r.bridge.state.pending, {});
@@ -1103,7 +1169,7 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         assert.equal(again.pendingCount(), 0);
     });
 
-    test("a try cut off before its answer goes again to the same session, even when the standing session moved", async () => {
+    test("a try cut off goes again to the same session while it can take wakes; else to a new one, marked repeat=maybe", async () => {
         const r = await rig();
         const sub = await subscribe(r);
         const first = r.bridge.state.session!.id;
@@ -1113,35 +1179,161 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         r.clock.now += BATCH_MS;
         await r.bridge.tick();
         await r.bridge.stop();
-        // The session moves out of the agent's home before the restart.
-        r.sessions.folders.set(first, "/elsewhere");
+        // The session moves out of the agent's home (another agent's now) before the restart.
+        r.sessions.folders.set(first, "/home/agents/duncan");
 
         const again = await r.restart();
 
         r.clock.now += RETRY_MS[0];
         await again.tick();
-        assert.equal(r.sessions.sent().length, 1);
-        assert.deepEqual(
-            r.sessions.delivered.map((each) => each.target),
-            [first, first],
-        );
 
-        // And when that session is gone: the batch counts as delivered, and no new session gets it.
-        const sub2 = sub.name;
+        const targets = r.sessions.delivered.map((each) => each.target);
 
-        await receive(again, sub2, event());
-        r.sessions.script.push("crash");
+        // Nothing new goes into the moved session: the events go to a new events session, and say they may repeat.
+        assert.equal(targets[0], first);
+        assert.equal(targets.length, 2);
+        assert.notEqual(targets[1], first);
+        assert.match(r.sessions.delivered[1]!.delivery.payload, /repeat=maybe/);
+        assert.deepEqual(again.state.pending, {});
+    });
+
+    test("a try cut off before it reached Pocket, then its session gone: the events still come, never lost", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+        // An error with no status, before Pocket took the message: the try is marked, nothing went.
+        r.sessions.script.push(new Error("the process stopped before the call"));
         r.clock.now += BATCH_MS;
-        await again.tick();
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(Object.values(r.bridge.state.batches)[0]?.inflight, true);
+        await r.bridge.stop();
+        r.sessions.folders.delete(first);
 
-        const target = r.sessions.delivered.at(-1)!.target;
+        const again = await r.restart();
 
-        r.sessions.folders.delete(target);
         r.clock.now += RETRY_MS[0];
         await again.tick();
-        assert.equal(r.sessions.sent().length, 2);
-        assert.deepEqual(again.state.batches, {});
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.match(sent[0]!.delivery.payload, new RegExp(`id=${e.id} repeat=maybe`));
         assert.deepEqual(again.state.pending, {});
+    });
+
+    test("a try cut off, then a 410 from that same session: the events go to a new session, never counted as sent", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+        r.sessions.script.push(new Error("the process stopped before the call"), status(410));
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        r.clock.now += RETRY_MS[0];
+        await r.bridge.tick();
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.notEqual(sent[0]!.target, first);
+        assert.match(sent[0]!.delivery.payload, new RegExp(`id=${e.id} repeat=maybe`));
+        assert.deepEqual(r.bridge.state.pending, {});
+    });
+
+    test("a batch whose tries all end with no answer goes to the digest marked repeat=maybe", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+
+        for (let n = 0; n <= RETRIES; n++) {
+            r.sessions.script.push("crash");
+        }
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+
+        for (const wait of RETRY_MS) {
+            r.clock.now += wait;
+            await r.bridge.tick();
+        }
+
+        assert.equal(r.sessions.sent().length, 1);
+        assert.deepEqual(r.bridge.state.batches, {});
+        assert.equal(r.bridge.pendingCount(), 1);
+        assert.equal(Object.values(r.bridge.state.pending)[0]?.again, true);
+    });
+
+    test("a wake that goes late counts in the hour from when it went", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        // 1 batch reserves at T0+60 s and goes after 2 retries, at T0+60 s+90 s.
+        await receive(r.bridge, sub.name, event());
+        r.sessions.script.push(status(409), status(409));
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        r.clock.now += RETRY_MS[0];
+        await r.bridge.tick();
+        r.clock.now += RETRY_MS[1];
+        await r.bridge.tick();
+
+        const went = r.clock.now;
+
+        assert.deepEqual(r.bridge.state.wakes[sub.name], [went]);
+    });
+
+    test("an events_pending answer outlives a day and other changes while its call can replay", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+
+        const taken = await r.bridge.takePending(10, "9:call-old");
+
+        r.clock.now += 3 * 24 * 3_600_000;
+        await receive(r.bridge, sub.name, event());
+        assert.deepEqual(await r.bridge.takePending(10, "9:call-old"), taken);
+    });
+
+    test("a stop waits for a worker that waits on lodge, and that worker writes nothing after it", async () => {
+        const r = await rig({ running: true });
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+        r.bridge.start();
+        await until(() => r.connections.length > 0 && r.connections.at(-1)!.waiting.size > 0);
+
+        // The consumer is gone; lodge's answer waits.
+        let answer: () => void = () => undefined;
+
+        r.lodge.listGate = new Promise((resolve) => (answer = resolve));
+        r.lodge.subs.delete(sub.name);
+        r.connections.at(-1)!.lose(sub.consumer);
+        await until(() => r.lodge.listing > 0);
+
+        let stopped = false;
+        const stopping = r.bridge.stop().then(() => (stopped = true));
+
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(stopped, false);
+        answer();
+        await stopping;
+
+        // The worker saw the stop: the store still has the event and the subscription.
+        const stored = await r.file.load();
+
+        assert.equal(Object.keys(stored!.pending).length, 1);
+        assert.equal(stored!.subs[sub.name]?.consumer, sub.consumer);
+        assert.equal(r.lodge.puts, 1);
     });
 
     test("a batch keeps its place in the hour across a restart: no 7th wake", async () => {

@@ -26,6 +26,6 @@ The first subscription shows a card. Open its lodge link, check that the princip
 - An event carries no content: the agent reads the object through its gateway tools.
 - A busy session is tried again, 5 times at most; the hourly cap, or a session that stays busy, moves a batch to the digest. Nothing is lost.
 - The agent's own events are dropped. If lodge revokes the client, the events that wait are deleted.
-- A restart neither loses nor repeats a wake.
+- A restart never loses an event. When a cut-off delivery cannot go again to the same session, its events come again, marked `repeat=maybe`.
 
 The full reference is [docs/modules/events-bridge.md](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/events-bridge.md).
