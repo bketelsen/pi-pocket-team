@@ -3790,13 +3790,115 @@ describe("a task whose start failed", () => {
         assert.equal(state.threads.T5?.state, "closed");
         assert.equal(
             state.threads.T1?.events.at(-1)?.text,
-            "t1: the start of T5 failed, and a session may run: the task stays delegated. Look at the session list.",
+            "t1: the start of T5 failed, and a session may run: the task stays delegated. Look at the session list (a found session thread): when no session runs for it, deliver the task again with team_delegate.",
+        );
+    });
+
+    test("a failed start with no session can be delivered again", () => {
+        const { state, graph } = approvedPlan();
+        const task = graph.tasks[0] ?? assert.fail("a task");
+        const forTask = {
+            agent: task.agent,
+            ...(task.repo === undefined ? {} : { repo: task.repo }),
+        };
+
+        other(state, "T5");
+        (state.threads.T5 ?? assert.fail("a thread")).state = "starting";
+
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4))));
+        assert(failThread(state, "x.test:T5", "it did not start", tick(5)));
+
+        // No session was ever bound to T5: the supervisor delivers the task again.
+        assert.equal(deliverCheck(state, "T1", "t1", forTask), undefined);
+
+        other(state, "T6");
+        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(6))));
+        assert.equal(task.attempts.length, 2);
+        assert.deepEqual(task.attempts[0]?.end, { at: tick(6), how: "stopped" });
+        assert.equal(task.attempts[1]?.thread, "T6");
+        assert.equal(task.attempts[1]?.end, undefined);
+        assert.equal(task.state, "delegated");
+        assert(
+            (state.threads.T1?.events ?? []).some(
+                (event) =>
+                    event.text ===
+                    "t1: the start of T5 failed with no session bound: delivered again as T6",
+            ),
+            "the plan thread says why the old attempt ended",
+        );
+
+        // A replay of the new thread adds no attempt and no event.
+        const events = state.threads.T1?.events.length ?? 0;
+
+        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(7))));
+        assert.equal(task.attempts.length, 2);
+        assert.equal(state.threads.T1?.events.length, events);
+    });
+
+    test("a failed thread with a bound session, or a running attempt, still holds its task", () => {
+        const words = "t1 is delegated: a task starts when it is ready.";
+
+        // (a) A session was bound: Pocket admitted it, so the task is no free task.
+        const bound = approvedPlan();
+        const boundTask = bound.graph.tasks[0] ?? assert.fail("a task");
+        const forTask = {
+            agent: boundTask.agent,
+            ...(boundTask.repo === undefined ? {} : { repo: boundTask.repo }),
+        };
+
+        other(bound.state, "T5");
+        (bound.state.threads.T5 ?? assert.fail("a thread")).state = "starting";
+        assert(!("error" in startTask(bound.state, "T1", "t1", "T5", tick(4))));
+
+        const failed = bound.state.threads.T5 ?? assert.fail("a thread");
+
+        failed.session = 44;
+        failed.address = "session-44";
+        assert(failThread(bound.state, "x.test:T5", "it did not start", tick(5)));
+        assert.equal(deliverCheck(bound.state, "T1", "t1", forTask), words);
+
+        // (b) The thread has not closed: the attempt still runs.
+        const running = approvedPlan();
+        const runningTask = running.graph.tasks[0] ?? assert.fail("a task");
+
+        other(running.state, "T5");
+        (running.state.threads.T5 ?? assert.fail("a thread")).state = "starting";
+        assert(!("error" in startTask(running.state, "T1", "t1", "T5", tick(4))));
+        assert.equal(runningTask.attempts[0]?.end, undefined);
+        assert.equal(
+            deliverCheck(running.state, "T1", "t1", {
+                agent: runningTask.agent,
+                ...(runningTask.repo === undefined ? {} : { repo: runningTask.repo }),
+            }),
+            words,
+        );
+    });
+
+    test("a thread the sweep closed as failed, with no session, can be delivered again", () => {
+        const { state, graph } = approvedPlan();
+        const task = graph.tasks[0] ?? assert.fail("a task");
+
+        other(state, "T5");
+        (state.threads.T5 ?? assert.fail("a thread")).state = "starting";
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4))));
+
+        const thread = state.threads.T5 ?? assert.fail("a thread");
+
+        thread.state = "closed";
+        thread.closed = { at: tick(5), why: "failed", by: "sweep" };
+
+        assert.equal(
+            deliverCheck(state, "T1", "t1", {
+                agent: task.agent,
+                ...(task.repo === undefined ? {} : { repo: task.repo }),
+            }),
+            undefined,
         );
     });
 
     test("a closed thread without a session that a call reuses is refused", () => {
         const words = (why: string): string =>
-            `This delegation's thread T5 closed (${why}) before a session was bound. Read it with desk read T5. For a plan task, the task stays delegated until a person decides.`;
+            `This delegation's thread T5 closed (${why}) before a session was bound. Read it with desk read T5. For a plan task, the task stays delegated: when no session runs for it, deliver it again with a new team_delegate call.`;
 
         assert.equal(
             closedThreadRefusal({ id: "T5", state: "closed", closed: { why: "failed" } }, true),

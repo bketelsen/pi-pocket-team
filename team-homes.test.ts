@@ -40,6 +40,7 @@ import { DeskThreads, threadOfSession } from "./desk.ts";
 import {
     guardRoster,
     Identity,
+    missingFolderRefusal,
     pinDecision,
     roster,
     taskTarget,
@@ -50,6 +51,8 @@ import {
 const definitions = join(root, "agents");
 const repoA = join(root, "nsl");
 const repoB = join(root, "igloo");
+// A roster folder that was never cloned: a delegation of it must refuse before it opens a thread.
+const repoMissing = join(root, "elsewhere");
 const homeDuncan = join(root, "homes", "duncan");
 const homeTwin = join(root, "homes", "twin");
 const homeMoneo = join(root, "homes", "moneo");
@@ -200,6 +203,14 @@ const model = scriptedModel((ctx) => {
         return tool("team_delegate", { agent: "moneo", task: "Plan the NAS notes." });
     }
 
+    if (text.endsWith("delegate-missing")) {
+        return tool("team_delegate", {
+            agent: "faradn",
+            repository: "frostyard/elsewhere",
+            task: "Say hello in a folder that is not there.",
+        });
+    }
+
     if (text.endsWith("work-linked")) {
         return tool("team_work", {
             repository: "frostyard/nsl",
@@ -275,6 +286,11 @@ before(async () => {
     writeFileSync(
         join(definitions, "irulan.md"),
         "---\nhome: ~/agents/irulan\n---\n# Irulan\nYou are Irulan.",
+    );
+    // A roster folder that is not there: its delegations are refused before a thread opens.
+    writeFileSync(
+        join(definitions, "faradn.md"),
+        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/elsewhere: ${repoMissing}\n---\n# Farad'n Corrino\nYou are Farad'n. Own a folder that is not there.`,
     );
 
     // The desk opens a thread for each delegation. It reads only the fixtures: no real config, no GitHub.
@@ -853,6 +869,34 @@ test("guardRoster keeps the last good roster, and has none when the first read f
     writeFileSync(join(folder, "bad-again.md"), "---\nrepositories: broken\n---\n# Bad\n");
     // The read fails now: the last good roster holds, so a guard never loses the team to 1 bad file.
     assert.equal((await guardRoster(folder))?.length, 1);
+});
+
+test("a delegation whose folder is not there is refused, and starts nothing", async () => {
+    const supervisor = await sessionAs("leto", homeLeto);
+    const threads = () => Object.keys(deskState()?.threads ?? {}).length;
+    const sessions = app.sessions().length;
+    const open = threads();
+
+    await say(app, supervisor, "delegate-missing");
+    assert(
+        (await said(supervisor)).includes(
+            missingFolderRefusal("faradn", repoMissing, "frostyard/elsewhere"),
+        ),
+        "the refusal names the folder and what to do",
+    );
+    assert.equal(app.sessions().length, sessions, "the refusal started no session");
+    assert.equal(threads(), open, "the refusal opened no desk thread");
+});
+
+test("the missing folder refusal says how to fix it, with a repository and without", () => {
+    assert.equal(
+        missingFolderRefusal("duncan", repoMissing, "frostyard/nsl"),
+        `${repoMissing} isn't there: the roster names it for duncan (frostyard/nsl). Nothing started, and no desk thread opened. Clone it first (git clone https://github.com/frostyard/nsl.git ${repoMissing}), then delegate again.`,
+    );
+    assert.equal(
+        missingFolderRefusal("moneo", repoMissing),
+        `${repoMissing} isn't there: the roster names it for moneo. Nothing started, and no desk thread opened. Brian makes the folder or fixes moneo.md, then delegate again.`,
+    );
 });
 
 test("taskTarget offers home as a choice, and the errors say what is there", () => {

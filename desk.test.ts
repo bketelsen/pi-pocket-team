@@ -14022,14 +14022,6 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
         });
     }
 
-    if (text.endsWith("desk failed delegate test")) {
-        return call("team_delegate", {
-            agent: "paul",
-            repository: "frostyard/missing",
-            task: TASK,
-        });
-    }
-
     if (text.endsWith("desk titled delegate test")) {
         return call("team_delegate", {
             agent: "duncan",
@@ -14351,6 +14343,9 @@ before(async () => {
     repository(old);
     repository(fresh);
     repository(brief);
+    // Paul's folder is an empty one: it is there, and it is no git work tree, so a start of his fails for its own
+    // reason and not for a missing folder.
+    mkdirSync(join(root, "nowhere"), { recursive: true });
     // Old work: a folder that is dirty at every supervisor's first sweep.
     appendFileSync(join(old, "file.txt"), "two\n");
     writeFileSync(
@@ -14363,7 +14358,7 @@ before(async () => {
     );
     writeFileSync(
         join(definitions, "paul.md"),
-        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/missing: ${join(root, "missing")}\n---\n# Paul Atreides\nYou are Paul Atreides. Own a folder that is not there.`,
+        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/nowhere: ${join(root, "nowhere")}\n---\n# Paul Atreides\nYou are Paul Atreides. Own a folder with no work in it.`,
     );
     writeFileSync(
         join(definitions, "gurney.md"),
@@ -14472,6 +14467,79 @@ async function supervisor(name: string): Promise<ConversationId> {
 }
 
 const deskState = () => app.harness.snapshot(DeskThreads, context);
+
+/** A count of the calls the tests make with a host that refuses the start, so that each key is its own. */
+let uniqueCall = 0;
+
+/**
+ * `team_delegate` with a Team module whose host refuses the linked start. Pocket's refusal comes after the desk opened
+ * the thread, which is the outcome these tests check; the live desk and the app's harness stay, so the thread, the
+ * fail and `changed` are real. The module in the global symbol comes back after the call.
+ */
+async function delegateRefusedByPocket(source: ConversationId, args: object): Promise<string> {
+    const shared = globalThis as unknown as Record<symbol, unknown>;
+    const saved = shared[Symbol.for("pi-pocket-team.team")];
+
+    // A call key of its own: the desk's thread of an earlier call closes before its bind, and this call is no replay.
+    uniqueCall += 1;
+    const stubWeb = {
+        conversationRoute() {},
+        route() {},
+        client() {},
+        command() {},
+        send() {},
+        onDispose() {},
+        error: (status: number, message: string) => Object.assign(new Error(message), { status }),
+    };
+    const stubHost = {
+        requesterOf: () => owner(app).id,
+        subagentModels: () => [],
+        text: { defang: (value: string) => value, quoted: () => "" },
+        notice() {},
+        linkedSessions: {
+            start: async () => {
+                throw new Error("Pocket refused the start");
+            },
+            list: async () => [],
+            send: async () => {},
+        },
+    };
+    const extension = createTeam(stubHost as never, stubWeb as never) as unknown as {
+        tools: {
+            name: string;
+            execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+        }[];
+    };
+
+    try {
+        const tool = extension.tools.find((each) => each.name === "team_delegate")!;
+
+        try {
+            await tool.execute(
+                args,
+                {
+                    conversationId: source,
+                    taskId: `task-no-start-${String(uniqueCall)}`,
+                    callId: `call-${String(uniqueCall)}`,
+                    snapshot: (...values: unknown[]) =>
+                        Reflect.apply(app.harness.snapshot, app.harness, values),
+                    commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
+                },
+                context,
+            );
+        } catch (error) {
+            return error instanceof Error ? error.message : String(error);
+        }
+
+        return "the tool did not refuse";
+    } finally {
+        if (saved === undefined) {
+            delete shared[Symbol.for("pi-pocket-team.team")];
+        } else {
+            shared[Symbol.for("pi-pocket-team.team")] = saved;
+        }
+    }
+}
 
 /** Delegate once, and give back the supervisor session, the linked session, and the thread. */
 async function delegated(
@@ -17571,11 +17639,14 @@ describe("the desk in a Pi Pocket", () => {
         const source = await supervisor("failed");
         const before = app.sessions().length;
 
-        await say(app, source, "desk failed delegate test");
-        assert.match(
-            (await modelTexts(app, source)).join("\n"),
-            /Do not delegate on another model/,
-        );
+        // Pocket refuses the start after the desk opened the thread: its session never comes.
+        const refusal = await delegateRefusedByPocket(source, {
+            agent: "paul",
+            repository: "frostyard/nowhere",
+            task: TASK,
+        });
+
+        assert.match(refusal, /Do not delegate on another model/);
         assert.equal(app.sessions().length, before, "no linked session started");
 
         const failed = Object.values((await deskState())?.threads ?? {}).find((thread) =>
@@ -18050,7 +18121,12 @@ describe("the desk in a Pi Pocket", () => {
             try {
                 const source = await supervisor("changed-failed");
 
-                await say(app, source, "desk failed delegate test");
+                await delegateRefusedByPocket(source, {
+                    agent: "paul",
+                    repository: "frostyard/nowhere",
+                    task: TASK,
+                });
+
                 const names = watched.log.filter((name) => name === "fail" || name === "changed");
 
                 assert.deepEqual(names.slice(-2), ["fail", "changed"]);

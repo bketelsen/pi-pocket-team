@@ -38,6 +38,8 @@ An agent with several repositories gets its lessons split between them. Reposito
 
 When the folder is the top of a git work tree, each delegation gets its own worktree beside the main checkout, at `<checkout>--<agent>-<slug>` on branch `<agent>/<slug>`, so 2 jobs in 1 repository share no folder and no branch. Remove the worktree when its pull request merges.
 
+A folder that is not there is refused before the session starts, and before any desk thread opens: nothing is cloned and no folder is made. The refusal names the folder and the repository, and gives the `git clone` command, or says that Brian makes the folder or fixes the profile of an agent with no repository.
+
 `repository: "home"` starts the task in the agent's own home instead, with no worktree. `team_work` does the same from inside an agent's home: it starts a linked session in a fresh worktree of 1 of its own repositories.
 
 Before each desk-tracked start (a task, a shift, the Clerk, a plan, a plan consult), Team asks the desk to turn off the supervisor's run-end answers (Pi Pocket 0.29.0 and later, and the fork's tags from 0.28.0-bk.1): the reports come by `team_message`, so a linked session's run end does not wake the supervisor. `team_work` and the Team panel's start do not ask, so their lead keeps its answers, unless that lead is a desk supervisor.

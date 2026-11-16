@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "desk.ts, team.ts",
+  "correction": "a plan task whose start failed with no session bound stayed delegated with an open attempt, and deliverCheck refused every new delivery, so only a scope revision could recover it; deliverCheck now takes a delegated task whose open attempt's thread closed as failed with no session and no address, startTask ends that attempt stopped, and team_delegate refuses a roster folder that is not there before the desk opens a thread",
+  "evidence": "bketelsen/pi-pocket-team#250: a plan task delivery to a repository whose clone was missing opened a thread, Pocket's start refused the folder, the desk closed the thread as failed, and the task could not be delivered again",
+  "promoted_to": "desk-plans.test.ts: a failed start with no session can be delivered again; a thread the sweep closed as failed, with no session, can be delivered again; team-homes.test.ts: a delegation whose folder is not there is refused, and starts nothing"
+}

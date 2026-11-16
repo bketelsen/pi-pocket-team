@@ -726,9 +726,12 @@ Each line below differs from the design above, and says why.
 - **A failed start of a task thread is an unknown outcome**: Pocket can admit the first message and still throw, so
   the desk never treats a failed start as proof that no worker runs. The task stays `delegated` with 1 event on the
   plan thread, after a thrown start and after the sweep's 1-hour starting limit: a second worker for 1 task is worse
-  than a task that waits for a person (PR 2's `revise` ends it). A replay of a start that worked uses the session the
-  desk bound, and never calls Pocket's start again; a replay of a thread that closed before any session was bound
-  starts no session.
+  than a task that waits for a person (PR 2's `revise` ends it). Since 2026-11-16 (bug: a clone that was not there left
+  a task delegated with no session), the supervisor delivers such a task again with `team_delegate` when the failed
+  thread has no bound session (no session and no address): the old attempt ends `stopped`, and the plan thread records
+  `delivered again as <thread>`. The desk still never makes the task ready by itself. A replay of a start that worked
+  uses the session the desk bound, and never calls Pocket's start again; a replay of a thread that closed before any
+  session was bound starts no session.
 
 ## 16. What PR 2 built, and where it differs
 
