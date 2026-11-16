@@ -25,15 +25,16 @@ of a server who works with a team of named agents. It is written for Brian Ketel
   [Terminal](https://bketelsen.github.io/pi-pocket-team/modules/terminal/).
 - **GitHub hooks.** A listener for signed GitHub webhook deliveries: checked facts, no GitHub text, wake the desk
   early. See [GitHub hooks](https://bketelsen.github.io/pi-pocket-team/modules/github-hooks/).
+- **Events bridge.** Wakes a named agent when a lodge app publishes an event that it follows, in its own standing
+  events session. See [Events bridge](https://bketelsen.github.io/pi-pocket-team/modules/events-bridge/).
 - **Daily audit and home seed.** Scripts that report on a day of the team's work, and make each agent's home folder.
   See [daily audit](docs/modules/daily-audit.md) and [home seed](docs/modules/home-seed.md).
 
 ## Requirements
 
 Pi Pocket v0.21.0 or later (extension API 2), on Node.js 24, and a Pi Pocket checkout beside this repository
-(`../pi-pocket-live` by default when it is a checkout, else `../pi-pocket`) for the links and the tests. CI tests
-upstream v0.27.0, the fork tag v0.28.1-bk.1 of [bketelsen/pi-pocket](https://github.com/bketelsen/pi-pocket)
-(the rollback target) and upstream v0.29.0, the release the owner's server runs. On a Pi Pocket that has the run-end
+(`../pi-pocket-live` by default when it is a checkout, else `../pi-pocket`) for the links and the tests. The events
+bridge needs v0.29.0 or later (`host.inbox`). CI tests upstream v0.29.0, the release the owner's server runs. On a Pi Pocket that has the run-end
 switch (0.29.0 and later, and the fork's 0.28 `bk` tags), the desk turns off automatic run-end answers on supervisor
 sessions.
 

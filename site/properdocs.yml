@@ -35,6 +35,7 @@ nav:
       - Desk: modules/desk.md
       - Terminal: modules/terminal.md
       - GitHub hooks: modules/github-hooks.md
+      - Events bridge: modules/events-bridge.md
   - Contributing:
       - Build and test: contributing/build.md
 

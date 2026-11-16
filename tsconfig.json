@@ -25,6 +25,7 @@
         "desk.ts",
         "terminal.ts",
         "github-hooks-fixture.ts",
-        "github-hooks.ts"
+        "github-hooks.ts",
+        "events-bridge.ts"
     ]
 }

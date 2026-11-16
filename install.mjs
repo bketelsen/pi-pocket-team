@@ -36,6 +36,9 @@ const MODULES = [
     "terminal.ts",
     "terminal-web",
     "github-hooks.ts",
+    // The vendored NATS client (scripts/vendor-nats.mjs): a helper, so a change to it needs a restart.
+    "_events-bridge-nats.mjs",
+    "events-bridge.ts",
 ];
 
 /**

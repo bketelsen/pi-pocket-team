@@ -69,6 +69,12 @@ pi-pocket-team is a set of drop-in extensions for [Pi Pocket](https://github.com
 
     Signed GitHub webhook deliveries wake the desk early, as checked facts with no GitHub text.
 
+- **[Events bridge](modules/events-bridge.md)**
+
+    ***
+
+    A named agent follows a lodge app's events, and wakes in its own events session when they come.
+
 </div>
 
 ## Start here
