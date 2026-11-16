@@ -428,11 +428,21 @@ describe("events bridge: the broker transport on a real JetStream", () => {
             timeout: 30_000,
         },
         async (t) => {
+            // Each resource is cleaned up even when a later step fails, the last one made first: node:test runs its
+            // `after` hooks in the order they were added, so 1 hook runs the steps. The store goes after the server's
+            // exit.
+            const cleanup: (() => unknown)[] = [];
+
+            t.after(async () => {
+                for (const step of cleanup.reverse()) {
+                    await step();
+                }
+            });
+
             const dir = mkdtempSync(join(tmpdir(), "events-bridge-nats-"));
             const config = join(dir, "server.conf");
 
-            // Each resource is cleaned up even when a later step fails; the store goes after the server's exit.
-            t.after(() => rmSync(dir, { recursive: true, force: true }));
+            cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
             writeFileSync(
                 config,
                 `listen: "127.0.0.1:-1"\njetstream { store_dir: "${join(dir, "js")}" }\n` +
@@ -446,7 +456,7 @@ describe("events bridge: the broker transport on a real JetStream", () => {
                 server.on("close", () => resolve());
             });
 
-            t.after(async () => {
+            cleanup.push(async () => {
                 if (
                     server.exitCode === null &&
                     server.signalCode === null &&
@@ -474,14 +484,14 @@ describe("events bridge: the broker transport on a real JetStream", () => {
             });
             const admin = await wsconnect({ servers: `ws://127.0.0.1:${port}` });
 
-            t.after(() => admin.close().catch(() => undefined));
+            cleanup.push(() => admin.close().catch(() => undefined));
 
             const connection = await natsTransport(`http://127.0.0.1:${port}/gateway/mcp`)({
                 token: "",
                 inboxPrefix: PREFIX,
             });
 
-            t.after(() => connection.close().catch(() => undefined));
+            cleanup.push(() => connection.close().catch(() => undefined));
 
             const api = async (subject: string, body: unknown) =>
                 JSON.parse(
