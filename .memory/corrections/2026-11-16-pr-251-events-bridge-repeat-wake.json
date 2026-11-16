@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "events-bridge.ts",
+  "correction": "a batch that may have woken a session that then moved or went could wake a new session without a place in the hour, a 7th wake after a restart: such a repeat now takes 1 more place, or goes to the digest marked repeat=maybe when the hour is full",
+  "evidence": "bketelsen/pi-pocket-team#251: re-review 3 (openai/gpt-6.1-sol) of 4978bea, finding C1",
+  "promoted_to": "events-bridge.test.ts: a try that may have woken a session that moved takes 1 more place in the hour: no 7th wake"
+}

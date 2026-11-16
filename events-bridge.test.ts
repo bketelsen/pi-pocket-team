@@ -1334,6 +1334,38 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         assert.equal(r.sessions.sent().length, WAKES_PER_HOUR);
     });
 
+    test("a try that may have woken a session that moved takes 1 more place in the hour: no 7th wake", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        for (let wake = 1; wake < WAKES_PER_HOUR; wake++) {
+            await receive(r.bridge, sub.name, event());
+            r.clock.now += BATCH_MS;
+            await r.bridge.tick();
+        }
+
+        // The 6th wake went, but its answer was lost; then a restart, and the session moved.
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+        r.sessions.script.push("crash");
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        await r.bridge.stop();
+        r.sessions.folders.set(first, "/home/agents/duncan");
+
+        const again = await r.restart();
+
+        r.clock.now += RETRY_MS[0];
+        await again.tick();
+        await again.tick();
+        assert.equal(r.sessions.sent().length, WAKES_PER_HOUR);
+        assert.ok(r.sessions.sent().every((each) => each.target === first));
+        assert.equal(again.state.pending[e.id]?.state, "digest");
+        assert.equal(again.state.pending[e.id]?.again, true);
+    });
+
     test("a try that may have gone, then no new session, then a new one: the events say repeat=maybe", async () => {
         const r = await rig();
         const sub = await subscribe(r);

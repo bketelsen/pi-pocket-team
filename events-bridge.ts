@@ -2214,6 +2214,23 @@ export class AgentBridge {
                 this.#mayRepeat(state, ids);
             }
 
+            // A try that may have woken another session already holds its wake: this one takes 1 more place in the
+            // hour, or, with the hour full, its events go to the digest.
+            if (this.#mayHaveGone(batch) && batch.target !== target) {
+                const now = this.#now();
+                const times = state.wakes[sub.name] ?? [];
+
+                if (times.filter((at) => now - at < HOUR).length >= WAKES_PER_HOUR) {
+                    this.#mayRepeat(state, ids);
+                    this.#batchToDigest(state, batchId);
+
+                    return undefined;
+                }
+
+                state.wakes[sub.name] = [...times, now];
+                batch.wake = now;
+            }
+
             if (batch.inflight === true) {
                 batch.uncertain = true;
             }
