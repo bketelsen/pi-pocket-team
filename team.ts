@@ -418,7 +418,7 @@ export function closedThreadRefusal(
         return undefined;
     }
 
-    return `This delegation's thread ${thread.id} closed (${thread.closed?.why ?? "failed"}) before a session was bound. Read it with desk read ${thread.id}. For a plan task, the task stays delegated until a person decides.`;
+    return `This delegation's thread ${thread.id} closed (${thread.closed?.why ?? "failed"}) before a session was bound. Read it with desk read ${thread.id}. For a plan task, the task stays delegated: when no session runs for it, deliver it again with a new team_delegate call.`;
 }
 
 /**
@@ -642,6 +642,25 @@ export function taskTarget(persona: Persona, repository?: unknown): TaskTarget {
         : persona.home !== undefined
           ? { folder: persona.home, home: true }
           : {};
+}
+
+/** Whether `path` is a directory now: any error, and a non-directory, counts as not there. */
+async function isDirectory(path: string): Promise<boolean> {
+    try {
+        return (await stat(path)).isDirectory();
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * The refusal of a delegation whose folder is not there. Pocket's start refuses a missing folder only after the desk
+ * thread opened, and a plan task then stays delegated: this one comes first.
+ */
+export function missingFolderRefusal(agent: string, folder: string, repo?: string): string {
+    return repo === undefined
+        ? `${folder} isn't there: the roster names it for ${agent}. Nothing started, and no desk thread opened. Brian makes the folder or fixes ${agent}.md, then delegate again.`
+        : `${folder} isn't there: the roster names it for ${agent} (${repo}). Nothing started, and no desk thread opened. Clone it first (git clone https://github.com/${repo}.git ${folder}), then delegate again.`;
 }
 
 // Snapshot the selected soul: edits to files affect new selections, not running work.
@@ -3988,6 +4007,12 @@ export default function createTeam(host: Host, web: Web) {
                 ...(known.address === undefined ? {} : { address: known.address }),
                 replay: true,
             };
+        }
+
+        // Pocket's start refuses a missing folder only after the desk thread opened, and a plan task then stays
+        // delegated: refuse it here, before anything starts.
+        if (known === undefined && cwd !== undefined && !(await isDirectory(cwd))) {
+            throw new Error(missingFolderRefusal(persona.id, cwd, target.repo));
         }
 
         if (persona.role === "clerk") {

@@ -2203,14 +2203,15 @@ export function planTaskUnclear(
     return addEvent(
         planThread,
         `plan-task-unclear:${taskId}:${threadId}`,
-        `${taskId}: the start of ${threadId} failed, and a session may run: the task stays delegated. Look at the session list.`,
+        `${taskId}: the start of ${threadId} failed, and a session may run: the task stays delegated. Look at the session list (a found session thread): when no session runs for it, deliver the task again with team_delegate.`,
         at,
     );
 }
 
 /**
  * Close a thread whose linked session did not start. A thrown start is no proof that no session runs: a task thread's
- * task stays delegated, with its attempt open, and the plan thread gets 1 event.
+ * task stays delegated, with its attempt open, and the plan thread gets 1 event. The supervisor delivers such a task
+ * again (`failedStartThread`).
  */
 export function failThread(
     state: DeskState,
@@ -17319,6 +17320,35 @@ const openAttempt = (task: PlanTask): PlanTask["attempts"][number] | undefined =
 };
 
 /**
+ * The thread of a task's open attempt whose start failed: it closed as `failed`, and no session was ever bound to it
+ * (no `session` and no `address`). The supervisor may deliver the task again, after a look at the session list: a
+ * session that Pocket admitted shows as a found session thread. A thread with a bound session never counts.
+ */
+export function failedStartThread(
+    state: Readonly<DeskState> | undefined,
+    task: PlanTask,
+): Thread | undefined {
+    if (task.state !== "delegated") {
+        return undefined;
+    }
+
+    const attempt = openAttempt(task);
+    const thread = attempt === undefined ? undefined : threadById(state, attempt.thread);
+
+    if (
+        thread === undefined ||
+        thread.state !== "closed" ||
+        thread.closed?.why !== "failed" ||
+        thread.session !== undefined ||
+        thread.address !== undefined
+    ) {
+        return undefined;
+    }
+
+    return thread;
+}
+
+/**
  * The tasks of the approved graph that hold the next approval (`approvePlan`): each one that is delegated or has an
  * open attempt, as "t2 (T5)", in graph order.
  */
@@ -18222,7 +18252,7 @@ export function deliverCheck(
         return `${taskId} is not a task of the approved graph v${String(graph.version)} of ${plan.thread}.`;
     }
 
-    if (task.state !== "ready") {
+    if (task.state !== "ready" && failedStartThread(state, task) === undefined) {
         return `${task.id} is ${task.state}: a task starts when it is ready.`;
     }
 
@@ -18409,6 +18439,25 @@ export function startTask(
     // the approved graph stays as Brian approved it.
     const repo = task.repo === undefined ? thread.repo : undefined;
     const earlier = task.attempts.map((each) => each.thread);
+    const planThread = threadById(state, plan.thread);
+
+    // A start that failed with no session bound: the supervisor delivers the task again. The old attempt ends
+    // `stopped`, and the plan thread gets 1 event that names both threads.
+    const failed = failedStartThread(state, task);
+    const previous = openAttempt(task);
+
+    if (failed !== undefined && previous !== undefined) {
+        previous.end = { at, how: "stopped" };
+
+        if (planThread !== undefined) {
+            addEvent(
+                planThread,
+                `plan-task-again:${taskId}:${threadId}`,
+                `${taskId}: the start of ${failed.id} failed with no session bound: delivered again as ${threadId}`,
+                at,
+            );
+        }
+    }
 
     task.state = "delegated";
     task.attempts.push({ thread: threadId, at, ...(repo === undefined ? {} : { repo }), prs: [] });
@@ -18416,8 +18465,6 @@ export function startTask(
     if (plan.state === "approved") {
         plan.state = "building";
     }
-
-    const planThread = threadById(state, plan.thread);
 
     if (planThread !== undefined) {
         addEvent(
@@ -29176,7 +29223,8 @@ export default function createDesk(host: Host, web: Web) {
                     events += 1;
                 }
 
-                // A task thread that timed out: a session may run, so its task stays delegated, with 1 event.
+                // A task thread that timed out: a session may run, so its task stays delegated, with 1 event. The
+                // supervisor delivers the task again when no session runs for it (`failedStartThread`).
                 const named = thread.planTask;
                 const plan = named === undefined ? undefined : planOf(state, named.plan);
                 const planThread = plan === undefined ? undefined : threadById(state, plan.thread);
