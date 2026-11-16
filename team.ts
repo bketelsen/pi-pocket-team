@@ -1503,8 +1503,19 @@ export type TeamApi = {
             model?: string;
             /** A personal agent (`private: true`): the desk makes no found thread of its work. */
             private?: true;
+            /** The profile's `mcp:` list, `[]` when absent. An older Team has none. */
+            mcp?: string[];
         }[]
     >;
+    /**
+     * Whose MCP servers apply in a conversation: the walk of the MCP guard (`mcpScope`), with its fail-closed rules. The
+     * events bridge gates its tools by it. A throw is the caller's to treat as a block. An older Team has none.
+     */
+    mcpScope?: (
+        read: Pick<DocumentReader, "snapshot">,
+        conversationId: ConversationId,
+        context: Context,
+    ) => Promise<McpScope>;
     /**
      * Start a plan from the desk page's New plan, as the person who taps: the same start as `team_delegate` with
      * `plan.start`, bound to the supervisor's conversation. An older Team has none: the desk then refuses the route.
@@ -2829,7 +2840,9 @@ export default function createTeam(host: Host, web: Web) {
                 ...(agent.home === undefined ? {} : { home: agent.home }),
                 ...(agent.model === "" ? {} : { model: agent.model }),
                 ...(agent.private === true ? { private: true as const } : {}),
+                mcp: [...(agent.mcp ?? [])],
             })),
+        mcpScope: (read, conversationId, context) => scopeOf(read, conversationId, context),
         startPlan: async (request) => {
             const supervisor = request.supervisor as ConversationId;
             const identity = await resolveIdentity(

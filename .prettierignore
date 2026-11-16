@@ -1,5 +1,8 @@
 terminal-web/vendor/
 
+# The vendored NATS client of the events bridge, made by scripts/vendor-nats.mjs: its bytes are pinned by a test.
+_events-bridge-nats.mjs
+
 # Byte-identical copies from bketelsen/agentic-template and frostyard/core: never reformat them (make verify pins 2 of them).
 scripts/check-template.mjs
 scripts/check-corrections.mjs

@@ -98,6 +98,21 @@
             "why": "auth: the owner-only Wiki routes that read files from disk, and the path check that keeps each read to a listed page"
         },
         {
+            "glob": "events-bridge.ts",
+            "level": "L1",
+            "why": "secrets and credentials: each agent's lodge OAuth tokens, their 0600 file and their hiding from tools; and the owner-only sign-in"
+        },
+        {
+            "glob": "_events-bridge-nats.mjs",
+            "level": "L1",
+            "why": "supply chain: vendored third-party code (nats.js) that runs inside the server"
+        },
+        {
+            "glob": "scripts/vendor-nats.mjs",
+            "level": "L2",
+            "why": "supply chain: the pinned versions and integrity hashes of the vendored NATS client"
+        },
+        {
             "glob": "bench/lib/sandbox.mjs",
             "level": "L1",
             "why": "secrets and credentials: binds the real auth.json into the bench sandbox with write access"

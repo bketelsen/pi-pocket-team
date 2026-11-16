@@ -1,10 +1,9 @@
 # The tests need a Pi Pocket checkout: link.mjs symlinks node_modules, _pocket.d.ts and _pocket into the
 # checkout at PI_POCKET_CHECKOUT. The job "pocket" clones each pinned Pi Pocket release of the matrix into the
 # runner's temporary folder, installs its dependencies, points the links at it, and runs the gate, make ci:
-#   - upstream TannerMidd/pi-pocket at v0.27.0, the oldest pin, which stays until 0.29 is settled;
-#   - the fork bketelsen/pi-pocket at v0.28.1-bk.1, the rollback target: upstream v0.28.1 plus the patches listed
-#     in BK-PATCHES.md on its branch bk/v0.28.1;
-#   - upstream TannerMidd/pi-pocket at v0.29.0, the server's release.
+#   - upstream TannerMidd/pi-pocket at v0.29.0, the server's release, and the oldest release with host.inbox, which
+#     the events bridge needs (docs/adr/0004-agents-follow-lodge-events-through-a-bridge.md). The older pins
+#     (v0.27.0, and the fork's v0.28.1-bk.1) left the matrix with it: neither has host.inbox.
 # Each entry also names the tag's commit, and the job fails when the clone is another one. Actions are pinned by
 # commit SHA, and the token can only read (frostyard/core ADR-0021).
 # The ruleset requires the check "Test". A matrix job gets 1 check for each entry, named with the entry, so the job
@@ -33,12 +32,6 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - repository: TannerMidd/pi-pocket
-                      ref: v0.27.0
-                      commit: 50194aa38eb368ef2cb8599d44fba81b05ed5263
-                    - repository: bketelsen/pi-pocket
-                      ref: v0.28.1-bk.1
-                      commit: 7891d67bb0179f1c13aad6a15014fba7d8f4ddf5
                     - repository: TannerMidd/pi-pocket
                       ref: v0.29.0
                       commit: 284559cdc4cfb07b0b3f9d6882684e77a58e575b

@@ -20,6 +20,7 @@ it fits.
 - [0001 — Record architecture decisions](adr/0001-record-architecture-decisions.md)
 - [0002 — Agent-portable instruction surface](adr/0002-agent-portable-instruction-surface.md)
 - [0003 — Verify gate, risk paths and corrections](adr/0003-verify-gate-risk-paths-and-corrections.md)
+- [0004 — Agents follow lodge events through a bridge drop-in](adr/0004-agents-follow-lodge-events-through-a-bridge.md)
 - [Org-wide decisions (frostyard/core ADRs)](org-adrs.md)
 
 ### Design
@@ -65,6 +66,7 @@ summarizes these pages.
 - [modules/homewiki.md](modules/homewiki.md): Homewiki: the Wiki rail page
 - [modules/terminal.md](modules/terminal.md): Terminal: the shell page and its limits
 - [modules/github-hooks.md](modules/github-hooks.md): GitHub hooks: the webhook listener, its checks, facts, documents and alarms
+- [modules/events-bridge.md](modules/events-bridge.md): Events bridge: lodge events for named agents, the sign-in, wakes, the store and the vendored NATS client
 - [modules/daily-audit.md](modules/daily-audit.md): the daily audit script
 - [modules/home-seed.md](modules/home-seed.md): the agent home seed script
 - [setup.md](setup.md): the requirements, the setup and tests of a checkout, and the install
