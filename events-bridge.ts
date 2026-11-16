@@ -939,13 +939,29 @@ export function natsTransport(gateway: string): Transport {
             throw error;
         }
 
+        // The pulls that wait for the end of the connection. Each pull removes its own waiter when it ends: a race
+        // against 1 promise that lives as long as the connection would keep 1 reaction for each pull until the end.
+        const waiters = new Set<() => void>();
+        let over = false;
+
+        const end = () => {
+            over = true;
+
+            for (const wake of waiters) {
+                wake();
+            }
+
+            waiters.clear();
+        };
+
         // nats.js settles `closed()` with the error that ended the connection, or with nothing.
-        const ended = nc.closed().then(
-            () => "closed" as const,
-            () => "closed" as const,
-        );
+        const ended = nc.closed().then(end, end);
 
         return {
+            /** The pulls that wait for the end of the connection now: a test's view. */
+            get waiting() {
+                return waiters.size;
+            },
             async pull(stream, consumer, wait) {
                 if (nc.isClosed()) {
                     return { kind: "closed" };
@@ -967,7 +983,23 @@ export function natsTransport(gateway: string): Transport {
                     // subscription with no callback): the end of the connection ends the pull.
                     request.catch(() => undefined);
 
-                    const msg = await Promise.race([request, ended]);
+                    let wake: (() => void) | undefined;
+                    const closed = new Promise<"closed">((resolve) => {
+                        wake = () => resolve("closed");
+
+                        if (over) {
+                            wake();
+                        } else {
+                            waiters.add(wake);
+                        }
+                    });
+                    let msg: Awaited<typeof request> | "closed";
+
+                    try {
+                        msg = await Promise.race([request, closed]);
+                    } finally {
+                        waiters.delete(wake!);
+                    }
 
                     if (msg === "closed") {
                         return { kind: "closed" };
@@ -1017,7 +1049,7 @@ export function natsTransport(gateway: string): Transport {
                 nc.publish(reply, "+ACK");
                 await nc.flush();
             },
-            closed: ended.then(() => undefined),
+            closed: ended,
             close: () => nc.close(),
         };
     };

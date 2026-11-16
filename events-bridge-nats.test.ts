@@ -18,6 +18,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
 import { natsTransport, type BrokerConnection } from "./events-bridge.ts";
+
+/** The transport's connection, with its count of the pulls that wait for its end. */
+type Watched = BrokerConnection & { readonly waiting: number };
 import { wsconnect } from "./_events-bridge-nats.mjs";
 
 const PREFIX = "_INBOX.chani";
@@ -330,7 +333,7 @@ describe("events bridge: the broker transport over a WebSocket", () => {
     const opened: BrokerConnection[] = [];
     let gateway = "";
 
-    const connect = async (): Promise<BrokerConnection> => {
+    const connect = async (): Promise<Watched> => {
         if (gateway === "") {
             gateway = await server.listen();
         }
@@ -339,7 +342,7 @@ describe("events bridge: the broker transport over a WebSocket", () => {
 
         opened.push(connection);
 
-        return connection;
+        return connection as Watched;
     };
 
     after(async () => {
@@ -368,14 +371,23 @@ describe("events bridge: the broker transport over a WebSocket", () => {
         assert.deepEqual(server.acks.at(-1), { subject: ACK, body: "+ACK" });
     });
 
-    test("2 pulls in a row each get their event", async () => {
+    test("pulls in a row each get their event, and none stays waiting for the end", async () => {
         server.answer = "event";
 
         const connection = await connect();
 
-        for (let i = 0; i < 2; i++) {
+        for (let i = 0; i < 50; i++) {
             assert.equal((await connection.pull("app_marks", "chani-s1", 1_000)).kind, "message");
         }
+
+        server.answer = "408";
+
+        for (let i = 0; i < 50; i++) {
+            assert.equal((await connection.pull("app_marks", "chani-s1", 1_000)).kind, "timeout");
+        }
+
+        // A pull that ended holds nothing on the connection: a connection lives up to 1 hour, at 1 pull each 30 s.
+        assert.equal(connection.waiting, 0);
     });
 
     test("an expired pull (408) is a timeout", async () => {
@@ -395,10 +407,13 @@ describe("events bridge: the broker transport over a WebSocket", () => {
         const pulling = connection.pull("app_marks", "chani-s1", 60_000);
 
         await seen;
+        assert.equal(connection.waiting, 1);
         server.dropAll();
 
         assert.equal((await pulling).kind, "closed");
         await connection.closed;
+        assert.equal(connection.waiting, 0);
+        assert.equal((await connection.pull("app_marks", "chani-s1", 60_000)).kind, "closed");
     });
 });
 
@@ -412,10 +427,12 @@ describe("events bridge: the broker transport on a real JetStream", () => {
             skip: NATS_SERVER === undefined ? "set NATS_SERVER to a nats-server binary" : false,
             timeout: 30_000,
         },
-        async () => {
+        async (t) => {
             const dir = mkdtempSync(join(tmpdir(), "events-bridge-nats-"));
             const config = join(dir, "server.conf");
 
+            // Each resource is cleaned up even when a later step fails; the store goes after the server's exit.
+            t.after(() => rmSync(dir, { recursive: true, force: true }));
             writeFileSync(
                 config,
                 `listen: "127.0.0.1:-1"\njetstream { store_dir: "${join(dir, "js")}" }\n` +
@@ -425,8 +442,25 @@ describe("events bridge: the broker transport on a real JetStream", () => {
             const server = spawn(NATS_SERVER!, ["-c", config], {
                 stdio: ["ignore", "ignore", "pipe"],
             });
+            const exited = new Promise<void>((resolve) => {
+                server.on("close", () => resolve());
+            });
+
+            t.after(async () => {
+                if (
+                    server.exitCode === null &&
+                    server.signalCode === null &&
+                    server.pid !== undefined
+                ) {
+                    server.kill();
+                }
+
+                await exited;
+            });
+
             let log = "";
             const port = await new Promise<string>((resolve, reject) => {
+                server.on("error", reject);
                 server.stderr.on("data", (chunk: Buffer) => {
                     log += chunk.toString();
 
@@ -439,73 +473,68 @@ describe("events bridge: the broker transport on a real JetStream", () => {
                 server.on("exit", () => reject(new Error(`nats-server ended:\n${log}`)));
             });
             const admin = await wsconnect({ servers: `ws://127.0.0.1:${port}` });
+
+            t.after(() => admin.close().catch(() => undefined));
+
             const connection = await natsTransport(`http://127.0.0.1:${port}/gateway/mcp`)({
                 token: "",
                 inboxPrefix: PREFIX,
             });
 
-            try {
-                const api = async (subject: string, body: unknown) =>
-                    JSON.parse(
-                        new TextDecoder().decode(
-                            (await admin.request(subject, JSON.stringify(body), { timeout: 5_000 }))
-                                .data,
-                        ),
-                    ) as Record<string, unknown>;
+            t.after(() => connection.close().catch(() => undefined));
 
-                assert.equal(
-                    (
-                        await api("$JS.API.STREAM.CREATE.app_marks", {
-                            name: "app_marks",
-                            subjects: ["marks.>"],
-                        })
-                    ).error,
-                    undefined,
-                );
-                assert.equal(
-                    (
-                        await api("$JS.API.CONSUMER.CREATE.app_marks.chani-s1", {
-                            stream_name: "app_marks",
-                            config: {
-                                durable_name: "chani-s1",
-                                ack_policy: "explicit",
-                                deliver_policy: "new",
-                                ack_wait: 30_000_000_000,
-                            },
-                        })
-                    ).error,
-                    undefined,
-                );
+            const api = async (subject: string, body: unknown) =>
+                JSON.parse(
+                    new TextDecoder().decode(
+                        (await admin.request(subject, JSON.stringify(body), { timeout: 5_000 }))
+                            .data,
+                    ),
+                ) as Record<string, unknown>;
 
-                admin.publish(EVENT_SUBJECT, EVENT);
-                await admin.flush();
+            assert.equal(
+                (
+                    await api("$JS.API.STREAM.CREATE.app_marks", {
+                        name: "app_marks",
+                        subjects: ["marks.>"],
+                    })
+                ).error,
+                undefined,
+            );
+            assert.equal(
+                (
+                    await api("$JS.API.CONSUMER.CREATE.app_marks.chani-s1", {
+                        stream_name: "app_marks",
+                        config: {
+                            durable_name: "chani-s1",
+                            ack_policy: "explicit",
+                            deliver_policy: "new",
+                            ack_wait: 30_000_000_000,
+                        },
+                    })
+                ).error,
+                undefined,
+            );
 
-                const pulled = await connection.pull("app_marks", "chani-s1", 2_000);
+            admin.publish(EVENT_SUBJECT, EVENT);
+            await admin.flush();
 
-                assert.equal(pulled.kind, "message");
-                assert.equal(
-                    pulled.kind === "message" && new TextDecoder().decode(pulled.data),
-                    EVENT,
-                );
+            const pulled = await connection.pull("app_marks", "chani-s1", 2_000);
 
-                if (pulled.kind === "message") {
-                    await connection.ack(pulled.reply);
-                }
+            assert.equal(pulled.kind, "message");
+            assert.equal(pulled.kind === "message" && new TextDecoder().decode(pulled.data), EVENT);
 
-                const info = (await api("$JS.API.CONSUMER.INFO.app_marks.chani-s1", {})) as {
-                    ack_floor: { stream_seq: number };
-                    num_ack_pending: number;
-                };
-
-                assert.equal(info.ack_floor.stream_seq, 1);
-                assert.equal(info.num_ack_pending, 0);
-                assert.equal((await connection.pull("app_marks", "chani-s1", 500)).kind, "timeout");
-            } finally {
-                await connection.close().catch(() => undefined);
-                await admin.close().catch(() => undefined);
-                server.kill();
-                rmSync(dir, { recursive: true, force: true });
+            if (pulled.kind === "message") {
+                await connection.ack(pulled.reply);
             }
+
+            const info = (await api("$JS.API.CONSUMER.INFO.app_marks.chani-s1", {})) as {
+                ack_floor: { stream_seq: number };
+                num_ack_pending: number;
+            };
+
+            assert.equal(info.ack_floor.stream_seq, 1);
+            assert.equal(info.num_ack_pending, 0);
+            assert.equal((await connection.pull("app_marks", "chani-s1", 500)).kind, "timeout");
         },
     );
 });

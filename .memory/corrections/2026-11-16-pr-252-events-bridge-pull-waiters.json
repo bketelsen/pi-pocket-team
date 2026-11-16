@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "events-bridge.ts",
+  "correction": "a broker pull of the events bridge raced its request against 1 promise that lives as long as the connection, so each pull that ended left 1 reaction on it until the connection ended; each pull now adds its own waiter for the end of the connection and removes it when the pull ends",
+  "evidence": "bketelsen/pi-pocket-team#252: cross-review (openai/gpt-6.1-sol) of 4c477b64b655b3abefdae79dd19d759ee827b60a, finding 1 (medium, blocking)",
+  "promoted_to": "events-bridge-nats.test.ts: pulls in a row each get their event, and none stays waiting for the end"
+}
