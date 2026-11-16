@@ -81,6 +81,14 @@ CI tests only Pi Pocket releases with `host.inbox`: the matrix pins v0.29.0.
   A session moved to another agent by hand gets 1 more wake before a new one.
 - Pocket counts the hourly limit in memory; the store counts it too, so a
   restart does not reset the cap.
+- Delivery is at least once. Pocket has no delivery receipt, so a try cut off
+  by a crash whose session then moved or went goes again, its lines marked
+  `repeat=maybe`; the agent checks the event ids. Such a repeat takes its own
+  place in the hour.
+- A replay of an `events_pending` call after a crash gets its stored answer
+  within a bound: the newest 100 answers always, older ones for 8 days. Pocket
+  gives no signal that a tool result is recorded, so a replay past that bound
+  can miss the events its first run took.
 
 ## Alternatives considered
 
