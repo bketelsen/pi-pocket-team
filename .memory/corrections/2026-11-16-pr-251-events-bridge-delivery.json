@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "events-bridge.ts",
+  "correction": "the events bridge could lose or repeat events and leak hidden tokens: a delivery now fixes its events (within Pocket's 8,000-character payload) and its wake reservation in the store before it starts, checks the store again after each wait, retries a try with no answer in the same session (Pocket's key counts per session), keeps a digest message's day and events until it goes, answers a replayed events_pending call with the same events, backs off a failed pause notice, keeps exactly the current tokens hidden (a refused hide writes nothing), and a reload waits for the old bridge's stop",
+  "evidence": "bketelsen/pi-pocket-team#251: cross-review (openai/gpt-6.1-sol) of 257f51b found 10 blocking points: token hiding, revoke during delivery, payload clipping, concurrent receive, digest attempts, per-session keys, reload overlap, events_pending durability, wake cap after restart, pause notice retry loop",
+  "promoted_to": "events-bridge.test.ts: rotated tokens are released and a refused hide writes nothing; a reload waits until the old bridge has stopped; a revoke while the events session is made; a message holds only the lines that fit; an event that comes while a batch starts is never lost; a digest that went before a crash is not sent again on another day; a try cut off goes again to the same session; a batch keeps its place in the hour across a restart; a pause notice that fails waits longer each time; a replay of events_pending gets the same events"
+}

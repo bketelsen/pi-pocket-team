@@ -79,6 +79,10 @@ export const MESSAGE_LINES = 40;
 export const DIGEST_CAP = 1000;
 /** Event ids kept for de-duplication: lodge's streams keep 7 days, so 8 covers every redelivery. */
 export const SEEN_MS = 8 * 24 * 3_600_000;
+/** The most text of 1 message's event lines: Pocket cuts a payload at 8,000 characters. */
+export const PAYLOAD_BUDGET = 7_000;
+/** A pause notice that did not go is tried again after this wait, doubled each time, 1 hour at most. */
+export const NOTICE_RETRY_MS = 30_000;
 /** A pull waits this long for an event; lodge allows 60 s at most. */
 export const PULL_MS = 30_000;
 /** The redirect address of the sign-in. Nothing listens there: the owner pastes the address the browser shows. */
@@ -134,7 +138,25 @@ export type Batch = {
     nextAt: number;
     /** Sessions made for this batch after a 410: at most 2. */
     remade: number;
+    /** The wake this batch holds in its subscription's hour, from the start of its delivery (a durable reservation). */
+    wake?: number;
+    /** The session of its last try. */
+    target?: number;
+    /** A try that ended with no answer (a crash, an error with no status): it may have gone, so the next try goes to `target`. */
+    inflight?: true;
 };
+
+/** The digest message that is on its way: its day (its key) and its events, fixed before the first try. */
+export type DigestAttempt = {
+    day: string;
+    ids: string[];
+    target?: number;
+    inflight?: true;
+    remade: number;
+};
+
+/** What events_pending gave a tool call: a replay of that call gives the same. */
+export type Taken = { at: number; events: Pending[]; more: number; dropped: number };
 
 /** The store of 1 agent: `<agent>.events.json`. */
 export type AgentState = {
@@ -150,7 +172,15 @@ export type AgentState = {
     session?: { id: number; generation: number; gone?: true };
     /** Events sessions made so far: each start has its own key. */
     generation: number;
-    paused?: { reason: string; at: number; notice: number; sent?: true };
+    /** `tries` and `nextAt`: the notice's tries; a notice that did not go waits longer each time. */
+    paused?: {
+        reason: string;
+        at: number;
+        notice: number;
+        sent?: true;
+        tries?: number;
+        nextAt?: number;
+    };
     pauses: number;
     subs: Record<string, Subscription>;
     /** Subscriptions that ended without an unsubscribe, for events_list: newest last, at most 20. */
@@ -161,7 +191,15 @@ export type AgentState = {
     seen: Record<string, number>;
     /** Subscription → the times of its `now` wakes in the last hour. */
     wakes: Record<string, number[]>;
-    digest: { day?: string; tries: number; nextAt?: number; dropped: number };
+    digest: {
+        day?: string;
+        tries: number;
+        nextAt?: number;
+        dropped: number;
+        attempt?: DigestAttempt;
+    };
+    /** events_pending's answers by tool call (`<conversation>:<call>`), for a day. */
+    taken?: Record<string, Taken>;
 };
 
 export function emptyState(agent: string, gateway: string): AgentState {
@@ -460,42 +498,88 @@ export class StateFile {
 }
 
 /**
- * The OAuth state of 1 agent's bridge client, `<agent>.json` (0600), in pi-mcp's format. Each token it loads or saves is
- * hidden from tools at once (`hide`). Its refresh lock is in memory: only this process uses the file.
+ * The tokens of 1 agent that `host.hide` keeps out of tool output: exactly the ones in its token file. A new token is
+ * hidden before the write that stores it (a failure throws, and nothing is written); an old one is released after the
+ * write that replaces it, so rotations never pile up against Pocket's limit of hidden values.
+ */
+export class Hider {
+    readonly #hide: (value: string) => () => void;
+    readonly #live = new Map<string, () => void>();
+
+    constructor(hide: (value: string) => () => void) {
+        this.#hide = hide;
+    }
+
+    /** Hides each of `values` that is not hidden yet. Throws when the host refuses one. */
+    add(values: readonly string[]): void {
+        for (const value of values) {
+            if (!this.#live.has(value)) {
+                this.#live.set(value, this.#hide(value));
+            }
+        }
+    }
+
+    /** Hides exactly `values`: the new ones first, then the others are released. */
+    set(values: readonly string[]): void {
+        this.add(values);
+
+        for (const [value, release] of this.#live) {
+            if (!values.includes(value)) {
+                release();
+                this.#live.delete(value);
+            }
+        }
+    }
+
+    get size(): number {
+        return this.#live.size;
+    }
+
+    clear(): void {
+        this.set([]);
+    }
+}
+
+const tokensOf = (state: McpOAuthState | undefined): string[] =>
+    [state?.tokens?.access_token, state?.tokens?.refresh_token].filter(
+        (value): value is string => typeof value === "string" && value.length > 0,
+    );
+
+/**
+ * The OAuth state of 1 agent's bridge client, `<agent>.json` (0600), in pi-mcp's format. Its tokens are hidden from
+ * tools by the agent's `Hider` before they are written, and at each load. Its refresh lock is in memory: only this
+ * process uses the file.
  */
 export class TokenFile implements McpOAuthServerStore {
     readonly path: string;
     readonly #lock: <T>(work: () => Promise<T>) => Promise<T>;
     readonly #refresh: <T>(work: () => Promise<T>) => Promise<T>;
-    readonly #hide: (value: string) => void;
+    readonly #hider: Hider;
 
-    constructor(dir: string, agent: string, hide: (value: string) => void) {
+    constructor(dir: string, agent: string, hider: Hider) {
         this.path = join(dir, `${agent}.json`);
         this.#lock = lockOf(this.path);
         this.#refresh = lockOf(`${this.path}#refresh`);
-        this.#hide = hide;
-    }
-
-    #hideTokens(state: McpOAuthState | undefined): void {
-        for (const value of [state?.tokens?.access_token, state?.tokens?.refresh_token]) {
-            if (typeof value === "string" && value.length >= 4) {
-                this.#hide(value);
-            }
-        }
+        this.#hider = hider;
     }
 
     async load(): Promise<McpOAuthState | undefined> {
-        const state = (await readJson(this.path)) as McpOAuthState | undefined;
+        return this.#lock(async () => {
+            const state = (await readJson(this.path)) as McpOAuthState | undefined;
 
-        this.#hideTokens(state);
+            this.#hider.set(tokensOf(state));
 
-        return state;
+            return state;
+        });
     }
 
     async save(state: McpOAuthState): Promise<void> {
-        // Hidden before the write: no tool reads the file before its tokens are hidden.
-        this.#hideTokens(state);
-        await this.#lock(() => writePrivate(this.path, `${JSON.stringify(state)}\n`));
+        await this.#lock(async () => {
+            // Hidden before the write: no tool reads a token before it is hidden, and a refusal writes nothing.
+            this.#hider.add(tokensOf(state));
+            await writePrivate(this.path, `${JSON.stringify(state)}\n`);
+            this.#hider.set(tokensOf(state));
+        });
     }
 
     withRefreshLock<T>(work: () => Promise<T>): Promise<T> {
@@ -1022,6 +1106,12 @@ export class AgentBridge {
             }
         }
 
+        for (const [key, taken] of Object.entries(state.taken ?? {})) {
+            if (now - taken.at > 24 * HOUR) {
+                delete state.taken![key];
+            }
+        }
+
         for (const [sub, times] of Object.entries(state.wakes)) {
             const recent = times.filter((at) => now - at < HOUR);
 
@@ -1252,21 +1342,31 @@ export class AgentBridge {
         pending.state = "digest";
         state.pending[pending.event.id] = pending;
 
+        // Events of the digest message on its way stay: that message may have gone already.
+        const sending = new Set(state.digest.attempt?.ids ?? []);
         const digest = Object.values(state.pending)
-            .filter((each) => each.state === "digest")
+            .filter((each) => each.state === "digest" && !sending.has(each.event.id))
             .sort((a, b) => a.received - b.received);
+        const over =
+            Object.values(state.pending).filter((each) => each.state === "digest").length -
+            DIGEST_CAP;
 
-        for (const old of digest.slice(0, Math.max(0, digest.length - DIGEST_CAP))) {
+        for (const old of digest.slice(0, Math.max(0, over))) {
             delete state.pending[old.event.id];
             state.seen[old.event.id] = old.received;
             state.digest.dropped++;
         }
     }
 
+    /** A batch that will not wake: its events go to the digest, and its place in the hour is free again. */
     #batchToDigest(state: AgentState, batchId: string): void {
         const batch = state.batches[batchId];
 
         delete state.batches[batchId];
+
+        if (batch !== undefined) {
+            this.#release(state, batch);
+        }
 
         for (const id of batch?.events ?? []) {
             const pending = state.pending[id];
@@ -1275,6 +1375,37 @@ export class AgentBridge {
                 this.#toDigest(state, pending);
             }
         }
+    }
+
+    /** Gives back the wake that a batch held in its subscription's hour. */
+    #release(state: AgentState, batch: Batch): void {
+        const times = state.wakes[batch.sub];
+        const at = batch.wake === undefined ? -1 : (times?.indexOf(batch.wake) ?? -1);
+
+        if (at !== -1) {
+            times!.splice(at, 1);
+        }
+
+        delete batch.wake;
+    }
+
+    /** The oldest events that fit in 1 message: `max` at most, and `PAYLOAD_BUDGET` characters of lines at most. */
+    #select(events: readonly Pending[], max: number): string[] {
+        const ids: string[] = [];
+        let size = 0;
+
+        for (const each of events) {
+            const line = eventLine(each.event).length + 1;
+
+            if (ids.length >= max || (ids.length > 0 && size + line > PAYLOAD_BUDGET)) {
+                break;
+            }
+
+            ids.push(each.event.id);
+            size += line;
+        }
+
+        return ids;
     }
 
     /** Events handed to a session: out of the store, into the ids seen. */
@@ -1579,22 +1710,39 @@ export class AgentBridge {
             .length;
     }
 
-    /** The oldest digest events, at most `max`: handed to the caller, so delivered. */
-    async takePending(max: number): Promise<{ events: Pending[]; more: number; dropped: number }> {
+    /**
+     * The oldest digest events, at most `max`: handed to the caller, so delivered. `call` names the tool call: a replay
+     * of it gets the same answer, so a crash before Pocket keeps the answer loses no event. The digest message on its
+     * way keeps its events.
+     */
+    async takePending(max: number, call: string): Promise<Taken> {
         return this.#change((state) => {
+            const done = state.taken?.[call];
+
+            if (done !== undefined) {
+                return done;
+            }
+
+            const sending = new Set(state.digest.attempt?.ids ?? []);
             const digest = Object.values(state.pending)
-                .filter((each) => each.state === "digest")
+                .filter((each) => each.state === "digest" && !sending.has(each.event.id))
                 .sort((a, b) => a.received - b.received);
             const events = digest.slice(0, max);
-            const dropped = state.digest.dropped;
+            const taken: Taken = {
+                at: this.#now(),
+                events,
+                more: digest.length - events.length,
+                dropped: state.digest.dropped,
+            };
 
             this.#delivered(
                 state,
                 events.map((each) => each.event.id),
             );
             state.digest.dropped = 0;
+            (state.taken ??= {})[call] = taken;
 
-            return { events, more: digest.length - events.length, dropped };
+            return taken;
         });
     }
 
@@ -1700,10 +1848,14 @@ export class AgentBridge {
         );
 
         if (state.paused !== undefined && state.paused.sent !== true) {
-            times.push(state.paused.at);
+            times.push(state.paused.nextAt ?? state.paused.at);
         }
 
-        if (this.pendingCount() > 0 || state.digest.day === undefined) {
+        if (
+            this.pendingCount() > 0 ||
+            state.digest.day === undefined ||
+            state.digest.attempt !== undefined
+        ) {
             times.push(state.digest.nextAt ?? nextDigestAt(this.#now(), state.digest.day));
         }
 
@@ -1746,8 +1898,9 @@ export class AgentBridge {
     async #due(): Promise<void> {
         const now = this.#now();
         const state = this.#state!;
+        const paused = state.paused;
 
-        if (state.paused !== undefined && state.paused.sent !== true) {
+        if (paused !== undefined && paused.sent !== true && (paused.nextAt ?? paused.at) <= now) {
             await this.#pauseNotice();
         }
 
@@ -1807,99 +1960,183 @@ export class AgentBridge {
     }
 
     /**
-     * Delivers 1 batch to the events session, once for its key. A batch past the wakes of the hour, or one that gets a
-     * 429, goes to the digest. A 409 is tried again after a wait, at most `RETRIES` times; then the digest. A 410 means
-     * the session is gone: a new one, and again at once (at most 2 new sessions for 1 batch).
+     * The session of a try. A try before it that ended with no answer (`inflight`) may have gone: this one goes to the
+     * same session, so Pocket's key, which counts in 1 session, sends nothing twice. Else the standing events session,
+     * checked now.
+     */
+    async #target(previous: { target?: number; inflight?: true }): Promise<number> {
+        return previous.inflight === true && previous.target !== undefined
+            ? previous.target
+            : this.#session();
+    }
+
+    /**
+     * Delivers 1 batch to the events session, once for its key (`eb-<agent>-<batch>`, named by its first event). The
+     * start of its delivery fixes its events (the ones that fit in 1 message; the rest go to the digest) and takes its
+     * place in the subscription's hour, in the store, so a restart keeps both. A batch past the wakes of the hour, or
+     * one that gets a 429, goes to the digest. A 409 is tried again after a wait, at most `RETRIES` times; then the
+     * digest. A 410 means the session is gone: a new one, and again at once (at most 2 new sessions for 1 batch). Each
+     * write checks the store again: a revoke or an unsubscribe during a wait deletes the batch, and nothing goes.
      */
     async #deliverBatch(batchId: string): Promise<void> {
         const now = this.#now();
-        let state = this.#state!;
-        let batch = state.batches[batchId];
+        const ready = await this.#change((state) => {
+            const batch = state.batches[batchId];
 
-        if (batch === undefined) {
-            return;
-        }
-
-        const sub = state.subs[batch.sub];
-        const events = batch.events
-            .map((id) => state.pending[id]?.event)
-            .filter((event): event is ThinEvent => event !== undefined);
-
-        if (sub === undefined || events.length === 0 || state.by === undefined) {
-            await this.#change((next) => {
-                if (sub === undefined || events.length === 0) {
-                    this.#delivered(next, next.batches[batchId]?.events ?? []);
-                    delete next.batches[batchId];
-                } else {
-                    // Nobody to deliver for: the digest keeps them for events_pending.
-                    this.#batchToDigest(next, batchId);
-                }
-            });
-
-            return;
-        }
-
-        if (batch.state === "open") {
-            const recent = (state.wakes[sub.name] ?? []).filter((at) => now - at < HOUR);
-
-            if (recent.length >= WAKES_PER_HOUR) {
-                await this.#change((next) => this.#batchToDigest(next, batchId));
-
-                return;
+            if (batch === undefined) {
+                return false;
             }
 
-            await this.#change((next) => {
-                const live = next.batches[batchId];
+            const sub = state.subs[batch.sub];
+            const live = batch.events.filter((id) => state.pending[id] !== undefined);
 
-                if (live !== undefined) {
-                    live.state = "delivering";
-                    live.nextAt = now;
+            if (sub === undefined || live.length === 0) {
+                this.#delivered(state, live);
+                this.#release(state, batch);
+                delete state.batches[batchId];
+
+                return false;
+            }
+
+            if (state.by === undefined) {
+                // Nobody to deliver for: the digest keeps them for events_pending.
+                this.#batchToDigest(state, batchId);
+
+                return false;
+            }
+
+            if (batch.state === "open") {
+                const recent = (state.wakes[sub.name] ?? []).filter((at) => now - at < HOUR);
+
+                if (recent.length >= WAKES_PER_HOUR) {
+                    this.#batchToDigest(state, batchId);
+
+                    return false;
                 }
-            });
-            state = this.#state!;
-            batch = state.batches[batchId]!;
+
+                const chosen = this.#select(
+                    live.map((id) => state.pending[id]!),
+                    MESSAGE_LINES,
+                );
+
+                for (const id of live.slice(chosen.length)) {
+                    this.#toDigest(state, state.pending[id]!);
+                }
+
+                batch.events = chosen;
+                batch.state = "delivering";
+                batch.nextAt = now;
+                batch.wake = now;
+                state.wakes[sub.name] = [...recent, now];
+            } else {
+                batch.events = live;
+            }
+
+            return true;
+        });
+
+        if (!ready) {
+            return;
         }
 
-        const shown = events.slice(0, MESSAGE_LINES);
-        const rest = events.slice(MESSAGE_LINES).map((event) => event.id);
-        const header = `Subscription ${sub.name} (topic ${sub.topic}, mode now): ${String(events.length)} events.`;
-        let session: number;
+        const before = this.#state!.batches[batchId]!;
+        const resumed = before.inflight === true && before.target !== undefined;
+        let target: number;
 
         try {
-            session = await this.#session();
+            target = await this.#target(before);
         } catch (error) {
-            await this.#retry(batchId, `no events session: ${messageOf(error)}`);
+            await this.#retry(batchId, `no events session: ${messageOf(error)}`, false);
 
             return;
         }
+
+        // After the waits: the batch as the store has it now, and the try marked before it starts.
+        const go = await this.#change((state) => {
+            const batch = state.batches[batchId];
+            const sub = batch === undefined ? undefined : state.subs[batch.sub];
+
+            if (batch === undefined) {
+                return undefined;
+            }
+
+            const ids = batch.events.filter((id) => state.pending[id] !== undefined);
+
+            if (sub === undefined || ids.length === 0) {
+                this.#delivered(state, ids);
+                this.#release(state, batch);
+                delete state.batches[batchId];
+
+                return undefined;
+            }
+
+            batch.events = ids;
+            batch.target = target;
+            batch.inflight = true;
+
+            return { sub, events: ids.map((id) => state.pending[id]!.event) };
+        });
+
+        if (go === undefined) {
+            return;
+        }
+
+        const header = `Subscription ${go.sub.name} (topic ${go.sub.topic}, mode now): ${String(go.events.length)} events.`;
 
         try {
             await this.#deps.sessions.deliver(
-                session,
+                target,
                 this.#delivery(
                     `eb-${this.agent}-${batchId}`,
-                    this.#payload(header, shown, rest.length),
-                    { subscription: sub.name, topic: sub.topic },
-                    { bucket: `events-bridge:${this.agent}:${sub.name}`, perHour: WAKES_PER_HOUR },
+                    this.#payload(header, go.events, 0),
+                    { subscription: go.sub.name, topic: go.sub.topic },
+                    {
+                        bucket: `events-bridge:${this.agent}:${go.sub.name}`,
+                        perHour: WAKES_PER_HOUR,
+                    },
                 ),
             );
         } catch (error) {
             const status = statusOf(error);
 
-            if (status === 429 || status === 400) {
-                await this.#change((next) => this.#batchToDigest(next, batchId));
+            // No status: the try may have gone. The next one goes to the same session, with the same key.
+            if (status === undefined) {
+                await this.#retry(batchId, messageOf(error), true);
 
                 return;
             }
 
-            if (status === 410 && batch.remade < 2) {
-                await this.#sessionGone(session);
-                await this.#change((next) => {
-                    const live = next.batches[batchId];
+            if (status === 429 || status === 400) {
+                await this.#change((state) => this.#batchToDigest(state, batchId));
 
-                    if (live !== undefined) {
-                        live.remade++;
-                        live.nextAt = this.#now();
+                return;
+            }
+
+            if (status === 410 && resumed) {
+                // The try that may have gone went to a session that is gone now: it counts as delivered, so a new
+                // session does not get the same events again.
+                await this.#change((state) => {
+                    this.#delivered(state, state.batches[batchId]?.events ?? []);
+                    delete state.batches[batchId];
+                });
+                this.#deps.notice(
+                    "warning",
+                    `Events bridge (${this.agent}): a batch that may have gone to session ${String(target)} counts as delivered; that session is gone.`,
+                );
+
+                return;
+            }
+
+            if (status === 410 && before.remade < 2) {
+                await this.#sessionGone(target);
+                await this.#change((state) => {
+                    const batch = state.batches[batchId];
+
+                    if (batch !== undefined) {
+                        batch.remade++;
+                        batch.nextAt = this.#now();
+                        delete batch.target;
+                        delete batch.inflight;
                     }
                 });
                 this.#again = true;
@@ -1907,54 +2144,56 @@ export class AgentBridge {
                 return;
             }
 
-            await this.#retry(batchId, messageOf(error));
+            if (status === 410) {
+                await this.#sessionGone(target);
+            }
+
+            await this.#retry(batchId, messageOf(error), false);
 
             return;
         }
 
-        // `sent: false` is a delivery that a crash cut off before this write: it went, once.
-        await this.#change((next) => {
-            const live = next.batches[batchId];
-
-            if (live === undefined) {
-                return;
-            }
-
-            this.#delivered(next, live.events.slice(0, MESSAGE_LINES));
-            delete next.batches[batchId];
-
-            for (const id of rest) {
-                const pending = next.pending[id];
-
-                if (pending !== undefined) {
-                    this.#toDigest(next, pending);
-                }
-            }
-
-            next.wakes[sub.name] = [...(next.wakes[sub.name] ?? []), now];
-        });
-    }
-
-    async #retry(batchId: string, why: string): Promise<void> {
-        const now = this.#now();
-
+        // `sent: false` is a try before this one that went: delivered, once.
         await this.#change((state) => {
             const batch = state.batches[batchId];
 
+            if (batch !== undefined) {
+                this.#delivered(state, batch.events);
+                delete state.batches[batchId];
+            }
+        });
+    }
+
+    /** A try that did not go: again after a wait, `RETRIES` times at most, then the digest. */
+    async #retry(batchId: string, why: string, inflight: boolean): Promise<void> {
+        const now = this.#now();
+        const moved = await this.#change((state) => {
+            const batch = state.batches[batchId];
+
             if (batch === undefined) {
-                return;
+                return false;
             }
 
             batch.tries++;
 
+            if (inflight) {
+                batch.inflight = true;
+            } else {
+                delete batch.inflight;
+            }
+
             if (batch.tries > RETRIES) {
                 this.#batchToDigest(state, batchId);
-            } else {
-                batch.nextAt = now + RETRY_MS[batch.tries - 1]!;
+
+                return true;
             }
+
+            batch.nextAt = now + RETRY_MS[batch.tries - 1]!;
+
+            return false;
         });
 
-        if (this.#state!.batches[batchId] === undefined) {
+        if (moved) {
             this.#deps.notice(
                 "info",
                 `Events bridge (${this.agent}): a batch went to the digest after ${String(RETRIES)} retries (${why}).`,
@@ -1962,91 +2201,204 @@ export class AgentBridge {
         }
     }
 
-    /** The day's digest: 1 message with the oldest digest events. The rest wait for events_pending or the next day. */
+    /**
+     * The day's digest: 1 message with the oldest digest events that fit. Its events and its day (its key) are fixed in
+     * the store before the first try, so a retry, a restart or another day sends the same message once. The rest wait
+     * for events_pending or the next day.
+     */
     async #deliverDigest(): Promise<void> {
         const now = this.#now();
         const day = digestDay(now);
-        const state = this.#state!;
-        const digest = Object.values(state.pending)
-            .filter((each) => each.state === "digest")
-            .sort((a, b) => a.received - b.received);
+        const ready = await this.#change((state) => {
+            let attempt = state.digest.attempt;
 
-        if (digest.length === 0 || state.by === undefined) {
-            await this.#change((next) => {
-                next.digest.day = day;
-                next.digest.tries = 0;
-                delete next.digest.nextAt;
-            });
+            if (attempt === undefined) {
+                const digest = Object.values(state.pending)
+                    .filter((each) => each.state === "digest")
+                    .sort((a, b) => a.received - b.received);
 
+                if (digest.length === 0 || state.by === undefined) {
+                    state.digest.day = day;
+                    state.digest.tries = 0;
+                    delete state.digest.nextAt;
+
+                    return false;
+                }
+
+                attempt = { day, ids: this.#select(digest, MESSAGE_LINES), remade: 0 };
+                state.digest.attempt = attempt;
+            }
+
+            attempt.ids = attempt.ids.filter((id) => state.pending[id] !== undefined);
+
+            if (attempt.ids.length === 0) {
+                state.digest.day = attempt.day;
+                state.digest.tries = 0;
+                delete state.digest.nextAt;
+                delete state.digest.attempt;
+
+                return false;
+            }
+
+            return true;
+        });
+
+        if (!ready) {
             return;
         }
 
-        const shown = digest.slice(0, MESSAGE_LINES);
-        const dropped = state.digest.dropped;
-        const header =
-            `Daily digest: ${String(digest.length)} events.` +
-            (dropped > 0
-                ? ` ${String(dropped)} older events were dropped: the bridge keeps ${String(DIGEST_CAP)}.`
-                : "");
-        let session: number;
+        const before = this.#state!.digest.attempt!;
+        const resumed = before.inflight === true && before.target !== undefined;
+        let target: number;
 
         try {
-            session = await this.#session();
+            target = await this.#target(before);
         } catch (error) {
-            await this.#digestRetry(day, messageOf(error));
+            await this.#digestRetry(messageOf(error), false);
 
             return;
         }
+
+        const go = await this.#change((state) => {
+            const attempt = state.digest.attempt;
+
+            if (attempt === undefined) {
+                return undefined;
+            }
+
+            attempt.ids = attempt.ids.filter((id) => state.pending[id] !== undefined);
+
+            if (attempt.ids.length === 0) {
+                state.digest.day = attempt.day;
+                delete state.digest.attempt;
+
+                return undefined;
+            }
+
+            attempt.target = target;
+            attempt.inflight = true;
+
+            const waiting = Object.values(state.pending).filter(
+                (each) => each.state === "digest",
+            ).length;
+
+            return {
+                day: attempt.day,
+                ids: [...attempt.ids],
+                events: attempt.ids.map((id) => state.pending[id]!.event),
+                waiting,
+                dropped: state.digest.dropped,
+            };
+        });
+
+        if (go === undefined) {
+            return;
+        }
+
+        const header =
+            `Daily digest: ${String(go.waiting)} events.` +
+            (go.dropped > 0
+                ? ` ${String(go.dropped)} older events were dropped: the bridge keeps ${String(DIGEST_CAP)}.`
+                : "");
 
         try {
             await this.#deps.sessions.deliver(
-                session,
+                target,
                 this.#delivery(
-                    `eb-${this.agent}-digest-${day}`,
-                    this.#payload(
-                        header,
-                        shown.map((each) => each.event),
-                        digest.length - shown.length,
-                    ),
-                    { digest: day },
+                    `eb-${this.agent}-digest-${go.day}`,
+                    this.#payload(header, go.events, go.waiting - go.events.length),
+                    { digest: go.day },
                 ),
             );
         } catch (error) {
-            if (statusOf(error) === 410) {
-                await this.#sessionGone(session);
+            const status = statusOf(error);
+
+            if (status === undefined) {
+                await this.#digestRetry(messageOf(error), true);
+
+                return;
+            }
+
+            if (status === 410 && resumed) {
+                await this.#change((state) => {
+                    this.#delivered(state, state.digest.attempt?.ids ?? []);
+                    state.digest.day = go.day;
+                    state.digest.tries = 0;
+                    state.digest.dropped = 0;
+                    delete state.digest.nextAt;
+                    delete state.digest.attempt;
+                });
+                this.#deps.notice(
+                    "warning",
+                    `Events bridge (${this.agent}): a digest that may have gone to session ${String(target)} counts as delivered; that session is gone.`,
+                );
+
+                return;
+            }
+
+            if (status === 410 && before.remade < 2) {
+                await this.#sessionGone(target);
+                await this.#change((state) => {
+                    const attempt = state.digest.attempt;
+
+                    if (attempt !== undefined) {
+                        attempt.remade++;
+                        delete attempt.target;
+                        delete attempt.inflight;
+                    }
+                });
                 this.#again = true;
 
                 return;
             }
 
-            await this.#digestRetry(day, messageOf(error));
+            if (status === 410) {
+                await this.#sessionGone(target);
+            }
+
+            await this.#digestRetry(messageOf(error), false);
 
             return;
         }
 
-        await this.#change((next) => {
-            this.#delivered(
-                next,
-                shown.map((each) => each.event.id),
-            );
-            next.digest.day = day;
-            next.digest.tries = 0;
-            next.digest.dropped = 0;
-            delete next.digest.nextAt;
+        await this.#change((state) => {
+            this.#delivered(state, state.digest.attempt?.ids ?? []);
+            state.digest.day = go.day;
+            state.digest.tries = 0;
+            state.digest.dropped = 0;
+            delete state.digest.nextAt;
+            delete state.digest.attempt;
         });
     }
 
-    async #digestRetry(day: string, why: string): Promise<void> {
+    /**
+     * A digest that did not go: again after a wait, `RETRIES` times at most. Then it waits for tomorrow, and its events
+     * for events_pending; a try that may have gone keeps its message, so tomorrow sends that 1 again.
+     */
+    async #digestRetry(why: string, inflight: boolean): Promise<void> {
         const now = this.#now();
 
         await this.#change((state) => {
+            const attempt = state.digest.attempt;
+
             state.digest.tries++;
 
+            if (attempt !== undefined) {
+                if (inflight) {
+                    attempt.inflight = true;
+                } else {
+                    delete attempt.inflight;
+                }
+            }
+
             if (state.digest.tries > RETRIES) {
-                // The events stay for events_pending and tomorrow's digest.
-                state.digest.day = day;
+                state.digest.day = attempt?.day ?? digestDay(now);
                 state.digest.tries = 0;
                 delete state.digest.nextAt;
+
+                if (attempt !== undefined && attempt.inflight !== true) {
+                    delete state.digest.attempt;
+                }
             } else {
                 state.digest.nextAt = now + DIGEST_RETRY_MS;
             }
@@ -2054,7 +2406,7 @@ export class AgentBridge {
         this.#deps.notice("info", `Events bridge (${this.agent}): the digest did not go (${why}).`);
     }
 
-    /** The 1 notice of a pause, in the events session, once for the pause's key. */
+    /** The 1 notice of a pause, in the events session, once for the pause's key; a try that fails waits longer each time. */
     async #pauseNotice(): Promise<void> {
         const state = this.#state!;
         const paused = state.paused;
@@ -2068,11 +2420,25 @@ export class AgentBridge {
             return;
         }
 
+        const failed = async () => {
+            await this.#change((next) => {
+                if (next.paused?.notice === paused.notice) {
+                    const tries = (next.paused.tries ?? 0) + 1;
+
+                    next.paused.tries = tries;
+                    next.paused.nextAt =
+                        this.#now() + Math.min(HOUR, NOTICE_RETRY_MS * 2 ** (tries - 1));
+                }
+            });
+        };
+
         let session: number;
 
         try {
             session = await this.#session();
         } catch {
+            await failed();
+
             return;
         }
 
@@ -2090,6 +2456,8 @@ export class AgentBridge {
             if (statusOf(error) === 410) {
                 await this.#sessionGone(session);
             }
+
+            await failed();
 
             return;
         }
@@ -2139,17 +2507,65 @@ type TeamApi = {
 };
 
 const TEAM_API = Symbol.for("pi-pocket-team.team");
-/** The bridges that run, by agent, shared by every load of this module: a new load stops the old one's first. */
+/** The bridges by agent, shared by every load of this module: a new load waits until the old one's has stopped. */
 const RUNNING = Symbol.for("pi-pocket-team.events-bridge.running");
+/** The hidden tokens by agent, shared by every load: a reload keeps them hidden, with no gap. */
+const HIDERS = Symbol.for("pi-pocket-team.events-bridge.hiders");
 
 const teamApi = (): TeamApi | undefined =>
     (globalThis as unknown as Record<symbol, TeamApi | undefined>)[TEAM_API];
 
-const running = (): Map<string, AgentBridge> => {
-    const shared = globalThis as unknown as Record<symbol, Map<string, AgentBridge> | undefined>;
+/** 1 agent's bridge in the shared map: running, or ending (`stopping`). */
+export type Slot = { bridge: AgentBridge; stopping?: Promise<void> };
+
+const running = (): Map<string, Slot> => {
+    const shared = globalThis as unknown as Record<symbol, Map<string, Slot> | undefined>;
 
     return (shared[RUNNING] ??= new Map());
 };
+
+const sharedHiders = (): Map<string, Hider> => {
+    const shared = globalThis as unknown as Record<symbol, Map<string, Hider> | undefined>;
+
+    return (shared[HIDERS] ??= new Map());
+};
+
+/**
+ * Stops `bridge` and keeps it in `slots` until its stop has ended, so a new bridge for the agent (a reload) waits for
+ * it: 2 bridges never write 1 store at once. Returns the stop.
+ */
+export function stopSlot(
+    slots: Map<string, Slot>,
+    agentId: string,
+    bridge: AgentBridge,
+): Promise<void> {
+    const current = slots.get(agentId);
+    const slot: Slot = current?.bridge === bridge ? current : { bridge };
+
+    slot.stopping ??= bridge.stop().finally(() => {
+        if (slots.get(agentId) === slot) {
+            slots.delete(agentId);
+        }
+    });
+
+    // A newer bridge of the agent keeps its place.
+    if (current === undefined || current === slot) {
+        slots.set(agentId, slot);
+    }
+
+    return slot.stopping;
+}
+
+/** Waits until no bridge of the agent runs: one that runs is stopped, one that ends is awaited. */
+export async function takeSlot(slots: Map<string, Slot>, agentId: string): Promise<void> {
+    for (let slot = slots.get(agentId); slot !== undefined; slot = slots.get(agentId)) {
+        await (slot.stopping ?? stopSlot(slots, agentId, slot.bridge)).catch(() => undefined);
+
+        if (slots.get(agentId) === slot) {
+            slots.delete(agentId);
+        }
+    }
+}
 
 /** The `mcp.json` entries whose URL is a lodge gateway (path `/gateway/mcp`), by name. */
 export async function gatewayEntries(file: string): Promise<Record<string, string>> {
@@ -2209,24 +2625,22 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
     const transportFor = options.transport ?? natsTransport;
     const ready =
         typeof host.inbox?.deliver === "function" && typeof host.sessions?.start === "function";
-    const hidden = new Set<string>();
-    const unhide: (() => void)[] = [];
     const mine = new Map<string, AgentBridge>();
     let disposed = false;
 
-    const hide = (value: string) => {
-        if (hidden.has(value) || typeof host.hide !== "function") {
-            return;
+    /** The agent's hidden tokens, shared by every load. A refusal of the host throws: the token is then not written. */
+    const hiderOf = (agentId: string): Hider => {
+        let hider = sharedHiders().get(agentId);
+
+        if (hider === undefined) {
+            hider = new Hider((value) => host.hide({ value, label: "events bridge token" }));
+            sharedHiders().set(agentId, hider);
         }
 
-        hidden.add(value);
-
-        try {
-            unhide.push(host.hide({ value, label: "events bridge token" }));
-        } catch {
-            // A value the host refuses to hide (too long): the file is still 0600.
-        }
+        return hider;
     };
+
+    const tokensOfAgent = (agentId: string) => new TokenFile(dir, agentId, hiderOf(agentId));
 
     const sessions: Sessions = {
         deliver: (target, delivery) =>
@@ -2324,7 +2738,7 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
         new LodgeClient({
             gateway,
             agent: agentId,
-            tokens: new TokenFile(dir, agentId, hide),
+            tokens: tokensOfAgent(agentId),
             ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
         });
 
@@ -2351,12 +2765,9 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
 
     const openBridge = async (agent: BridgeAgent, gateway: string) => {
         const shared = running();
-        const old = shared.get(agent.id);
 
-        if (old !== undefined) {
-            shared.delete(agent.id);
-            await old.stop();
-        }
+        // The bridge of an old load (a reload) or of this one: stopped, and its last write done, first.
+        await takeSlot(shared, agent.id);
 
         const bridge = new AgentBridge({
             agent,
@@ -2374,7 +2785,7 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
         }
 
         mine.set(agent.id, bridge);
-        shared.set(agent.id, bridge);
+        shared.set(agent.id, { bridge });
         bridge.start();
 
         return bridge;
@@ -2393,6 +2804,8 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
         } catch {
             return;
         }
+
+        await hideStored();
 
         for (const name of names) {
             const agentId = name.slice(0, -".events.json".length);
@@ -2413,16 +2826,39 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
 
                 if (bridge !== undefined) {
                     mine.delete(agentId);
-
-                    if (running().get(agentId) === bridge) {
-                        running().delete(agentId);
-                    }
-
-                    await bridge.stop();
+                    await stopSlot(running(), agentId, bridge);
                 }
             }
         }
     };
+
+    /** The tokens of every agent's file, hidden at load: no tool reads them, also before a bridge runs. */
+    const hideStored = async () => {
+        let files: string[] = [];
+
+        try {
+            files = (await readdir(dir)).filter(
+                (name) => name.endsWith(".json") && !name.endsWith(".events.json"),
+            );
+        } catch {
+            return;
+        }
+
+        for (const file of files) {
+            await tokensOfAgent(file.slice(0, -".json".length))
+                .load()
+                .catch((error: unknown) =>
+                    notice(
+                        "error",
+                        `Events bridge: the tokens of ${file} are not hidden: ${messageOf(error)}`,
+                    ),
+                );
+        }
+    };
+
+    if (ready) {
+        void hideStored();
+    }
 
     const first = setTimeout(() => void sweep(), 1_000);
     const every = setInterval(() => void sweep(), 10 * 60_000);
@@ -2435,19 +2871,12 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
         clearTimeout(first);
         clearInterval(every);
 
+        // Each stop stays in the shared map until it ends: the next load waits for it. The hidden tokens stay hidden.
         for (const [agentId, bridge] of mine) {
-            if (running().get(agentId) === bridge) {
-                running().delete(agentId);
-            }
-
-            void bridge.stop();
+            void stopSlot(running(), agentId, bridge).catch(() => undefined);
         }
 
         mine.clear();
-
-        for (const each of unhide) {
-            each();
-        }
     });
 
     if (typeof host.on === "function") {
@@ -2544,10 +2973,7 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
                 await bridge.resume(origin);
             };
 
-            if (
-                bridge.paused !== undefined ||
-                !(await new TokenFile(dir, agent.id, hide).signedIn())
-            ) {
+            if (bridge.paused !== undefined || !(await tokensOfAgent(agent.id).signedIn())) {
                 await signIn();
             }
 
@@ -2641,10 +3067,15 @@ export default function createEventsBridge(host: Host, web: Web, options: Module
                 }),
             ),
         }),
+        // A replay of the call gives the same events (they are kept by call): no event is lost in a crash.
+        replay: "safe",
         deferred: true,
         execute: async (args, api, context) => {
             const { bridge } = await gated(api, context);
-            const taken = await bridge.takePending(args.max ?? MESSAGE_LINES);
+            const taken = await bridge.takePending(
+                args.max ?? MESSAGE_LINES,
+                `${String(api.conversationId)}:${api.callId}`,
+            );
 
             if (taken.events.length === 0) {
                 return text("No events wait in your digest.");

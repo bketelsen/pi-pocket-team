@@ -22,16 +22,21 @@ import {
     digestTime,
     eventLine,
     gatewayEntries,
+    Hider,
     gatewayOf,
     type Lodge,
     type LodgeAnswer,
     type LodgeSub,
     nextDigestAt,
+    PAYLOAD_BUDGET,
     type Pulled,
     RETRIES,
     RETRY_MS,
     type Sessions,
+    type Slot,
     StateFile,
+    stopSlot,
+    takeSlot,
     thinEvent,
     TokenFile,
     type Transport,
@@ -145,6 +150,8 @@ class FakeSessions implements Sessions {
     readonly keys = new Set<string>();
     /** The next answers of `deliver`: an error to throw, or "crash" (it went, then the caller died). */
     readonly script: (Error | "crash")[] = [];
+    /** Holds `start` until the test opens it. */
+    gate: Promise<void> | undefined;
     #next = 100;
 
     async deliver(target: number, delivery: InboxDelivery): Promise<{ sent: boolean }> {
@@ -158,9 +165,10 @@ class FakeSessions implements Sessions {
             throw status(410);
         }
 
-        const sent = !this.keys.has(delivery.key);
+        // Pocket's key counts in 1 session (inbox.ts: submissionByRequest of the target).
+        const sent = !this.keys.has(`${String(target)}:${delivery.key}`);
 
-        this.keys.add(delivery.key);
+        this.keys.add(`${String(target)}:${delivery.key}`);
         this.delivered.push({ target, delivery, sent });
 
         if (step === "crash") {
@@ -175,6 +183,7 @@ class FakeSessions implements Sessions {
         request: { title: string; cwd: string },
         key: string,
     ): Promise<number> {
+        await this.gate;
         this.started.push({ source, request, key });
 
         const id = this.#next++;
@@ -275,6 +284,12 @@ type Rig = {
 };
 
 const ORIGIN = { by: "brian", source: 7 };
+
+const tokenState = (n: string) =>
+    ({
+        tokens: { access_token: `lgo_at_${n}`, refresh_token: `lgo_rt_${n}`, token_type: "Bearer" },
+        clientInformation: { client_id: "lgc_AAECAwQFBgcICQoLDA0ODw" },
+    }) as never;
 
 async function rig(options: { running?: boolean } = {}): Promise<Rig> {
     const dir = scratch();
@@ -421,32 +436,87 @@ describe("events bridge: pure parts", () => {
         assert.deepEqual(await gatewayEntries(join(dir, "none.json")), {});
     });
 
-    test("the token file is 0600, its tokens are hidden at load and save, and it is not the mcp module's oauth.json", async () => {
+    test("the token file is 0600, its tokens are hidden before the write and at load, and it is not the mcp module's oauth.json", async () => {
         const dir = scratch();
-        const hidden: string[] = [];
-        const tokens = new TokenFile(dir, "moneo", (value) => hidden.push(value));
+        const live = new Set<string>();
+        const hider = new Hider((value) => {
+            live.add(value);
+
+            return () => live.delete(value);
+        });
+        const tokens = new TokenFile(dir, "moneo", hider);
 
         assert.equal(tokens.path, join(dir, "moneo.json"));
         assert.equal(await tokens.signedIn(), false);
-        await tokens.save({
-            tokens: {
-                access_token: "lgo_at_secret",
-                refresh_token: "lgo_rt_secret",
-                token_type: "Bearer",
-            },
-            clientInformation: { client_id: "lgc_AAECAwQFBgcICQoLDA0ODw" },
-        } as never);
-        assert.deepEqual(hidden, ["lgo_at_secret", "lgo_rt_secret"]);
+        await tokens.save(tokenState("1"));
+        assert.deepEqual([...live].sort(), ["lgo_at_1", "lgo_rt_1"]);
         assert.equal(statSync(tokens.path).mode & 0o777, 0o600);
         assert.equal(await tokens.signedIn(), true);
         assert.equal(await tokens.clientId(), "lgc_AAECAwQFBgcICQoLDA0ODw");
-
-        // A new load of the module hides them again when it reads the file.
-        const later: string[] = [];
-
-        await new TokenFile(dir, "moneo", (value) => later.push(value)).load();
-        assert.deepEqual(later, ["lgo_at_secret", "lgo_rt_secret"]);
         assert.doesNotMatch(tokens.path, /oauth\.json$/);
+
+        // A new load of the module hides them when it reads the file, before any refresh.
+        const later = new Set<string>();
+
+        await new TokenFile(
+            dir,
+            "moneo",
+            new Hider((value) => {
+                later.add(value);
+
+                return () => later.delete(value);
+            }),
+        ).load();
+        assert.deepEqual([...later].sort(), ["lgo_at_1", "lgo_rt_1"]);
+    });
+
+    test("rotated tokens are released: 500 refreshes keep 2 values hidden, and a refused hide writes nothing", async () => {
+        const dir = scratch();
+        const live = new Set<string>();
+        let refuse = false;
+        const hider = new Hider((value) => {
+            if (refuse) {
+                throw new Error("host.hide: 2000 values are hidden already");
+            }
+
+            live.add(value);
+
+            return () => live.delete(value);
+        });
+        const tokens = new TokenFile(dir, "moneo", hider);
+
+        for (let n = 0; n < 500; n++) {
+            await tokens.save(tokenState(String(n)));
+        }
+
+        assert.deepEqual([...live].sort(), ["lgo_at_499", "lgo_rt_499"]);
+        assert.equal(hider.size, 2);
+
+        refuse = true;
+        await assert.rejects(tokens.save(tokenState("next")), /2000 values/);
+        assert.match(readFileSync(tokens.path, "utf8"), /lgo_at_499/);
+        assert.doesNotMatch(readFileSync(tokens.path, "utf8"), /lgo_at_next/);
+    });
+
+    test("a reload waits until the old bridge has stopped", async () => {
+        const slots = new Map<string, Slot>();
+        let release: () => void = () => undefined;
+        const stopped = new Promise<void>((resolve) => (release = resolve));
+        const old = { stop: () => stopped } as unknown as AgentBridge;
+        let took = false;
+
+        slots.set("moneo", { bridge: old });
+        // The old load's dispose: the stop starts, and its slot stays.
+        void stopSlot(slots, "moneo", old);
+
+        const taking = takeSlot(slots, "moneo").then(() => (took = true));
+
+        await until(() => slots.get("moneo")?.stopping !== undefined);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(took, false);
+        release();
+        await taking;
+        assert.equal(slots.has("moneo"), false);
     });
 });
 
@@ -688,7 +758,10 @@ describe("events bridge: the digest, own events, revokes and pauses", () => {
         );
         assert.equal(r.bridge.pendingCount(), 5);
 
-        const taken = await r.bridge.takePending(3);
+        const taken = await r.bridge.takePending(3, "9:call-1");
+
+        // A replay of the same call gets the same events, and takes no more.
+        assert.deepEqual(await r.bridge.takePending(3, "9:call-1"), taken);
 
         assert.equal(taken.events.length, 3);
         assert.equal(taken.more, 2);
@@ -901,6 +974,238 @@ describe("events bridge: the standing events session", () => {
         await again.tick();
         assert.equal(r.sessions.started.length, 1);
         assert.equal(r.sessions.sent().length, 1);
+    });
+});
+
+describe("events bridge: deliveries keep their events, their key and their session", () => {
+    test("a revoke while the events session is made: the batch does not go", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        // The standing session is gone, so the delivery makes a new one, and that start waits.
+        r.bridge.archived(r.bridge.state.session!.id, true);
+        await until(() => r.bridge.state.session?.gone === true);
+        await receive(r.bridge, sub.name, event());
+
+        let open: () => void = () => undefined;
+
+        r.sessions.gate = new Promise((resolve) => (open = resolve));
+        r.clock.now += BATCH_MS;
+
+        const ticking = r.bridge.tick();
+
+        await until(
+            () =>
+                r.bridge.state.batches[`b-${Object.keys(r.bridge.state.pending)[0] ?? ""}`]
+                    ?.state === "delivering",
+        );
+        await r.bridge.revoke("all", "lodge refused the token");
+        open();
+        await ticking;
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.deepEqual(r.bridge.state.pending, {});
+        assert.deepEqual(r.bridge.state.batches, {});
+    });
+
+    test("a message holds only the lines that fit Pocket's 8,000 characters; the rest wait in the digest", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const long = {
+            subject: "s".repeat(200),
+            selector: `/${"p".repeat(299)}`,
+            source: "x".repeat(200),
+        };
+
+        for (let n = 0; n < 30; n++) {
+            await receive(r.bridge, sub.name, event(long));
+        }
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+
+        const lines = sent[0]!.delivery.payload.split("\n").length - 1;
+
+        assert.ok(sent[0]!.delivery.payload.length <= PAYLOAD_BUDGET + 200);
+        assert.ok(lines > 0 && lines < 30, String(lines));
+        // Each event: delivered in the message, or waiting in the digest.
+        assert.equal(r.bridge.pendingCount(), 30 - lines);
+    });
+
+    test("an event that comes while a batch starts its delivery is never lost", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = event();
+
+        await receive(r.bridge, sub.name, first);
+        r.clock.now += BATCH_MS;
+
+        // The delivery and a receive at once: the receive's write can land before or after the batch is fixed.
+        const late = event();
+
+        await Promise.all([r.bridge.tick(), receive(r.bridge, sub.name, late)]);
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+
+        const shown = r.sessions
+            .sent()
+            .map((each) => each.delivery.payload)
+            .join("\n");
+
+        for (const each of [first, late]) {
+            assert.ok(
+                shown.includes(`id=${each.id}`) || each.id in r.bridge.state.pending,
+                each.id,
+            );
+        }
+
+        assert.deepEqual(r.bridge.state.pending, {});
+    });
+
+    test("a digest that went before a crash is not sent again on another day, and keeps its events", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        for (let n = 0; n < 3; n++) {
+            await receive(r.bridge, sub.name, event());
+        }
+
+        r.sessions.script.push("crash");
+        r.clock.now = digestTime("2026-11-17");
+        await r.bridge.tick();
+        assert.equal(r.sessions.sent().length, 1);
+        assert.equal(r.bridge.state.digest.attempt?.inflight, true);
+
+        // events_pending meanwhile takes nothing of the message on its way.
+        assert.equal((await r.bridge.takePending(10, "9:call-2")).events.length, 0);
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.stop();
+
+        // The restart is on the next day: the same message, with its key of the 17th, sends nothing again.
+        const again = await r.restart();
+
+        r.clock.now = digestTime("2026-11-18");
+        await again.tick();
+        await again.tick();
+
+        const keys = r.sessions.delivered.map((each) => each.delivery.key);
+
+        assert.deepEqual(keys.slice(0, 2), [
+            "eb-moneo-digest-2026-11-17",
+            "eb-moneo-digest-2026-11-17",
+        ]);
+        assert.equal(r.sessions.sent().length, 2);
+        assert.equal(r.sessions.sent()[1]!.delivery.key, "eb-moneo-digest-2026-11-18");
+        assert.equal(again.pendingCount(), 0);
+    });
+
+    test("a try cut off before its answer goes again to the same session, even when the standing session moved", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.sessions.script.push("crash");
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        await r.bridge.stop();
+        // The session moves out of the agent's home before the restart.
+        r.sessions.folders.set(first, "/elsewhere");
+
+        const again = await r.restart();
+
+        r.clock.now += RETRY_MS[0];
+        await again.tick();
+        assert.equal(r.sessions.sent().length, 1);
+        assert.deepEqual(
+            r.sessions.delivered.map((each) => each.target),
+            [first, first],
+        );
+
+        // And when that session is gone: the batch counts as delivered, and no new session gets it.
+        const sub2 = sub.name;
+
+        await receive(again, sub2, event());
+        r.sessions.script.push("crash");
+        r.clock.now += BATCH_MS;
+        await again.tick();
+
+        const target = r.sessions.delivered.at(-1)!.target;
+
+        r.sessions.folders.delete(target);
+        r.clock.now += RETRY_MS[0];
+        await again.tick();
+        assert.equal(r.sessions.sent().length, 2);
+        assert.deepEqual(again.state.batches, {});
+        assert.deepEqual(again.state.pending, {});
+    });
+
+    test("a batch keeps its place in the hour across a restart: no 7th wake", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        for (let wake = 0; wake < WAKES_PER_HOUR - 1; wake++) {
+            await receive(r.bridge, sub.name, event());
+            r.clock.now += BATCH_MS;
+            await r.bridge.tick();
+        }
+
+        // The 6th batch gets 409 twice: it waits for its retry, and holds its place in the hour.
+        await receive(r.bridge, sub.name, event());
+        r.sessions.script.push(status(409), status(409));
+        r.clock.now += BATCH_MS;
+
+        const sixth = r.clock.now;
+
+        await r.bridge.tick();
+        // A 7th batch opens; then a restart (Pocket's own count is in memory, and starts empty).
+        await receive(r.bridge, sub.name, event());
+        r.clock.now = sixth + RETRY_MS[0];
+        await r.bridge.tick();
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        // The 7th closes while the 6th still waits: the hour is full.
+        r.clock.now = sixth + BATCH_MS;
+        await again.tick();
+        r.clock.now = sixth + RETRY_MS[0] + RETRY_MS[1];
+        await again.tick();
+        assert.equal(r.sessions.sent().length, WAKES_PER_HOUR);
+        assert.equal(again.pendingCount(), 1);
+    });
+
+    test("a pause notice that fails waits longer each time", async () => {
+        const r = await rig();
+
+        await subscribe(r);
+        await r.bridge.pause("lodge refused the refresh");
+
+        for (let n = 0; n < 4; n++) {
+            r.sessions.script.push(status(409));
+        }
+
+        const tries = () => r.sessions.delivered.length + (4 - r.sessions.script.length);
+
+        await r.bridge.tick();
+        assert.equal(tries(), 1);
+        // Due again only after its wait: 30 s, then 60 s.
+        await r.bridge.tick();
+        assert.equal(tries(), 1);
+        r.clock.now += 30_000;
+        await r.bridge.tick();
+        assert.equal(tries(), 2);
+        r.clock.now += 59_000;
+        await r.bridge.tick();
+        assert.equal(tries(), 2);
+        r.clock.now += 1_000;
+        await r.bridge.tick();
+        assert.equal(tries(), 3);
+        assert.equal(r.bridge.state.paused?.tries, 3);
     });
 });
 

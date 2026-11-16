@@ -24,7 +24,7 @@ The first subscription shows a card. Open its lodge link, check that the princip
 ## What to expect
 
 - An event carries no content: the agent reads the object through its gateway tools.
-- A busy session, or the hourly cap, moves a batch to the digest; nothing is lost.
+- A busy session is tried again, 5 times at most; the hourly cap, or a session that stays busy, moves a batch to the digest. Nothing is lost.
 - The agent's own events are dropped. If lodge revokes the client, the events that wait are deleted.
 - A restart neither loses nor repeats a wake.
 

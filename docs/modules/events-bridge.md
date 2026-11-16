@@ -29,12 +29,13 @@ The first `events_subscribe` shows Brian a card:
 2. On lodge's consent page, the principal must be the agent's id, with the scope `events`. Approve it.
 3. The browser then goes to `http://127.0.0.1:8792/events-bridge/callback?...`, which does not load. Copy the whole address from the address bar into the card's field.
 
-The tokens go to `~/.config/pi-pocket-team/events-bridge/<agent>.json` (0600), and each token is hidden from tools. The bridge never uses the `mcp` module's `oauth.json`. A refresh that fails pauses the agent's subscriptions, and the events session gets 1 notice. The next `events_subscribe` signs in again and ends the pause.
+The tokens go to `~/.config/pi-pocket-team/events-bridge/<agent>.json` (0600). Each token is hidden from tools (`host.hide`) before the write that stores it, and every token file is read and hidden when the module loads. A rotated token is released after the write that replaces it, so each agent holds 2 hidden values. When Pocket refuses to hide a token, nothing is written. The hidden values stay across a reload. The bridge never uses the `mcp` module's `oauth.json`. A refresh that fails pauses the agent's subscriptions, and the events session gets 1 notice; a notice that does not go is tried again after 30 s, doubled each time, 1 hour at most. The next `events_subscribe` signs in again and ends the pause.
 
 ## Wakes
 
-- **now:** events are batched for 60 s from the first one. A batch is 1 message to the events session, through `host.inbox.deliver`, at most 6 an hour for each subscription. Past the cap, or on a `429`, the batch goes to the digest. A `409` (the session does not take messages now) is tried again with the same key after 30 s, 1, 2, 4 and 8 minutes: 5 times at most, then the digest. A `410` (the session is gone) makes a new events session and tries again at once.
-- **digest:** 1 message a day at 08:00 America/New_York with the oldest 40 events. The rest wait for `events_pending` or the next day. The digest keeps 1,000 events; past it, the oldest go, and the next message counts them.
+- **now:** events are batched for 60 s from the first one. A batch is 1 message to the events session, through `host.inbox.deliver`, at most 6 an hour for each subscription. When its delivery starts, the store fixes its events (at most 40, and only the lines that fit in 7,000 characters, because Pocket cuts a payload at 8,000; the rest go to the digest) and its place in the hour, so a restart keeps both. Past the cap, or on a `429`, the batch goes to the digest and gives its place back. A `409` (the session does not take messages now) is tried again with the same key after 30 s, 1, 2, 4 and 8 minutes: 5 times at most, then the digest. A `410` (the session is gone) makes a new events session and tries again at once.
+- **digest:** 1 message a day at 08:00 America/New_York with the oldest events that fit (40 at most). The store fixes that message's day (its key) and events before the first try; a retry, a restart or a later day sends that same message. The rest wait for `events_pending` or the next day. The digest keeps 1,000 events; past it, the oldest go (never those of the message on its way), and the next message counts them.
+- Each write checks the store again: a revoke or an unsubscribe while the bridge waits (for example for a new session) deletes the batch, and nothing goes.
 - Each message lists 1 event per line: time, type, subject, selector, author and id. An event carries no content: the agent reads the object through its gateway tools. Pocket fences the lines as outside data. The type `org.frostyard.lodge.resync` means that events were lost.
 - The prompt section of the agent's sessions counts the events in the digest.
 
@@ -49,7 +50,7 @@ The bridge makes 1 standing session per agent, `<Agent> events`, in the agent's 
 - `<agent>.json`: the OAuth client and tokens (pi-mcp's format).
 - `<agent>.events.json`: the subscriptions, the events not yet delivered (batched or in the digest), the ids of events seen in the last 8 days, the wakes of the last hour, the events session, the pause, and the digest's last day.
 
-An event is in the store before its JetStream ack. A delivery's key is stable (`eb-<agent>-b-<first event id>` for a batch, `eb-<agent>-digest-<day>` for a digest), and Pocket delivers a key once, so a crash before or after a delivery gives 1 delivery. An event that comes again (a lost ack) is acked and dropped.
+An event is in the store before its JetStream ack. A delivery's key is stable (`eb-<agent>-b-<first event id>` for a batch, `eb-<agent>-digest-<day>` for a digest), and Pocket delivers a key once in 1 session. The store marks a try before it starts: a try that ends with no answer (a crash) is tried again in the same session, so Pocket sends nothing twice; when that session is gone, the events count as delivered, with a notice. So a crash before or after a delivery gives 1 delivery. An event that comes again (a lost ack) is acked and dropped. `events_pending` keeps its answer by tool call for a day, and the tool is replay-safe: a replay after a crash gets the same events.
 
 ## Drops and revokes
 
@@ -66,4 +67,4 @@ The bridge connects with NATS over WebSocket at `wss://<lodge>/nats`, with the a
 
 ## Reloads and turning it off
 
-A reload stops the old bridges and starts new ones from the stores. At load, and each 10 minutes, each agent with a store runs while its profile still names a gateway; one that lost it stops (its store stays). With the module off, nothing pulls: lodge's consumers keep the events (7 days), and the bridge takes them when it is on again.
+A reload stops the old bridges and starts new ones from the stores; a new bridge waits until the old one's stop has ended, so 2 bridges never write 1 store. At load, and each 10 minutes, each agent with a store runs while its profile still names a gateway; one that lost it stops (its store stays). With the module off, nothing pulls: lodge's consumers keep the events (7 days), and the bridge takes them when it is on again.
