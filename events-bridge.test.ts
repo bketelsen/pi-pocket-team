@@ -2530,6 +2530,102 @@ describe("events bridge: a hold during the events_pending write", () => {
         assert.equal(r.bridge.state.pending[e.id], undefined);
     });
 
+    test("revokes during the answer's write and during its trimming write: the answer gives none of their events", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks", "digest");
+        const b = await subscribe(r, "notes", "digest");
+        const ea = event();
+        const eb = event();
+
+        await receive(r.bridge, a.name, ea);
+        await receive(r.bridge, b.name, eb);
+
+        const opens: (() => void)[] = [];
+
+        const arm = () => {
+            r.file.gate = new Promise((resolve) => opens.push(resolve));
+        };
+
+        arm();
+
+        const taking = r.bridge.takePending(10, "9:call-two-revokes");
+
+        // 1: the answer's own write waits; A is revoked meanwhile.
+        await until(() => r.file.holding === 1);
+
+        const revokingA = r.bridge.revoke([a.name], "the consumer of A is gone");
+
+        arm();
+        opens[0]!();
+        // 2: the revoke of A writes.
+        await until(() => r.file.holding === 2);
+        arm();
+        opens[1]!();
+        // 3: the answer's trimming write waits; B is revoked meanwhile.
+        await until(() => r.file.holding === 3);
+
+        const revokingB = r.bridge.revoke([b.name], "the consumer of B is gone");
+
+        r.file.gate = undefined;
+        opens[2]!();
+
+        const taken = await taking;
+
+        await revokingA;
+        await revokingB;
+
+        assert.deepEqual(taken.events, []);
+        assert.deepEqual(r.bridge.state.taken?.["9:call-two-revokes"]?.events ?? [], []);
+        assert.equal(r.bridge.state.pending[ea.id], undefined);
+        assert.equal(r.bridge.state.pending[eb.id], undefined);
+    });
+
+    test("a hold during the answer's trimming write: the answer gives nothing, and the kept events come back", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks", "digest");
+        const b = await subscribe(r, "notes", "digest");
+        const ea = event();
+        const eb = event();
+
+        await receive(r.bridge, a.name, ea);
+        await receive(r.bridge, b.name, eb);
+
+        const opens: (() => void)[] = [];
+
+        const arm = () => {
+            r.file.gate = new Promise((resolve) => opens.push(resolve));
+        };
+
+        arm();
+
+        const taking = r.bridge.takePending(10, "9:call-trim-hold");
+
+        await until(() => r.file.holding === 1);
+
+        const revokingA = r.bridge.revoke([a.name], "the consumer of A is gone");
+
+        arm();
+        opens[0]!();
+        await until(() => r.file.holding === 2);
+        arm();
+        opens[1]!();
+        // The trimming write waits; Team changes the events session's identity meanwhile.
+        await until(() => r.file.holding === 3);
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        r.file.gate = undefined;
+        opens[2]!();
+
+        const taken = await taking;
+
+        await revokingA;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        assert.equal(r.bridge.state.taken?.["9:call-trim-hold"], undefined);
+        assert.equal(r.bridge.state.pending[ea.id], undefined);
+        assert.equal(r.bridge.state.pending[eb.id]?.sub, b.name);
+    });
+
     test("an unsubscribe during a held answer's write: none of its events come back", async () => {
         const r = await rig();
         const kept = await subscribe(r, "marks", "digest");

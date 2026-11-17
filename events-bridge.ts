@@ -2126,45 +2126,51 @@ export class AgentBridge {
             return { taken, fresh: true };
         });
 
-        // A hold that came during the answer's own write takes its events back: none was given, and the call is kept
-        // for no replay. A revoke that ran meanwhile keeps its deletion. An answer with no event of its own takes
-        // nothing back: it holds nothing.
-        const gave = result.taken.events.length > 0 || result.taken.dropped > 0;
-        const answer = result.taken;
+        // The hand-off of a fresh answer that gave something: each pass checks the holds and the revokes after the
+        // last write, and the answer goes only from a pass with no write after its checks. A hold takes the events back
+        // (none was given, and the call is kept for no replay; a revoke's deletion stays). A revoke or an unsubscribe
+        // takes its events out of the answer and its stored copy, and the next pass checks again. An answer with no
+        // event of its own takes nothing back: it holds nothing.
+        let answer = result.taken;
 
-        if (!result.fresh || !gave) {
+        if (!result.fresh || (answer.events.length === 0 && answer.dropped === 0)) {
             return answer;
         }
 
-        if (this.#held()) {
-            await this.#change((state) => {
-                for (const each of answer.events) {
-                    const id = each.event.id;
+        for (;;) {
+            if (this.#held()) {
+                const back = answer;
 
-                    if (!revoked(each.sub) && state.pending[id] === undefined) {
-                        state.pending[id] = structuredClone(each);
-                        delete state.seen[id];
+                await this.#change((state) => {
+                    for (const each of back.events) {
+                        const id = each.event.id;
+
+                        if (!revoked(each.sub) && state.pending[id] === undefined) {
+                            state.pending[id] = structuredClone(each);
+                            delete state.seen[id];
+                        }
                     }
-                }
 
-                // This call set the count to 0: the answer reported what it had.
-                if (answer.dropped > 0) {
-                    state.digest.dropped = answer.dropped;
-                }
+                    // This call set the count to 0: the answer reported what it had.
+                    if (back.dropped > 0) {
+                        state.digest.dropped = back.dropped;
+                    }
 
-                if (state.taken !== undefined) {
-                    delete state.taken[call];
-                }
-            });
+                    if (state.taken !== undefined) {
+                        delete state.taken[call];
+                    }
+                });
 
-            return this.#heldAnswer(this.#state!, this.#heldReason());
-        }
+                return this.#heldAnswer(this.#state!, this.#heldReason());
+            }
 
-        // A revoke or an unsubscribe that came during the write: its events stay deleted, and the answer gives none of
-        // them (its stored copy for a replay neither).
-        const kept = answer.events.filter((each) => !revoked(each.sub));
+            const kept = answer.events.filter((each) => !revoked(each.sub));
 
-        if (kept.length < answer.events.length) {
+            // No write since the checks above: the answer goes now.
+            if (kept.length === answer.events.length) {
+                return answer;
+            }
+
             const trimmed: Taken = { ...answer, events: kept };
 
             await this.#change((state) => {
@@ -2173,10 +2179,8 @@ export class AgentBridge {
                 }
             });
 
-            return trimmed;
+            answer = trimmed;
         }
-
-        return answer;
     }
 
     /** Why the bridge holds the events now, in the words events_pending gives. */
