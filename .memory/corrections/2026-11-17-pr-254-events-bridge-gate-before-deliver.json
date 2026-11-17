@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-17",
+  "scope": "events-bridge.ts",
+  "correction": "the events bridge checked its holds and the session's identity before the store writes of a try, not right before the delivery, so an identity change or a pause during those writes still let the batch, the digest or the pause notice go; each delivery now checks the gates again right before it calls Pocket, and a hold after the try's mark puts the batch or the digest message back with no try counted; the check right before the delivery also covers a revoke or an unsubscribe of the events' subscriptions and a session whose folder moved out of the agent's home",
+  "evidence": "bketelsen/pi-pocket-team#254: cross-review (openai/gpt-6.1-sol) of 68044e837faa1f54c3fc54aaa05debdff89c763f, finding 1 (high, blocking); re-review 4 at d997454ac8329e49c2282cf7d0da15ae7f1abfe8, findings 1 and 2 (high, blocking)",
+  "promoted_to": "events-bridge.test.ts: a batch whose try's write is still in flight does not go when Team changes the identity; a digest whose try's write is still in flight does not go when Team changes the identity; a pause during a new session's start: the batch does not go; a revoke during a batch try's write: no revoked event reaches Pocket; a revoke of 1 subscription during a digest try's write: its events never go, the other's go; a session moved to another agent's home during a batch try's write takes no wake; the same during a digest try's write; a new session moved to another agent's home before the pause notice: no notice goes there"
+}

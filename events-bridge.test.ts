@@ -98,6 +98,12 @@ class FakeLodge implements Lodge {
     });
     readonly subs = new Map<string, LodgeSub>();
     puts = 0;
+    /** Holds `put` until the test opens it. */
+    putGate: Promise<void> | undefined;
+    /** The `put` calls that wait on `putGate` now. */
+    putting = 0;
+    /** An answer to give instead of the real one, when set (after `putGate`). */
+    putAnswer: (() => LodgeAnswer<LodgeSub>) | undefined;
 
     async token(): Promise<string> {
         if (this.tokenError !== undefined) {
@@ -113,6 +119,19 @@ class FakeLodge implements Lodge {
 
     async put(name: string, topic: string): Promise<LodgeAnswer<LodgeSub>> {
         this.puts++;
+        this.putting++;
+
+        try {
+            await this.putGate;
+        } finally {
+            this.putting--;
+        }
+
+        const answer = this.putAnswer?.();
+
+        if (answer !== undefined) {
+            return answer;
+        }
 
         const sub: LodgeSub = {
             name,
@@ -159,6 +178,8 @@ class FakeSessions implements Sessions {
         [];
     readonly folders = new Map<number, string>();
     readonly keys = new Set<string>();
+    /** The sessions made, by start key: a start with a key seen before gives that session back, as Pocket does. */
+    readonly byKey = new Map<string, number>();
     /** The next answers of `deliver`: an error to throw, or "crash" (it went, then the caller died). */
     readonly script: (Error | "crash")[] = [];
     /** Holds `start` until the test opens it. */
@@ -195,10 +216,19 @@ class FakeSessions implements Sessions {
         key: string,
     ): Promise<number> {
         await this.gate;
+
+        // Pocket's key counts for a session start: a start with the same key gives the session it made before.
+        const known = this.byKey.get(key);
+
+        if (known !== undefined) {
+            return known;
+        }
+
         this.started.push({ source, request, key });
 
         const id = this.#next++;
 
+        this.byKey.set(key, id);
         this.folders.set(id, request.cwd);
 
         return id;
@@ -289,11 +319,19 @@ class FakeConnection implements BrokerConnection {
 class GatedFile extends StateFile {
     gate: Promise<void> | undefined;
     holding = 0;
+    /** Saves that pass the gate before it holds one. */
+    pass = 0;
 
     override async save(state: AgentState): Promise<void> {
         if (this.gate !== undefined) {
-            this.holding++;
-            await this.gate;
+            if (this.pass > 0) {
+                this.pass--;
+            } else {
+                const gate = this.gate;
+
+                this.holding++;
+                await gate;
+            }
         }
 
         return super.save(state);
@@ -325,7 +363,7 @@ const tokenState = (n: string) =>
         clientInformation: { client_id: "lgc_AAECAwQFBgcICQoLDA0ODw" },
     }) as never;
 
-async function rig(options: { running?: boolean } = {}): Promise<Rig> {
+async function rig(options: { running?: boolean; check?: boolean } = {}): Promise<Rig> {
     const dir = scratch();
     const lodge = new FakeLodge();
     const sessions = new FakeSessions();
@@ -372,6 +410,15 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
 
         await bridge.open(GATEWAY);
 
+        // The gates of a bridge that starts now: lodge has confirmed the client in this process (a test that needs a
+        // bridge with no check yet passes `check: false`).
+        if (options.check !== false) {
+            await bridge.checkLodge();
+        }
+
+        // The check's own tick settles before the test goes on.
+        await bridge.tick();
+
         return bridge;
     };
 
@@ -397,6 +444,18 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
 /** The bridge stays idle: subscribe with the pulls stopped. */
 async function subscribe(r: Rig, topic = "marks.bookmark", mode: "now" | "digest" = "now") {
     return (await r.bridge.subscribe(topic, mode, ORIGIN)).sub;
+}
+
+/**
+ * The identity check that a bridge which just restarted needs: its recorded events session takes no wake until this
+ * process verified who it is. A restart forgets the check (it is never in the store).
+ */
+async function verify(bridge: AgentBridge, agent = "moneo"): Promise<void> {
+    const check = bridge.identityToCheck();
+
+    assert.notEqual(check, undefined, "the recorded session waits for its identity check");
+    await bridge.identity(check!.session, agent, check!.epoch);
+    await bridge.tick();
 }
 
 const receive = (bridge: AgentBridge, sub: string, value: unknown, acks: string[] = []) =>
@@ -752,6 +811,9 @@ describe("events bridge: restarts give 1 delivery", () => {
 
         const again = await r.restart();
 
+        // A restart forgets the session's identity check: it comes before the delivery.
+        await verify(again);
+
         r.clock.now += BATCH_MS;
         await again.tick();
         await again.tick();
@@ -779,6 +841,8 @@ describe("events bridge: restarts give 1 delivery", () => {
         await r.bridge.stop();
 
         const again = await r.restart();
+
+        await verify(again);
 
         r.clock.now += RETRY_MS[0];
         await again.tick();
@@ -1026,9 +1090,14 @@ describe("events bridge: the standing events session", () => {
 
         const fourth = r.bridge.state.session!.id;
 
-        r.bridge.identity(fourth, "moneo");
+        // Team changed an identity: the session is unchecked until a check says whose it is.
+        r.bridge.identityChanged(fourth);
+
+        const check = r.bridge.identityToCheck()!;
+
+        assert.equal(check.session, fourth);
         assert.equal(r.bridge.state.session?.gone, undefined);
-        r.bridge.identity(fourth, undefined);
+        await r.bridge.identity(fourth, undefined, check.epoch);
         await until(() => r.bridge.state.session?.gone === true);
 
         // Brian's chat never got a wake.
@@ -1046,11 +1115,363 @@ describe("events bridge: the standing events session", () => {
 
         const again = await r.restart();
 
+        await verify(again);
+
         await receive(again, sub.name, event());
         r.clock.now += BATCH_MS;
         await again.tick();
         assert.equal(r.sessions.started.length, 1);
         assert.equal(r.sessions.sent().length, 1);
+    });
+});
+
+describe("events bridge: the identity of the events session", () => {
+    test("Team says the session is another agent: it takes no wake, and the batch goes to a new session", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        // Team changed an identity: the session is unchecked, and it is still in Moneo's home.
+        r.bridge.identityChanged(first);
+
+        const check = r.bridge.identityToCheck()!;
+
+        assert.equal(check.session, first);
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+
+        // Now Team's answer: the session's identity is Duncan's, so it is gone, and the batch goes by itself.
+        await r.bridge.identity(first, "duncan", check.epoch);
+        await until(() => r.bridge.state.session?.gone === true);
+        await until(() => r.sessions.sent().length === 1);
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.notEqual(sent[0]!.target, first);
+        assert.equal(sent[0]!.target, r.bridge.state.session!.id);
+        assert.equal(r.sessions.started.length, 2);
+    });
+
+    test("after a restart, a recorded session that no one checked takes no wake: the batch waits for its check", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        r.clock.now += BATCH_MS;
+        await again.tick();
+
+        // No delivery, and no new session: the batch keeps its state and counts no try.
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(r.sessions.started.length, 1);
+        assert.equal(Object.values(again.state.batches)[0]?.tries, 0);
+        assert.equal(Object.values(again.state.batches)[0]?.state, "open");
+        assert.equal(Object.keys(again.state.pending).length, 1);
+
+        await verify(again);
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+        assert.equal(r.sessions.started.length, 1);
+        assert.deepEqual(again.state.pending, {});
+    });
+
+    test("an identity change clears the check: no delivery until a new one, and the old check's answer is ignored", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.bridge.identityChanged(first);
+
+        // A check that started before the next change answers for the old epoch: its answer proves nothing now.
+        const stale = r.bridge.identityToCheck()!;
+
+        assert.equal(stale.session, first);
+        r.bridge.identityChanged(first);
+        await r.bridge.identity(stale.session, "moneo", stale.epoch);
+        assert.deepEqual(r.bridge.identityToCheck(), {
+            session: first,
+            epoch: stale.epoch + 1,
+        });
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(Object.values(r.bridge.state.batches)[0]?.tries, 0);
+
+        const fresh = r.bridge.identityToCheck()!;
+
+        await r.bridge.identity(fresh.session, "moneo", fresh.epoch);
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+    });
+
+    test("the pause notice waits for an unchecked events session", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        await again.pause("lodge refused the refresh");
+        await again.tick();
+
+        // The notice goes to the events session: an unchecked one holds it.
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(again.state.paused?.sent, undefined);
+
+        await verify(again);
+        await again.tick();
+
+        const notices = r.sessions.sent().filter((each) => each.delivery.key.includes("paused"));
+
+        assert.equal(notices.length, 1);
+        assert.equal(notices[0]!.target, first);
+        assert.equal(again.state.paused?.sent, true);
+    });
+});
+
+describe("events bridge: lodge confirms the client before any event goes", () => {
+    test("a refused refresh pauses the bridge: the stored batch and digest wait, and events_pending gives none", async () => {
+        const r = await rig();
+        const nowSub = await subscribe(r, "marks.bookmark", "now");
+        const digestSub = await subscribe(r, "marks.folder", "digest");
+
+        await receive(r.bridge, nowSub.name, event());
+        await receive(r.bridge, digestSub.name, event());
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        await verify(again);
+
+        // lodge revokes the client while the bridge is down: only a refused refresh tells it, and that is a pause.
+        r.lodge.tokenError = new AuthRequired("lodge refused the refresh");
+        assert.equal(await again.checkLodge(), false);
+        assert.equal(again.paused, "lodge refused the refresh");
+        assert.equal(again.state.paused?.sent, undefined);
+
+        // The batch's time, and then 08:00 the next morning: only the pause notice goes.
+        r.clock.now = T0 + BATCH_MS;
+        await again.tick();
+        r.clock.now = digestTime("2026-11-17");
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.match(sent[0]!.delivery.key, /-paused-/);
+        assert.equal(Object.keys(again.state.pending).length, 2);
+        assert.equal(Object.keys(again.state.batches).length, 1);
+
+        // events_pending gives no event, keeps no answer for the call, and takes none.
+        const taken = await again.takePending(10, "9:call-held");
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.more, 1);
+        assert.equal(taken.held, "paused: lodge refused the refresh");
+        assert.match(
+            pendingAnswer(taken, (line) => line),
+            /The events bridge holds your events now \(paused: lodge refused the refresh\): none were given\./,
+        );
+        assert.equal(again.state.taken?.["9:call-held"], undefined);
+        assert.equal(Object.keys(again.state.pending).length, 2);
+        await again.stop();
+    });
+
+    test("a pause while the bridge runs: batches and the digest wait, and events_pending gives none", async () => {
+        const r = await rig();
+        const nowSub = await subscribe(r, "marks.bookmark", "now");
+        const digestSub = await subscribe(r, "marks.folder", "digest");
+
+        await receive(r.bridge, nowSub.name, event());
+        await receive(r.bridge, digestSub.name, event());
+
+        await r.bridge.pause("lodge refused the refresh");
+
+        r.clock.now = digestTime("2026-11-17");
+        await r.bridge.tick();
+
+        assert.equal(r.bridge.paused, "lodge refused the refresh");
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.match(sent[0]!.delivery.key, /-paused-/);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 2);
+        assert.equal(r.bridge.pendingCount(), 1);
+
+        const taken = await r.bridge.takePending(10, "9:call-paused");
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.more, 1);
+        assert.equal(taken.held, "paused: lodge refused the refresh");
+        assert.equal(r.bridge.state.taken?.["9:call-paused"], undefined);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 2);
+    });
+
+    test("a restarted bridge delivers nothing before lodge has confirmed the client", async () => {
+        const r = await rig({ check: false });
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        // The session's check is done; lodge's answer is still missing.
+        await again.identity(first, "moneo", again.identityToCheck()!.epoch);
+        r.clock.now += BATCH_MS;
+        await again.tick();
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(Object.values(again.state.batches)[0]?.tries, 0);
+        assert.equal(Object.keys(again.state.pending).length, 1);
+
+        assert.equal(await again.checkLodge(), true);
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+    });
+
+    test("checkLodge subscribes again a subscription that lodge does not list, and its events never go", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+
+        // lodge lost the subscription (a failed closed, or a revoke) in a way the bridge has not seen yet.
+        r.lodge.subs.delete(sub.name);
+        assert.equal(await r.bridge.checkLodge(), true);
+
+        assert.deepEqual(r.bridge.state.pending, {});
+        assert.deepEqual(r.bridge.state.batches, {});
+        assert.notEqual(r.bridge.state.subs[sub.name]?.consumer, sub.consumer);
+        assert.equal(r.lodge.puts, 2);
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+    });
+
+    test("events_pending holds the digest while lodge has not confirmed the subscriptions", async () => {
+        const r = await rig({ check: false });
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+
+        // lodge cannot answer yet: nothing is confirmed, so no event goes, and the answer is kept for no call.
+        r.lodge.listAnswer = () => ({ ok: false, status: 503, message: "lodge is busy" });
+
+        const held = await r.bridge.takePending(10, "9:call-unconfirmed");
+
+        assert.deepEqual(held.events, []);
+        assert.equal(held.more, 1);
+        assert.equal(held.held, "lodge has not confirmed the subscriptions yet");
+        assert.equal(r.bridge.state.taken?.["9:call-unconfirmed"], undefined);
+        assert.equal(r.bridge.pendingCount(), 1);
+
+        // lodge answers, and confirms the subscription: the event comes.
+        r.lodge.listAnswer = () => ({ ok: true, value: [...r.lodge.subs.values()] });
+        assert.equal(await r.bridge.checkLodge(), true);
+
+        const taken = await r.bridge.takePending(10, "9:call-confirmed");
+
+        assert.equal(taken.events.length, 1);
+        assert.equal(taken.held, undefined);
+        assert.equal(r.bridge.pendingCount(), 0);
+    });
+
+    test("after a sign-in the bridge delivers only once lodge has confirmed the client again", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.pause("lodge refused the refresh");
+        await r.bridge.resume(ORIGIN);
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 1);
+
+        assert.equal(await r.bridge.checkLodge(), true);
+        await r.bridge.tick();
+
+        assert.equal(r.sessions.sent().length, 1);
+        assert.deepEqual(r.bridge.state.pending, {});
+    });
+
+    test("a lodge check that started before a pause and a sign-in confirms nothing: a new check must come", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const again = await r.restart();
+
+        await verify(again);
+        await receive(again, sub.name, event());
+
+        // The check waits on lodge's answer; meanwhile the bridge pauses and Brian signs it in again.
+        let open: () => void = () => undefined;
+
+        r.lodge.listGate = new Promise((resolve) => (open = resolve));
+
+        const listing = r.lodge.listing;
+        const old = again.checkLodge();
+
+        await until(() => r.lodge.listing === listing + 1);
+        await again.pause("lodge refused the refresh");
+        await again.resume(ORIGIN);
+        open();
+        r.lodge.listGate = undefined;
+
+        assert.equal(await old, false);
+        r.clock.now += BATCH_MS;
+        await again.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+
+        // A check after the sign-in confirms the client: now the batch goes.
+        assert.equal(await again.checkLodge(), true);
+        await again.tick();
+        assert.equal(r.sessions.sent().length, 1);
+    });
+
+    test("a subscription made while the recorded events session waits for its check stands, and its wakes wait", async () => {
+        const r = await rig();
+
+        await subscribe(r);
+
+        const first = r.bridge.state.session!.id;
+        const again = await r.restart();
+
+        // After the restart, nobody checked the recorded session yet: the subscription still goes through.
+        const made = await again.subscribe("marks.folder", "now", ORIGIN);
+
+        assert.equal(made.session, first);
+        assert.equal(r.sessions.started.length, 1);
+        assert.notEqual(again.identityToCheck(), undefined);
     });
 });
 
@@ -1173,6 +1594,8 @@ describe("events bridge: deliveries keep their events, their key and their sessi
 
         // The restart is on the next day: the same message, with its key of the 17th, sends nothing again.
         const again = await r.restart();
+
+        await verify(again);
 
         r.clock.now = digestTime("2026-11-18");
         await again.tick();
@@ -1327,6 +1750,8 @@ describe("events bridge: deliveries keep their events, their key and their sessi
 
         const again = await r.restart();
 
+        await verify(again);
+
         await receive(again, sub.name, event());
         r.clock.now += BATCH_MS;
         await again.tick();
@@ -1393,6 +1818,10 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         await r.bridge.tick();
         await r.bridge.tick();
 
+        // The refused start left its mark: the start that follows reuses its key, so its session waits for a check.
+        await verify(r.bridge);
+        await r.bridge.tick();
+
         const last = r.sessions.sent().at(-1)!;
 
         assert.notEqual(last.target, first);
@@ -1420,6 +1849,10 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         r.sessions.gate = undefined;
         r.clock.now += 3_600_000;
         await r.bridge.tick();
+        await r.bridge.tick();
+
+        // The refused start left its mark: the start that follows reuses its key, so its session waits for a check.
+        await verify(r.bridge);
         await r.bridge.tick();
 
         const last = r.sessions.sent().at(-1)!;
@@ -1564,6 +1997,8 @@ describe("events bridge: deliveries keep their events, their key and their sessi
 
         const again = await r.restart();
 
+        await verify(again);
+
         // The 7th closes while the 6th still waits: the hour is full.
         r.clock.now = sixth + BATCH_MS;
         await again.tick();
@@ -1600,6 +2035,828 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         await r.bridge.tick();
         assert.equal(tries(), 3);
         assert.equal(r.bridge.state.paused?.tries, 3);
+    });
+});
+
+describe("events bridge: the gates hold right before a delivery", () => {
+    test("a batch whose try's write is still in flight does not go when Team changes the identity", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+
+        let land: () => void = () => undefined;
+
+        // The delivery's start writes first; the try's own write is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        // The store while that write waits: the batch, and its subscription's wakes.
+        const batchBefore = structuredClone(Object.values(r.bridge.state.batches)[0]!);
+        const wakesBefore = structuredClone(r.bridge.state.wakes[sub.name]);
+
+        r.bridge.identityChanged(first);
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        // No try went: the batch and its wakes are as they were, and nothing was delivered.
+        assert.equal(r.sessions.delivered.length, 0);
+
+        const batch = r.bridge.state.batches[batchBefore.id]!;
+
+        assert.deepEqual(batch, batchBefore);
+        assert.equal(batch.tries, 0);
+        assert.equal(batch.target, undefined);
+        assert.deepEqual(r.bridge.state.wakes[sub.name], wakesBefore);
+
+        // A check: the batch goes once, to the verified session.
+        await verify(r.bridge);
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+        assert.equal(sent[0]!.delivery.key, `eb-moneo-b-${batchBefore.events[0]!}`);
+        assert.deepEqual(r.bridge.state.batches, {});
+    });
+
+    test("a digest whose try's write is still in flight does not go when Team changes the identity", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now = digestTime("2026-11-17");
+
+        let land: () => void = () => undefined;
+
+        // The message's own write passes; the try's write is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        const attemptBefore = structuredClone(r.bridge.state.digest.attempt!);
+
+        assert.equal(attemptBefore.inflight, undefined);
+
+        r.bridge.identityChanged(first);
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.deepEqual(r.bridge.state.digest.attempt, attemptBefore);
+        assert.equal(r.bridge.state.digest.tries, 0);
+
+        await verify(r.bridge);
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+        assert.equal(r.bridge.state.digest.attempt, undefined);
+    });
+
+    test("a revoke during a batch try's write: no revoked event reaches Pocket", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+
+        let land: () => void = () => undefined;
+
+        // The delivery's start writes first; the try's own write is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        // Only a revoke: no pause, no identity change.
+        const revoking = r.bridge.revoke([sub.name], "the consumer is gone");
+
+        r.file.gate = undefined;
+        land();
+        await ticking;
+        await revoking;
+        await r.bridge.tick();
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.deepEqual(r.bridge.state.batches, {});
+        assert.deepEqual(r.bridge.state.pending, {});
+    });
+
+    test("a revoke of 1 subscription during a digest try's write: its events never go, the other's go", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks", "digest");
+        const b = await subscribe(r, "notes", "digest");
+        const ea = event();
+        const eb = event();
+
+        await receive(r.bridge, a.name, ea);
+        await receive(r.bridge, b.name, eb);
+        r.clock.now = digestTime("2026-11-17");
+
+        let land: () => void = () => undefined;
+
+        // The message's own write passes; the try's write is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        const revoking = r.bridge.revoke([a.name], "the consumer of A is gone");
+
+        r.file.gate = undefined;
+        land();
+        await ticking;
+        await revoking;
+
+        // That try did not go.
+        assert.equal(r.sessions.delivered.length, 0);
+
+        // The next try sends B's event only.
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.doesNotMatch(sent[0]!.delivery.payload, new RegExp(ea.id));
+        assert.match(sent[0]!.delivery.payload, new RegExp(eb.id));
+    });
+
+    test("a session moved to another agent's home during a batch try's write takes no wake", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+
+        let land: () => void = () => undefined;
+
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        // The folder moves: Team's folder rule now names another agent.
+        r.sessions.folders.set(first, "/home/agents/duncan");
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        assert.equal(
+            r.sessions.delivered.some((each) => each.target === first),
+            false,
+        );
+    });
+
+    test("a session moved to another agent's home during a digest try's write takes no wake", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now = digestTime("2026-11-17");
+
+        let land: () => void = () => undefined;
+
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        r.sessions.folders.set(first, "/home/agents/duncan");
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        assert.equal(
+            r.sessions.delivered.some((each) => each.target === first),
+            false,
+        );
+    });
+
+    test("a new session moved to another agent's home before the pause notice: no notice goes there", async () => {
+        const r = await rig();
+
+        await subscribe(r);
+
+        // The standing session is gone: the notice makes a new one.
+        r.bridge.archived(r.bridge.state.session!.id, true);
+        await until(() => r.bridge.state.session?.gone === true);
+        await r.bridge.pause("lodge refused the refresh");
+
+        let land: () => void = () => undefined;
+
+        // The start's mark writes first; the write that records the new session is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        // The new session is the newest one the fake made, in Moneo's home.
+        const newest = Math.max(...[...r.sessions.folders.keys()]);
+
+        assert.equal(r.sessions.folders.get(newest), HOME);
+        r.sessions.folders.set(newest, "/home/agents/duncan");
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        assert.equal(
+            r.sessions.delivered.some((each) => each.target === newest),
+            false,
+        );
+    });
+
+    test("a pause during a new session's start: the batch does not go", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        // The standing session is gone: the delivery makes a new one, and that start waits.
+        r.bridge.archived(r.bridge.state.session!.id, true);
+        await until(() => r.bridge.state.session?.gone === true);
+
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+
+        let open: () => void = () => undefined;
+
+        r.sessions.gate = new Promise((resolve) => (open = resolve));
+        r.clock.now += BATCH_MS;
+
+        const ticking = r.bridge.tick();
+
+        await until(() => Object.values(r.bridge.state.batches)[0]?.state === "delivering");
+        await r.bridge.pause("lodge refused the refresh");
+        r.sessions.gate = undefined;
+        open();
+        await ticking;
+
+        // Only the pause notice may go: no event does, and no try counts.
+        assert.deepEqual(
+            r.sessions
+                .sent()
+                .map((each) => each.delivery.payload)
+                .filter((each) => each.includes(`id=${e.id}`)),
+            [],
+        );
+        assert.equal(Object.values(r.bridge.state.batches)[0]?.tries, 0);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 1);
+    });
+
+    test("a start cut off before its session write: the same key gives that session back, which waits for a check", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        // The session goes: the next delivery starts generation 2.
+        r.bridge.archived(first, true);
+        await until(() => r.bridge.state.session?.gone === true);
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+
+        let kill: (error: Error) => void = () => undefined;
+
+        // The delivery's start and the start's mark are written; then the process stops on the session's write.
+        r.file.pass = 2;
+        r.file.gate = new Promise<void>((_resolve, reject) => (kill = reject));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+        r.file.gate = undefined;
+        kill(new Error("the process stopped before the session write"));
+        await ticking;
+
+        // The store has the mark of the cut-off start, and no session for it.
+        const stored = await r.file.load();
+
+        assert.equal(stored?.starting, 2);
+        assert.equal(stored?.generation, 1);
+        await r.bridge.stop();
+
+        const made = r.sessions.started.length;
+        const again = await r.restart();
+
+        r.clock.now += RETRY_MS[0];
+        await again.tick();
+
+        // The start of generation 2 began before this process: its session may be older, so no wake goes yet.
+        const replay = again.state.session!.id;
+
+        assert.equal(replay, r.sessions.byKey.get("x.events-bridge.session:moneo:2"));
+        assert.equal(r.sessions.started.length, made);
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(again.state.starting, undefined);
+        assert.equal(Object.values(again.state.batches)[0]?.tries, 1);
+
+        // Team says that session is another agent's: the events go to a new session, never to it.
+        await verify(again, "duncan");
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.notEqual(sent[0]!.target, replay);
+        assert.equal(sent[0]!.target, again.state.session!.id);
+        assert.equal(r.sessions.started.length, made + 1);
+    });
+});
+
+describe("events bridge: lodges answers that a pause or a sign-in overtook", () => {
+    test("a lodge check that a sign-in overtook changes nothing", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+
+        // A check whose list waits.
+        let answer: () => void = () => undefined;
+
+        r.lodge.listGate = new Promise((resolve) => (answer = resolve));
+
+        const checking = r.bridge.checkLodge();
+
+        await until(() => r.lodge.listing > 0);
+
+        await r.bridge.pause("lodge refused the refresh");
+        await r.bridge.resume(ORIGIN);
+
+        // The old list answers now, with a 401: it is no revoke of the client this bridge has now.
+        r.lodge.tokenError = new AuthRequired("lodge refused the token", true);
+        answer();
+
+        assert.equal(await checking, false);
+        assert.equal(r.bridge.paused, undefined);
+        assert.equal(r.bridge.state.paused, undefined);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 1);
+        assert.equal(Object.keys(r.bridge.state.subs).length, 1);
+    });
+
+    test("events_pending holds the digest while the events session waits for Team's check", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.stop();
+
+        // lodge is confirmed in this process; the recorded session is not checked yet.
+        const again = await r.restart();
+        const held = await again.takePending(10, "9:call-session-wait");
+
+        assert.deepEqual(held.events, []);
+        assert.equal(held.more, 1);
+        assert.equal(held.held, "your events session waits for Team's identity check");
+        assert.equal(again.state.taken?.["9:call-session-wait"], undefined);
+        assert.equal(Object.keys(again.state.pending).length, 1);
+    });
+
+    test("a sign-in while an events_pending change waits: a held answer, and nothing stored", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        // The event's write holds the queue: the events_pending change waits behind it.
+        const receiving = receive(r.bridge, sub.name, event());
+
+        await until(() => r.file.holding === 1);
+
+        const taking = r.bridge.takePending(10, "9:call-resumed");
+        const resuming = r.bridge.resume(ORIGIN);
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await receiving;
+        await resuming;
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.more, 1);
+        assert.equal(taken.held, "lodge has not confirmed the subscriptions yet");
+        assert.equal(r.bridge.state.taken?.["9:call-resumed"], undefined);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 1);
+    });
+});
+
+describe("events bridge: a lodge answer that arrives after its check", () => {
+    test("an obsolete put that fails to sign in pauses nothing and deletes no other subscription's events", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks.bookmark", "now");
+        const b = await subscribe(r, "marks.folder", "now");
+
+        const kept = event();
+
+        await receive(r.bridge, b.name, kept);
+
+        // lodge lost A's consumer: the check must subscribe it again, and that put waits.
+        r.lodge.subs.delete(a.name);
+
+        let refuse: (error: Error) => void = () => undefined;
+
+        r.lodge.putGate = new Promise<void>((_resolve, reject) => (refuse = reject));
+
+        const checking = r.bridge.checkLodge();
+
+        await until(() => r.lodge.putting > 0);
+
+        // A pause and a sign-in while that put waits: its answer is old.
+        await r.bridge.pause("lodge refused the refresh");
+        await r.bridge.resume(ORIGIN);
+
+        r.lodge.putGate = undefined;
+        refuse(new AuthRequired("lodge refused the token", true));
+
+        assert.equal(await checking, false);
+        assert.equal(r.bridge.paused, undefined);
+        // B's event never went, and the old 401 is no revoke of the client this bridge has now.
+        assert.notEqual(r.bridge.state.pending[kept.id], undefined);
+    });
+
+    test("an obsolete put that lodge refuses ends no subscription", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        r.lodge.subs.delete(sub.name);
+
+        let open: () => void = () => undefined;
+
+        r.lodge.putGate = new Promise((resolve) => (open = resolve));
+        r.lodge.putAnswer = () => ({ ok: false, status: 403, message: "the grant gives nothing" });
+
+        const checking = r.bridge.checkLodge();
+
+        await until(() => r.lodge.putting > 0);
+
+        await r.bridge.pause("lodge refused the refresh");
+        await r.bridge.resume(ORIGIN);
+
+        r.lodge.putGate = undefined;
+        open();
+
+        assert.equal(await checking, false);
+        // An answer of the old client ends nothing.
+        assert.notEqual(r.bridge.state.subs[sub.name], undefined);
+        assert.deepEqual(r.bridge.state.ended, []);
+    });
+});
+
+describe("events bridge: a hold during the events_pending write", () => {
+    test("an identity change during the answer's write takes the events back", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-take");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.held, "your events session waits for Team's identity check");
+        assert.equal(taken.more, 1);
+        assert.equal(r.bridge.state.taken?.["9:call-take"], undefined);
+        assert.equal(r.bridge.pendingCount(), 1);
+
+        // A check: the event comes once.
+        await verify(r.bridge);
+
+        const after = await r.bridge.takePending(10, "9:call-after");
+
+        assert.equal(after.events.length, 1);
+        assert.equal(after.held, undefined);
+        assert.equal(r.bridge.pendingCount(), 0);
+    });
+
+    test("a pause during the answer's write takes the events back", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-pause");
+
+        await until(() => r.file.holding === 1);
+
+        const pausing = r.bridge.pause("lodge refused the refresh");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await pausing;
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.held, "paused: lodge refused the refresh");
+        assert.equal(r.bridge.state.taken?.["9:call-pause"], undefined);
+        assert.equal(r.bridge.pendingCount(), 1);
+    });
+
+    test("a revoke during the answer's write keeps the events deleted", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-revoked");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        const revoking = r.bridge.revoke("all", "lodge refused the token");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await revoking;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        assert.equal(r.bridge.state.taken?.["9:call-revoked"], undefined);
+        // A revoke's deletion holds: the answer puts nothing back.
+        assert.equal(r.bridge.state.pending[e.id], undefined);
+        assert.equal(r.bridge.pendingCount(), 0);
+    });
+
+    test("a revoke of another subscription during the answer's write loses none of this one's events", async () => {
+        const r = await rig();
+        const kept = await subscribe(r, "marks", "digest");
+        const other = await subscribe(r, "notes", "digest");
+        const mine = event();
+
+        await receive(r.bridge, kept.name, mine);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-other");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        const revoking = r.bridge.revoke([other.name], "the consumer is gone");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await revoking;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        // Only the other subscription was revoked: this event comes back, and waits for the next answer.
+        assert.equal(r.bridge.state.pending[mine.id]?.sub, kept.name);
+        assert.equal(r.bridge.pendingCount(), 1);
+    });
+
+    test("a revoke alone during the answer's write: the answer gives none of the revoked events", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-revoke-alone");
+
+        await until(() => r.file.holding === 1);
+
+        // No other hold: only the revoke.
+        const revoking = r.bridge.revoke("all", "lodge refused the token");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await revoking;
+
+        assert.deepEqual(taken.events, []);
+        assert.deepEqual(r.bridge.state.taken?.["9:call-revoke-alone"]?.events ?? [], []);
+        assert.equal(r.bridge.state.pending[e.id], undefined);
+    });
+
+    test("revokes during the answer's write and during its trimming write: the answer gives none of their events", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks", "digest");
+        const b = await subscribe(r, "notes", "digest");
+        const ea = event();
+        const eb = event();
+
+        await receive(r.bridge, a.name, ea);
+        await receive(r.bridge, b.name, eb);
+
+        const opens: (() => void)[] = [];
+
+        const arm = () => {
+            r.file.gate = new Promise((resolve) => opens.push(resolve));
+        };
+
+        arm();
+
+        const taking = r.bridge.takePending(10, "9:call-two-revokes");
+
+        // 1: the answer's own write waits; A is revoked meanwhile.
+        await until(() => r.file.holding === 1);
+
+        const revokingA = r.bridge.revoke([a.name], "the consumer of A is gone");
+
+        arm();
+        opens[0]!();
+        // 2: the revoke of A writes.
+        await until(() => r.file.holding === 2);
+        arm();
+        opens[1]!();
+        // 3: the answer's trimming write waits; B is revoked meanwhile.
+        await until(() => r.file.holding === 3);
+
+        const revokingB = r.bridge.revoke([b.name], "the consumer of B is gone");
+
+        r.file.gate = undefined;
+        opens[2]!();
+
+        const taken = await taking;
+
+        await revokingA;
+        await revokingB;
+
+        assert.deepEqual(taken.events, []);
+        assert.deepEqual(r.bridge.state.taken?.["9:call-two-revokes"]?.events ?? [], []);
+        assert.equal(r.bridge.state.pending[ea.id], undefined);
+        assert.equal(r.bridge.state.pending[eb.id], undefined);
+    });
+
+    test("a hold during the answer's trimming write: the answer gives nothing, and the kept events come back", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks", "digest");
+        const b = await subscribe(r, "notes", "digest");
+        const ea = event();
+        const eb = event();
+
+        await receive(r.bridge, a.name, ea);
+        await receive(r.bridge, b.name, eb);
+
+        const opens: (() => void)[] = [];
+
+        const arm = () => {
+            r.file.gate = new Promise((resolve) => opens.push(resolve));
+        };
+
+        arm();
+
+        const taking = r.bridge.takePending(10, "9:call-trim-hold");
+
+        await until(() => r.file.holding === 1);
+
+        const revokingA = r.bridge.revoke([a.name], "the consumer of A is gone");
+
+        arm();
+        opens[0]!();
+        await until(() => r.file.holding === 2);
+        arm();
+        opens[1]!();
+        // The trimming write waits; Team changes the events session's identity meanwhile.
+        await until(() => r.file.holding === 3);
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        r.file.gate = undefined;
+        opens[2]!();
+
+        const taken = await taking;
+
+        await revokingA;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        assert.equal(r.bridge.state.taken?.["9:call-trim-hold"], undefined);
+        assert.equal(r.bridge.state.pending[ea.id], undefined);
+        assert.equal(r.bridge.state.pending[eb.id]?.sub, b.name);
+    });
+
+    test("an unsubscribe during a held answer's write: none of its events come back", async () => {
+        const r = await rig();
+        const kept = await subscribe(r, "marks", "digest");
+        const other = await subscribe(r, "notes", "digest");
+        const mine = event();
+        const theirs = event();
+
+        await receive(r.bridge, kept.name, mine);
+        await receive(r.bridge, other.name, theirs);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-unsubscribed");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+
+        const unsubscribing = r.bridge.unsubscribe(other.name);
+
+        await until(() => !r.lodge.subs.has(other.name));
+        // 1 turn of the event loop: the unsubscribe goes on after lodge's answer, before the write lands.
+        await new Promise((resolve) => setImmediate(resolve));
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await unsubscribing;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        assert.equal(r.bridge.state.pending[mine.id]?.sub, kept.name);
+        assert.equal(r.bridge.state.pending[theirs.id], undefined);
+    });
+
+    test("a sign-in during the revoke of a refused check: the check pauses nothing", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+
+        // The check's list finds a refused token (a 401): its revoke's write waits.
+        r.lodge.tokenError = new AuthRequired("lodge refused the token", true);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const checking = r.bridge.checkLodge();
+
+        await until(() => r.file.holding === 1);
+
+        // Brian signs the bridge in again while that write waits.
+        r.lodge.tokenError = undefined;
+
+        const resuming = r.bridge.resume(ORIGIN);
+
+        r.file.gate = undefined;
+        land();
+
+        assert.equal(await checking, false);
+        await resuming;
+        assert.equal(r.bridge.paused, undefined);
     });
 });
 

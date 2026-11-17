@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-17",
+  "scope": "events-bridge.ts",
+  "correction": "the events bridge counted every session it started as verified, but Pocket's session start returns the session of an earlier start with the same key, which can be older than this process and have another identity; the bridge now marks a start in the store before it begins, and a start that finds the mark (a replay) waits for Team's check",
+  "evidence": "bketelsen/pi-pocket-team#254: cross-review (openai/gpt-6.1-sol) of 68044e837faa1f54c3fc54aaa05debdff89c763f, finding 2 (high, blocking)",
+  "promoted_to": "events-bridge.test.ts: a start cut off before its session write: the same key gives that session back, which waits for a check"
+}

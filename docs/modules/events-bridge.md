@@ -2,7 +2,7 @@
 
 The events bridge wakes a named agent when a lodge app publishes an event that the agent follows. Each agent has its own lodge OAuth client (scope `events`), its own durable subscriptions, and its own standing events session, `<Agent> events`, in its home. Brian's chat with the agent never gets a wake.
 
-Files: `events-bridge.ts`, and the vendored NATS client `_events-bridge-nats.mjs` (made by `scripts/vendor-nats.mjs`). It needs Pi Pocket 0.29.0 or later (`host.inbox`) and the Team module. Why it is built this way: [ADR-0004](../adr/0004-agents-follow-lodge-events-through-a-bridge.md).
+Files: `events-bridge.ts`, and the vendored NATS client `_events-bridge-nats.mjs` (made by `scripts/vendor-nats.mjs`). It needs Pi Pocket 0.29.0 or later (`host.inbox`) and the Team module. Why it is built this way: [ADR-0004](../adr/0004-agents-follow-lodge-events-through-a-bridge.md); why it holds events until Team and lodge confirm them: [ADR-0005](../adr/0005-events-bridge-holds-events-until-confirmed.md).
 
 ## Who gets it
 
@@ -17,7 +17,7 @@ All 4 are deferred: the agent loads them with tool search.
 | `events_subscribe(topic_prefix, mode)` | Follows the events under a topic prefix, such as `marks.bookmark` or `marks`. `mode` is `now` or `digest`. The same topic again changes the mode. Only the owner can start it: the first call asks Brian to sign the bridge in. |
 | `events_list`                          | The subscriptions, their waiting events, the wakes of this hour, the pause state, the events session, and the subscriptions that ended.                                                                                         |
 | `events_unsubscribe(id)`               | Ends a subscription at lodge and deletes its waiting events.                                                                                                                                                                    |
-| `events_pending(max?)`                 | Reads the events that wait in the digest, oldest first (40 by default, 100 at most). They count as delivered once read.                                                                                                         |
+| `events_pending(max?)`                 | Reads the events that wait in the digest, oldest first (40 by default, 100 at most). They count as delivered once read. While the bridge holds events (see [Holds](#holds)), it gives none and says why.                        |
 
 A subscription needs a grant: the agent asks with its gateway's `request_access`, and Brian approves it on lodge's consent page. lodge refuses a topic that the grant does not reach (`403`), and filters each consumer to the paths the grant can read.
 
@@ -29,7 +29,7 @@ The first `events_subscribe` shows Brian a card:
 2. On lodge's consent page, the principal must be the agent's id, with the scope `events`. Approve it.
 3. The browser then goes to `http://127.0.0.1:8792/events-bridge/callback?...`, which does not load. Copy the whole address from the address bar into the card's field.
 
-The tokens go to `~/.config/pi-pocket-team/events-bridge/<agent>.json` (0600). Each token is hidden from tools (`host.hide`) before the write that stores it, and every token file is read and hidden before the module counts as loaded; a file whose tokens cannot be hidden is deleted, and that agent signs in again. A rotated token is released after the write that replaces it, so each agent holds 2 hidden values. When Pocket refuses to hide a token, nothing is written. The hidden values stay across a reload. The bridge never uses the `mcp` module's `oauth.json`. A refresh that fails pauses the agent's subscriptions, and the events session gets 1 notice; a notice that does not go is tried again after 30 s, doubled each time, 1 hour at most. The next `events_subscribe` signs in again and ends the pause.
+The tokens go to `~/.config/pi-pocket-team/events-bridge/<agent>.json` (0600). Each token is hidden from tools (`host.hide`) before the write that stores it, and every token file is read and hidden before the module counts as loaded; a file whose tokens cannot be hidden is deleted, and that agent signs in again. A rotated token is released after the write that replaces it, so each agent holds 2 hidden values. When Pocket refuses to hide a token, nothing is written. The hidden values stay across a reload. The bridge never uses the `mcp` module's `oauth.json`. A refresh that fails pauses the agent's subscriptions, and the events session gets 1 notice; a notice that does not go is tried again after 30 s, doubled each time, 1 hour at most. While paused, no event leaves the bridge (see [Holds](#holds)). The next `events_subscribe` signs in again and ends the pause.
 
 ## Wakes
 
@@ -41,7 +41,17 @@ The tokens go to `~/.config/pi-pocket-team/events-bridge/<agent>.json` (0600). E
 
 ## The events session
 
-The bridge makes 1 standing session per agent, `<Agent> events`, in the agent's home (so Team gives it the agent's identity), on the profile's model. It records the session's id. Before each delivery it checks that the session is still in the agent's home and not archived; Pocket's `410` says it is gone. Team's walk checks its identity each time the session runs. When a check fails, the next delivery makes a new session, with a new key. A new session starts from the chat where Brian last signed the bridge in, as an ordinary session: its answers never go back to that chat.
+The bridge makes 1 standing session per agent, `<Agent> events`, in the agent's home (so Team gives it the agent's identity), on the profile's model. It records the session's id. Before each delivery it checks that the session is still in the agent's home, not archived, and that Team confirmed its identity in this process; Pocket's `410` says it is gone. Team's rule applies: the session's explicit identity first, its folder only when it has none. A background delivery cannot read documents, so the confirmation comes from a read with a reader: the bridge's prompt section (in any session's turn) and each of its tool calls ask Team (`persona`) who the recorded session is. The answer is kept in memory only. Team tells the bridge each explicit identity change (`Symbol.for("pi-pocket-team.identity-changed")`), and the bridge then asks again; an answer from a read that started before the change counts for nothing. After a restart, the recorded session waits for a new confirmation, and its events wait with it (no try counted). When Team names another agent, or none, the next delivery makes a new session, with a new key. A session the bridge makes counts as confirmed only when its start began in this process: the bridge marks a start in the store (`starting`) before it begins, and a start after a restart that finds the mark gets back the session of the same key, which may be older, so it waits for a check. Each delivery checks the gates again right before it calls Pocket (the holds, the session's identity and folder, and a revoke or an unsubscribe of its events' subscriptions); one that fails after the try's store write puts the batch or the digest message back, with no try counted, and the next try leaves out the revoked events. A new session starts from the chat where Brian last signed the bridge in, as an ordinary session: its answers never go back to that chat.
+
+## Holds
+
+No event leaves the bridge (no batch, no digest, no `events_pending` answer) while:
+
+- the bridge is paused (a refresh failed, or lodge refused a token);
+- lodge has not confirmed the client in this process: at start and after a sign-in, the bridge lists its subscriptions at lodge first. A refused token pauses it (a `401` also deletes the undelivered events). A subscription that lodge no longer lists loses its undelivered events, and the bridge subscribes it again. So a client revoked while the bridge was down never delivers the events stored before;
+- the events session waits for Team's confirmation (above). The pause notice waits for it too.
+
+A held batch keeps its state: no try counts, and a batch that has not started takes no place in the hour. A held `events_pending` call takes no event and stores no answer; a hold that comes during the answer's own store write puts its events back (except those of a subscription that a revoke or an unsubscribe reached meanwhile), and a revoke or an unsubscribe during that write removes its events from the answer. A lodge check that a pause or a sign-in overtook changes nothing, also through the resubscriptions it started.
 
 ## What it keeps
 

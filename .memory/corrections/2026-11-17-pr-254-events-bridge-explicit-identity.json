@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-17",
+  "scope": "events-bridge.ts",
+  "correction": "the events bridge checked its events session only by its folder before a delivery, but Team gives a session's explicit identity priority over its folder, so a session in one agent's home set to another agent still got the first agent's events; the bridge now delivers only to a session whose identity Team confirmed in this process (TeamApi.persona, read in the bridge's prompt section and tool calls), Team calls the identity listeners after each explicit change so that the bridge checks again, and a session that Team names as another agent is replaced",
+  "evidence": "bketelsen/pi-pocket-team#251: plan verification review of the merged events bridge (080014eeef270e1ae4d4c5abde90c9b49282b657), finding 1 (blocking)",
+  "promoted_to": "events-bridge.test.ts: Team says the session is another agent: it takes no wake, and the batch goes to a new session; after a restart, a recorded session that no one checked takes no wake; an identity change clears the check; events-bridge.pocket.test.ts: a recorded events session that Team says is another agent is marked gone; team-memory.test.ts: a change of identity tells the identity listeners"
+}

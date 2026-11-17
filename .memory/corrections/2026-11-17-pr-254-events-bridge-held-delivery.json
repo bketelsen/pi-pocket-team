@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-17",
+  "scope": "events-bridge.ts",
+  "correction": "a client that lodge revoked while the bridge was down only paused the bridge at the next start (a refused refresh), and the batches, the digest and events_pending never checked the pause, and the timer delivered stored batches before any call to lodge; now no event leaves the bridge while it is paused or before lodge confirmed the client and its subscriptions in this process (checkLodge at start and after each sign-in), and a subscription that lodge no longer lists loses its undelivered events",
+  "evidence": "bketelsen/pi-pocket-team#251: plan verification review of the merged events bridge (080014eeef270e1ae4d4c5abde90c9b49282b657), finding 2 (blocking)",
+  "promoted_to": "events-bridge.test.ts: a refused refresh pauses the bridge: the stored batch and digest wait, and events_pending gives none; a restarted bridge delivers nothing before lodge has confirmed the client; checkLodge subscribes again a subscription that lodge does not list, and its events never go; a lodge check that started before a pause and a sign-in confirms nothing"
+}

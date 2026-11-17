@@ -21,6 +21,7 @@ it fits.
 - [0002 — Agent-portable instruction surface](adr/0002-agent-portable-instruction-surface.md)
 - [0003 — Verify gate, risk paths and corrections](adr/0003-verify-gate-risk-paths-and-corrections.md)
 - [0004 — Agents follow lodge events through a bridge drop-in](adr/0004-agents-follow-lodge-events-through-a-bridge.md)
+- [0005 — The events bridge holds events until Team and lodge confirm them](adr/0005-events-bridge-holds-events-until-confirmed.md)
 - [Org-wide decisions (frostyard/core ADRs)](org-adrs.md)
 
 ### Design

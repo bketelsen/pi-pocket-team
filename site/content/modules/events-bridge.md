@@ -19,13 +19,14 @@ The agent needs a grant first: it asks with its gateway's `request_access`, and 
 
 ## Sign in
 
-The first subscription shows a card. Open its lodge link, check that the principal is the agent's id with the scope `events`, and approve. Your browser then opens a `http://127.0.0.1:8792/...` address that does not load: copy that whole address into the card. The tokens go to `~/.config/pi-pocket-team/events-bridge/<agent>.json`, readable only by the server's user, and are hidden from tools. If a refresh fails, the bridge pauses and the events session gets 1 notice; ask the agent to subscribe again to sign in.
+The first subscription shows a card. Open its lodge link, check that the principal is the agent's id with the scope `events`, and approve. Your browser then opens a `http://127.0.0.1:8792/...` address that does not load: copy that whole address into the card. The tokens go to `~/.config/pi-pocket-team/events-bridge/<agent>.json`, readable only by the server's user, and are hidden from tools. If a refresh fails, the bridge pauses and the events session gets 1 notice; no event goes out while it is paused. Ask the agent to subscribe again to sign in.
 
 ## What to expect
 
 - An event carries no content: the agent reads the object through its gateway tools.
 - A busy session is tried again, 5 times at most; the hourly cap, or a session that stays busy, moves a batch to the digest. Nothing is lost.
-- The agent's own events are dropped. If lodge revokes the client, the events that wait are deleted.
+- The agent's own events are dropped. If lodge revokes the client, the events that wait are deleted. At start and after a sign-in, the bridge asks lodge first, so a revoke while the server was down also stops them.
+- Events go only to an events session that Team confirms as the agent's: an identity you set on that session by hand outranks its folder, and then the bridge makes a new one. After a restart, events wait until Team confirms the session again.
 - A restart never loses an event. When a cut-off delivery cannot go again to the same session, its events come again, marked `repeat=maybe`.
 
 The full reference is [docs/modules/events-bridge.md](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/events-bridge.md).

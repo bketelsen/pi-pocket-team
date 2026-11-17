@@ -92,9 +92,13 @@ export function pendingLine(each: Pending): string {
 
 /** events_pending's answer to the model: the lines, with `repeat=maybe` and its note where a line may come twice. */
 export function pendingAnswer(
-    taken: { events: readonly Pending[]; more: number; dropped: number },
+    taken: { events: readonly Pending[]; more: number; dropped: number; held?: string },
     defang: (line: string) => string,
 ): string {
+    if (taken.held !== undefined) {
+        return `The events bridge holds your events now (${taken.held}): none were given. Ask Brian to ask you to subscribe again when it is paused.`;
+    }
+
     if (taken.events.length === 0) {
         return "No events wait in your digest.";
     }
@@ -119,6 +123,10 @@ export const TAKEN_KEEP = 100;
 export const NOTICE_RETRY_MS = 30_000;
 /** A pull waits this long for an event; lodge allows 60 s at most. */
 export const PULL_MS = 30_000;
+/** Why events_pending holds the events: the events session waits for Team's identity check. */
+export const SESSION_HELD = "your events session waits for Team's identity check";
+/** Why events_pending holds the events: lodge has not confirmed this client and its subscriptions in this process. */
+export const LODGE_HELD = "lodge has not confirmed the subscriptions yet";
 /** The redirect address of the sign-in. Nothing listens there: the owner pastes the address the browser shows. */
 export const SIGN_IN_REDIRECT = "http://127.0.0.1:8792/events-bridge/callback";
 /** A subscription's name, as lodge takes it. */
@@ -202,7 +210,14 @@ export type DigestAttempt = {
 };
 
 /** What events_pending gave a tool call: a replay of that call gives the same. */
-export type Taken = { at: number; events: Pending[]; more: number; dropped: number };
+export type Taken = {
+    at: number;
+    events: Pending[];
+    more: number;
+    dropped: number;
+    /** The bridge holds the events now, for this reason: none were given, and the answer is not kept. */
+    held?: string;
+};
 
 /** The store of 1 agent: `<agent>.events.json`. */
 export type AgentState = {
@@ -218,6 +233,11 @@ export type AgentState = {
     session?: { id: number; generation: number; gone?: true };
     /** Events sessions made so far: each start has its own key. */
     generation: number;
+    /**
+     * The generation of a session start that began. A start with the same key after a restart can return a session made
+     * before it, which no check confirmed: then the session is not verified, and it waits for a check.
+     */
+    starting?: number;
     /** `tries` and `nextAt`: the notice's tries; a notice that did not go waits longer each time. */
     paused?: {
         reason: string;
@@ -654,6 +674,17 @@ export class AuthRequired extends Error {
         super(message);
         this.name = "AuthRequired";
         this.after401 = after401;
+    }
+}
+
+/**
+ * The events session's identity is not checked yet: Team says who a session is, and only a session this process
+ * verified takes a wake. A delivery that finds the session unchecked waits; it does not go.
+ */
+export class SessionUnchecked extends Error {
+    constructor(session: number) {
+        super(`the identity of events session ${String(session)} is not checked yet`);
+        this.name = "SessionUnchecked";
     }
 }
 
@@ -1131,6 +1162,21 @@ export class AgentBridge {
     #again = false;
     #connected = false;
     #connection: BrokerConnection | undefined;
+    /** The events session whose identity this process verified; never in the store, so a restart verifies again. */
+    #verified: number | undefined;
+    /** Counts the identity changes: a check that started before one is ignored. */
+    #identityEpoch = 0;
+    /** lodge confirmed this client and its subscriptions in this process: no event goes before it does. */
+    #lodgeChecked = false;
+    /** The lodge check that runs now: calls at the same time share it. */
+    #checking: Promise<boolean> | undefined;
+    /** Counts the pauses and sign-ins: a lodge check that started before one confirms nothing. */
+    #lodgeEpoch = 0;
+    /**
+     * Counts the revokes, of every subscription (`all`) and of each one by name: an events_pending answer that a revoke
+     * overtook puts no event of a revoked subscription back, and puts the others back.
+     */
+    #revokes = { all: 0, subs: new Map<string, number>() };
 
     constructor(deps: BridgeDeps) {
         this.#deps = deps;
@@ -1286,6 +1332,16 @@ export class AgentBridge {
     async #round(round: { attempt: number }): Promise<void> {
         if (this.#active().length === 0) {
             await this.#changed.promise;
+
+            return;
+        }
+
+        // No event goes before lodge confirmed this client and its subscriptions in this process.
+        if (!this.#lodgeChecked && !(await this.checkLodge())) {
+            round.attempt++;
+            await this.#sleep(
+                this.#deps.backoff?.(round.attempt) ?? Math.min(60_000, 1_000 * 2 ** round.attempt),
+            );
 
             return;
         }
@@ -1569,6 +1625,14 @@ export class AgentBridge {
 
     /** Deletes the undelivered events (and batches) of subscriptions: a revoke. `all` for every subscription. */
     async revoke(subs: readonly string[] | "all", why: string): Promise<void> {
+        if (subs === "all") {
+            this.#revokes.all++;
+        } else {
+            for (const name of subs) {
+                this.#revokes.subs.set(name, (this.#revokes.subs.get(name) ?? 0) + 1);
+            }
+        }
+
         await this.#change((state) => {
             const names = subs === "all" ? Object.keys(state.subs) : subs;
 
@@ -1594,15 +1658,23 @@ export class AgentBridge {
     }
 
     /** Only a new sign-in helps: pause the subscriptions, and post 1 notice to the events session for this pause. */
-    async #authFailed(error: AuthRequired): Promise<void> {
+    async #authFailed(error: AuthRequired, epoch?: number): Promise<void> {
         if (error.after401) {
             await this.revoke("all", error.message);
+        }
+
+        // A sign-in during the revoke's write ends the check that found the refusal: its pause would undo the sign-in.
+        if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+            return;
         }
 
         await this.pause(error.message);
     }
 
     async pause(reason: string): Promise<void> {
+        this.#lodgeChecked = false;
+        this.#lodgeEpoch++;
+
         const first = await this.#change((state) => {
             if (state.paused !== undefined) {
                 return false;
@@ -1631,6 +1703,10 @@ export class AgentBridge {
 
     /** After a sign-in: the person and the conversation of later deliveries, and the pause ends. */
     async resume(origin: { by: string; source: number }): Promise<void> {
+        // lodge answers about the client again: no event goes until its own answer says the client is there.
+        this.#lodgeChecked = false;
+        this.#lodgeEpoch++;
+
         await this.#change((state) => {
             state.by = origin.by;
             state.source = origin.source;
@@ -1648,6 +1724,78 @@ export class AgentBridge {
                 await this.#authFailed(error);
             }
         }
+    }
+
+    /**
+     * Asks lodge whether this client and its subscriptions are there, before any event goes: a pause or a not yet
+     * confirmed client holds every wake. A revoked client pauses (a refused refresh keeps its events); a subscription
+     * that lodge no longer lists loses its undelivered events and is made again, as `#consumerGone` does. 1 check runs
+     * at a time. Answers whether the client is confirmed now: false means no event goes.
+     */
+    checkLodge(): Promise<boolean> {
+        this.#checking ??= this.#confirmed().finally(() => {
+            this.#checking = undefined;
+        });
+
+        return this.#checking;
+    }
+
+    async #confirmed(): Promise<boolean> {
+        if (this.#state!.paused !== undefined) {
+            return false;
+        }
+
+        // A pause or a sign-in during this check makes its answer old: then it confirms nothing.
+        const epoch = this.#lodgeEpoch;
+
+        let listed: LodgeAnswer<LodgeSub[]>;
+
+        try {
+            listed = await this.#deps.lodge.list();
+        } catch (error) {
+            // An answer of an old check changes nothing: no pause, no revoke.
+            if (epoch !== this.#lodgeEpoch) {
+                return false;
+            }
+
+            if (error instanceof AuthRequired) {
+                await this.#authFailed(error, epoch);
+            }
+
+            return false;
+        }
+
+        if (!listed.ok) {
+            return false;
+        }
+
+        // The list of a check that a pause or a sign-in overtook is old: it reconciles nothing.
+        if (epoch !== this.#lodgeEpoch) {
+            return false;
+        }
+
+        const there = new Set(listed.value.map((each) => each.name));
+
+        for (const name of Object.keys(this.#state!.subs)) {
+            if (!there.has(name)) {
+                if (epoch !== this.#lodgeEpoch) {
+                    return false;
+                }
+
+                await this.#resubscribe(name, "lodge does not list it", epoch);
+            }
+        }
+
+        // A 401 of a resubscription pauses the bridge: then nothing goes, and the answer says so.
+        if (this.#state!.paused !== undefined || epoch !== this.#lodgeEpoch) {
+            return false;
+        }
+
+        this.#lodgeChecked = true;
+        this.#schedule();
+        void this.tick();
+
+        return true;
     }
 
     /**
@@ -1676,6 +1824,15 @@ export class AgentBridge {
             return;
         }
 
+        await this.#resubscribe(name, reason);
+    }
+
+    /**
+     * A subscription that lodge does not list: its undelivered events go (they never reach the agent), and the bridge
+     * makes it again. 403 and 404 end it: the grant gives nothing under it. With an `epoch` (a check's), an answer that a
+     * pause or a sign-in overtook acts nowhere: no pause, no revoke, no end.
+     */
+    async #resubscribe(name: string, reason: string, epoch?: number): Promise<void> {
         const sub = this.#state!.subs[name];
 
         if (sub === undefined) {
@@ -1689,14 +1846,21 @@ export class AgentBridge {
         try {
             again = await this.#deps.lodge.put(name, sub.topic);
         } catch (error) {
+            // An answer of a check that a pause or a sign-in overtook changes nothing: no pause, no revoke.
+            if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+                return;
+            }
+
             if (error instanceof AuthRequired) {
-                await this.#authFailed(error);
+                await this.#authFailed(error, epoch);
             }
 
             return;
         }
 
         if (again.ok) {
+            // The consumer lodge made is real: the local record names it, or the pulls find it gone. It is no action
+            // on the client, so an old check applies it too.
             await this.#change((state) => {
                 const live = state.subs[name];
 
@@ -1707,7 +1871,16 @@ export class AgentBridge {
                 }
             });
         } else if (again.status === 403 || again.status === 404) {
+            if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+                return;
+            }
+
             await this.#change((state) => {
+                // The queue can run this change later: the check again, inside it.
+                if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+                    return;
+                }
+
                 this.#end(
                     state,
                     name,
@@ -1756,6 +1929,8 @@ export class AgentBridge {
             throw new Error(subscribeRefusal(answer.status, answer.message));
         }
 
+        const wasPaused = this.#state!.paused !== undefined;
+
         const sub: Subscription = {
             name,
             topic,
@@ -1782,7 +1957,24 @@ export class AgentBridge {
             }
         });
 
-        const session = await this.#session();
+        // A pause ended here as well: lodge must confirm this client again before an event goes.
+        if (wasPaused) {
+            this.#lodgeChecked = false;
+            this.#lodgeEpoch++;
+        }
+
+        let session: number;
+
+        try {
+            session = await this.#session();
+        } catch (error) {
+            // The recorded session waits for Team's check: the subscription stands, and its wakes wait with it.
+            if (!(error instanceof SessionUnchecked)) {
+                throw error;
+            }
+
+            session = this.#state!.session!.id;
+        }
 
         this.#kick();
         this.#schedule();
@@ -1802,6 +1994,9 @@ export class AgentBridge {
                 `lodge refused the unsubscribe (${String(answer.status)}): ${answer.message}`,
             );
         }
+
+        // Its waiting events go: an events_pending answer under way puts none of them back, and gives none.
+        this.#revokes.subs.set(name, (this.#revokes.subs.get(name) ?? 0) + 1);
 
         await this.#change((state) => {
             for (const [id, pending] of Object.entries(state.pending)) {
@@ -1858,20 +2053,59 @@ export class AgentBridge {
     /**
      * The oldest digest events, at most `max`: handed to the caller, so delivered. `call` names the tool call: a replay
      * of it gets the same answer, so a crash before Pocket keeps the answer loses no event. The digest message on its
-     * way keeps its events.
+     * way keeps its events. A bridge that holds the events (a pause, or a client lodge has not confirmed yet) gives
+     * none: its answer is held, kept for no call, and takes no event.
      */
     async takePending(max: number, call: string): Promise<Taken> {
-        return this.#change((state) => {
+        const replay = this.#state!.taken?.[call];
+
+        if (replay !== undefined) {
+            return structuredClone(replay);
+        }
+
+        const paused = this.#state!.paused;
+
+        if (paused !== undefined) {
+            return this.#heldAnswer(this.#state!, `paused: ${paused.reason}`);
+        }
+
+        // The events session waits for Team's check: it takes no event yet.
+        if (this.#sessionWaits()) {
+            return this.#heldAnswer(this.#state!, SESSION_HELD);
+        }
+
+        // Only an event that can go needs lodge's confirmation: with none, there is nothing to hold.
+        if (!this.#lodgeChecked && this.#giveable().length > 0 && !(await this.checkLodge())) {
+            return this.#heldAnswer(this.#state!, LODGE_HELD);
+        }
+
+        // An event of a subscription that a revoke reached since this mark stays deleted.
+        const mark = this.#revokeMark();
+        const revoked = (sub: string) => this.#revokedSince(mark, sub);
+        const result = await this.#change((state) => {
             const done = state.taken?.[call];
 
             if (done !== undefined) {
-                return done;
+                return { taken: done, fresh: false };
             }
 
-            const sending = new Set(state.digest.attempt?.ids ?? []);
-            const digest = Object.values(state.pending)
-                .filter((each) => each.state === "digest" && !sending.has(each.event.id))
-                .sort((a, b) => a.received - b.received);
+            // A hold that came during the checks: nothing goes, and the answer is kept for no call.
+            if (state.paused !== undefined) {
+                return {
+                    taken: this.#heldAnswer(state, `paused: ${state.paused.reason}`),
+                    fresh: false,
+                };
+            }
+
+            if (this.#sessionWaits()) {
+                return { taken: this.#heldAnswer(state, SESSION_HELD), fresh: false };
+            }
+
+            if (!this.#lodgeChecked && this.#giveable(state).length > 0) {
+                return { taken: this.#heldAnswer(state, LODGE_HELD), fresh: false };
+            }
+
+            const digest = this.#giveable(state);
             const events = digest.slice(0, max);
             const taken: Taken = {
                 at: this.#now(),
@@ -1887,24 +2121,168 @@ export class AgentBridge {
             state.digest.dropped = 0;
             (state.taken ??= {})[call] = taken;
 
-            return taken;
+            return { taken, fresh: true };
         });
+
+        // The hand-off of a fresh answer that gave something: each pass checks the holds and the revokes after the
+        // last write, and the answer goes only from a pass with no write after its checks. A hold takes the events back
+        // (none was given, and the call is kept for no replay; a revoke's deletion stays). A revoke or an unsubscribe
+        // takes its events out of the answer and its stored copy, and the next pass checks again. An answer with no
+        // event of its own takes nothing back: it holds nothing.
+        let answer = result.taken;
+
+        if (!result.fresh || (answer.events.length === 0 && answer.dropped === 0)) {
+            return answer;
+        }
+
+        for (;;) {
+            if (this.#held()) {
+                const back = answer;
+
+                await this.#change((state) => {
+                    for (const each of back.events) {
+                        const id = each.event.id;
+
+                        if (!revoked(each.sub) && state.pending[id] === undefined) {
+                            state.pending[id] = structuredClone(each);
+                            delete state.seen[id];
+                        }
+                    }
+
+                    // This call set the count to 0: the answer reported what it had.
+                    if (back.dropped > 0) {
+                        state.digest.dropped = back.dropped;
+                    }
+
+                    if (state.taken !== undefined) {
+                        delete state.taken[call];
+                    }
+                });
+
+                return this.#heldAnswer(this.#state!, this.#heldReason());
+            }
+
+            const kept = answer.events.filter((each) => !revoked(each.sub));
+
+            // No write since the checks above: the answer goes now.
+            if (kept.length === answer.events.length) {
+                return answer;
+            }
+
+            const trimmed: Taken = { ...answer, events: kept };
+
+            await this.#change((state) => {
+                if (state.taken?.[call] !== undefined) {
+                    state.taken[call] = structuredClone(trimmed);
+                }
+            });
+
+            answer = trimmed;
+        }
     }
 
     /**
-     * What Team says of a session, from a prompt section that runs in it: a recorded events session that no longer has
-     * this agent's identity is gone, and the next delivery makes a new one.
+     * The revoke counts now. Take it before the change that selects events is queued: a revoke after it is seen, and a
+     * revoke before it has run its deletion before that change.
      */
-    identity(session: number, agentId: string | undefined): void {
+    #revokeMark(): { all: number; subs: Map<string, number> } {
+        return { all: this.#revokes.all, subs: new Map(this.#revokes.subs) };
+    }
+
+    /** A revoke or an unsubscribe reached the subscription since the mark: its events stay deleted, and none goes. */
+    #revokedSince(mark: { all: number; subs: Map<string, number> }, sub: string): boolean {
+        return (
+            this.#revokes.all !== mark.all ||
+            (this.#revokes.subs.get(sub) ?? 0) !== (mark.subs.get(sub) ?? 0)
+        );
+    }
+
+    /** Why the bridge holds the events now, in the words events_pending gives. */
+    #heldReason(): string {
+        const paused = this.#state!.paused;
+
+        if (paused !== undefined) {
+            return `paused: ${paused.reason}`;
+        }
+
+        return this.#sessionWaits() ? SESSION_HELD : LODGE_HELD;
+    }
+
+    /** The digest events that events_pending may give now: the oldest first, and not the message on its way. */
+    #giveable(state: AgentState = this.#state!): Pending[] {
+        const sending = new Set(state.digest.attempt?.ids ?? []);
+
+        return Object.values(state.pending)
+            .filter((each) => each.state === "digest" && !sending.has(each.event.id))
+            .sort((a, b) => a.received - b.received);
+    }
+
+    /** An answer that gives no event, and waits for the bridge to stop holding them. It is never stored. */
+    #heldAnswer(state: AgentState, held: string): Taken {
+        const waiting = Object.values(state.pending).filter((each) => each.state === "digest");
+
+        return { at: this.#now(), events: [], more: waiting.length, dropped: 0, held };
+    }
+
+    /**
+     * What Team says of a session, from a prompt section that runs in it: a recorded events session that Team says is
+     * another agent (or no agent) is gone, and the next delivery makes a new one. Only a session which this process
+     * verified takes a wake, so an unchecked one holds the deliveries until a check comes.
+     */
+    async identity(session: number, agentId: string | undefined, epoch: number): Promise<void> {
         const current = this.#state?.session;
 
-        if (current?.id === session && current.gone !== true && agentId !== this.agent) {
-            void this.#change((state) => {
-                if (state.session?.id === session) {
-                    state.session.gone = true;
-                }
-            }).catch(() => undefined);
+        // A check that started before an identity change answers for the old identity: it proves nothing now.
+        if (epoch !== this.#identityEpoch) {
+            return;
         }
+
+        if (current === undefined || current.id !== session || current.gone === true) {
+            return;
+        }
+
+        if (agentId === this.agent) {
+            this.#verified = session;
+            void this.tick();
+
+            return;
+        }
+
+        // Team says another agent's identity: the session is gone, and the next delivery makes a new one. The tick
+        // waits for the write: before it, the store still has the session, and the delivery would wait for a check.
+        // The caller waits for the write too, so a tool call after the check sees the session gone.
+        await this.#change((state) => {
+            if (state.session?.id === session) {
+                state.session.gone = true;
+            }
+        }).catch(() => undefined);
+        void this.tick();
+    }
+
+    /** Team changed a session's explicit identity: the recorded events session is unchecked until Team says who it is. */
+    identityChanged(session: number): void {
+        this.#identityEpoch++;
+
+        if (this.#verified === session) {
+            this.#verified = undefined;
+        }
+
+        this.#schedule();
+    }
+
+    /** The recorded events session whose identity this process has not checked yet, with the epoch of that check. */
+    identityToCheck(): { session: number; epoch: number } | undefined {
+        const current = this.#state?.session;
+
+        if (current === undefined || current.gone === true || !this.#ours(current.id)) {
+            return undefined;
+        }
+
+        if (this.#verified === current.id) {
+            return undefined;
+        }
+
+        return { session: current.id, epoch: this.#identityEpoch };
     }
 
     archived(session: number, archived: boolean): void {
@@ -1933,15 +2311,22 @@ export class AgentBridge {
     }
 
     /**
-     * The standing events session, checked at each delivery: it is there, not archived, and in the agent's home. Else a
-     * new one, `<Agent> events` in the agent's home, with a key of its own, from the sign-in's conversation.
+     * The standing events session, checked at each delivery: it is there, not archived, in the agent's home, and its
+     * identity is the one this process verified. Else a new one, `<Agent> events` in the agent's home, with a key of its
+     * own, from the sign-in's conversation. A recorded session that no check confirmed yet throws `SessionUnchecked`:
+     * its folder alone does not say whose it is. A session made now counts as confirmed only when this start began in
+     * this process: one that a restarted start has to reuse (the same key) may be older, so it waits for a check.
      */
     async #session(): Promise<number> {
         const state = this.#state!;
         const current = state.session;
 
         if (current !== undefined && current.gone !== true && this.#ours(current.id)) {
-            return current.id;
+            if (this.#verified === current.id) {
+                return current.id;
+            }
+
+            throw new SessionUnchecked(current.id);
         }
 
         if (state.source === undefined) {
@@ -1951,6 +2336,18 @@ export class AgentBridge {
         }
 
         const generation = state.generation + 1;
+        // The identity this new session is made under: an identity change while it starts needs a check after it.
+        const epoch = this.#identityEpoch;
+        // A start of this generation began before: the same key can give back a session made before that start.
+        const replay = state.starting === generation;
+
+        // The mark goes first, in its own write: a start cut off after this leaves the mark, and its session waits.
+        if (!replay) {
+            await this.#change((next) => {
+                next.starting = generation;
+            });
+        }
+
         const id = await this.#deps.sessions.start(
             state.source,
             {
@@ -1964,9 +2361,34 @@ export class AgentBridge {
         await this.#change((next) => {
             next.generation = generation;
             next.session = { id, generation };
+            delete next.starting;
         });
 
+        // A session whose start began in this process, under this identity, is the agent's. A replayed start is not.
+        if (replay || this.#identityEpoch !== epoch) {
+            throw new SessionUnchecked(id);
+        }
+
+        this.#verified = id;
+
         return id;
+    }
+
+    /** The recorded events session waits for its identity check: no delivery goes until one confirms it. */
+    #sessionWaits(): boolean {
+        const current = this.#state?.session;
+
+        return (
+            current !== undefined &&
+            current.gone !== true &&
+            this.#ours(current.id) &&
+            this.#verified !== current.id
+        );
+    }
+
+    /** Nothing goes out now: a pause, a client lodge has not confirmed, or an events session that waits for its check. */
+    #held(): boolean {
+        return this.#state!.paused !== undefined || !this.#lodgeChecked || this.#sessionWaits();
     }
 
     async #sessionGone(id: number): Promise<void> {
@@ -1988,18 +2410,24 @@ export class AgentBridge {
         this.#cancelTimer?.();
 
         const state = this.#state;
-        const times: number[] = Object.values(state.batches).map((batch) =>
-            batch.state === "open" ? batch.closeAt : batch.nextAt,
-        );
+        // A bridge that holds the events (a pause, an unconfirmed client, an unchecked session) has no batch or digest
+        // time to arm: its gates (identity, checkLodge, resume) tick when they open.
+        const held = this.#held();
+        const times: number[] = held
+            ? []
+            : Object.values(state.batches).map((batch) =>
+                  batch.state === "open" ? batch.closeAt : batch.nextAt,
+              );
 
-        if (state.paused !== undefined && state.paused.sent !== true) {
+        if (state.paused !== undefined && state.paused.sent !== true && !this.#sessionWaits()) {
             times.push(state.paused.nextAt ?? state.paused.at);
         }
 
         if (
-            this.pendingCount() > 0 ||
-            state.digest.day === undefined ||
-            state.digest.attempt !== undefined
+            !held &&
+            (this.pendingCount() > 0 ||
+                state.digest.day === undefined ||
+                state.digest.attempt !== undefined)
         ) {
             times.push(state.digest.nextAt ?? nextDigestAt(this.#now(), state.digest.day));
         }
@@ -2049,9 +2477,22 @@ export class AgentBridge {
         const now = this.#now();
         const state = this.#state!;
         const paused = state.paused;
+        // The notice goes to the events session: an unchecked one holds it too.
+        const waiting = this.#sessionWaits();
 
-        if (paused !== undefined && paused.sent !== true && (paused.nextAt ?? paused.at) <= now) {
+        if (
+            !waiting &&
+            paused !== undefined &&
+            paused.sent !== true &&
+            (paused.nextAt ?? paused.at) <= now
+        ) {
             await this.#pauseNotice();
+        }
+
+        // No event leaves the bridge while it holds them: a pause, a client lodge has not confirmed, or an events
+        // session whose identity no check confirmed yet.
+        if (this.#held()) {
+            return;
         }
 
         for (const batch of Object.values(state.batches)) {
@@ -2118,11 +2559,16 @@ export class AgentBridge {
         return each.inflight === true || each.uncertain === true;
     }
 
-    /** A session that can take a wake now: in the agent's home, and not one the bridge found gone. */
+    /** A session that can take a wake now: in the agent's home, its identity verified in this process, and not one the
+     * bridge found gone. */
     #usable(session: number): boolean {
         const current = this.#state!.session;
 
-        return this.#ours(session) && !(current?.id === session && current.gone === true);
+        return (
+            this.#ours(session) &&
+            this.#verified === session &&
+            !(current?.id === session && current.gone === true)
+        );
     }
 
     /**
@@ -2162,6 +2608,11 @@ export class AgentBridge {
      * write checks the store again: a revoke or an unsubscribe during a wait deletes the batch, and nothing goes.
      */
     async #deliverBatch(batchId: string): Promise<void> {
+        // Defense in depth: a bridge that holds the events delivers nothing.
+        if (this.#held()) {
+            return;
+        }
+
         const now = this.#now();
         const ready = await this.#change((state) => {
             const batch = state.batches[batchId];
@@ -2228,6 +2679,11 @@ export class AgentBridge {
         try {
             target = await this.#target(before);
         } catch (error) {
+            // An unchecked events session is no failed try: the batch keeps its state and waits for its check.
+            if (error instanceof SessionUnchecked) {
+                return;
+            }
+
             // No try went: a try before it that may have gone stays so.
             await this.#retry(
                 batchId,
@@ -2240,14 +2696,29 @@ export class AgentBridge {
 
         // The same session as a try that may have gone: Pocket's key holds there.
         const resumed = this.#mayHaveGone(before) && before.target === target;
+        // The revokes from here on stop the try (see `#revokeMark`).
+        const mark = this.#revokeMark();
         // After the waits: the batch as the store has it now, and the try marked before it starts.
         const go = await this.#change((state) => {
             const batch = state.batches[batchId];
-            const sub = batch === undefined ? undefined : state.subs[batch.sub];
 
             if (batch === undefined) {
                 return undefined;
             }
+
+            // The gates, right before the try: a pause, an identity change, a moved session or a revoke since `#target`
+            // stops it, with no mark.
+            if (this.#held() || !this.#usable(target) || this.#revokedSince(mark, batch.sub)) {
+                return undefined;
+            }
+
+            // The batch and its wakes before this change changes them: a hold after the write puts them back.
+            const kept = structuredClone(batch);
+            const wakes =
+                state.wakes[batch.sub] === undefined
+                    ? undefined
+                    : structuredClone(state.wakes[batch.sub]);
+            const sub = state.subs[batch.sub];
 
             const ids = batch.events.filter((id) => state.pending[id] !== undefined);
 
@@ -2293,10 +2764,35 @@ export class AgentBridge {
             batch.target = target;
             batch.inflight = true;
 
-            return { sub, events: ids.map((id) => structuredClone(state.pending[id]!)) };
+            return {
+                sub,
+                events: ids.map((id) => structuredClone(state.pending[id]!)),
+                kept,
+                wakes,
+            };
         });
 
         if (go === undefined) {
+            return;
+        }
+
+        // The gates again, right before the delivery (no wait between them and it): a hold, a moved session or a revoke
+        // puts the store back, and no try counts and no batch moves (a revoke's own change then deletes the batch).
+        if (this.#held() || !this.#usable(target) || this.#revokedSince(mark, go.sub.name)) {
+            await this.#change((state) => {
+                if (state.batches[batchId] === undefined) {
+                    return;
+                }
+
+                state.batches[batchId] = go.kept;
+
+                if (go.wakes === undefined) {
+                    delete state.wakes[go.kept.sub];
+                } else {
+                    state.wakes[go.kept.sub] = go.wakes;
+                }
+            });
+
             return;
         }
 
@@ -2437,6 +2933,11 @@ export class AgentBridge {
      * for events_pending or the next day.
      */
     async #deliverDigest(): Promise<void> {
+        // Defense in depth: a bridge that holds the events delivers nothing.
+        if (this.#held()) {
+            return;
+        }
+
         const now = this.#now();
         const day = digestDay(now);
         const ready = await this.#change((state) => {
@@ -2483,6 +2984,11 @@ export class AgentBridge {
         try {
             target = await this.#target(before);
         } catch (error) {
+            // An unchecked events session is no failed try: the digest keeps its state and waits for its check.
+            if (error instanceof SessionUnchecked) {
+                return;
+            }
+
             // No try went: a try before it that may have gone stays so.
             await this.#digestRetry(messageOf(error), before.inflight === true);
 
@@ -2490,12 +2996,31 @@ export class AgentBridge {
         }
 
         const resumed = this.#mayHaveGone(before) && before.target === target;
+        // The revokes from here on stop the try (see `#revokeMark`).
+        const mark = this.#revokeMark();
         const go = await this.#change((state) => {
             const attempt = state.digest.attempt;
 
             if (attempt === undefined) {
                 return undefined;
             }
+
+            // The gates, right before the try: a pause, an identity change, a moved session or a revoke of 1 of its
+            // subscriptions since `#target` stops it, with no mark.
+            if (
+                this.#held() ||
+                !this.#usable(target) ||
+                attempt.ids.some((id) => {
+                    const pending = state.pending[id];
+
+                    return pending !== undefined && this.#revokedSince(mark, pending.sub);
+                })
+            ) {
+                return undefined;
+            }
+
+            // The message before this change changes it: a hold after the write puts it back.
+            const kept = structuredClone(attempt);
 
             attempt.ids = attempt.ids.filter((id) => state.pending[id] !== undefined);
 
@@ -2531,10 +3056,30 @@ export class AgentBridge {
                 events: attempt.ids.map((id) => structuredClone(state.pending[id]!)),
                 waiting,
                 dropped: state.digest.dropped,
+                kept,
             };
         });
 
         if (go === undefined) {
+            return;
+        }
+
+        // The gates again, right before the delivery (no wait between them and it): a hold, a moved session or a revoke
+        // of 1 of its subscriptions puts the message back, and no try counts. The next try leaves out the events that
+        // the revoke deleted, and sends the others.
+        if (
+            this.#held() ||
+            !this.#usable(target) ||
+            go.events.some((each) => this.#revokedSince(mark, each.sub))
+        ) {
+            await this.#change((state) => {
+                if (state.digest.attempt === undefined) {
+                    return;
+                }
+
+                state.digest.attempt = go.kept;
+            });
+
             return;
         }
 
@@ -2671,9 +3216,19 @@ export class AgentBridge {
 
         try {
             session = await this.#session();
-        } catch {
+        } catch (error) {
+            // An unchecked events session is no failed try: the notice waits for the session's check.
+            if (error instanceof SessionUnchecked) {
+                return;
+            }
+
             await failed();
 
+            return;
+        }
+
+        // The gates right before the delivery: the session is the verified one, and nothing holds it.
+        if (!this.#usable(session) || this.#sessionWaits()) {
             return;
         }
 
@@ -2734,6 +3289,12 @@ type TeamApi = {
     roster: () => Promise<
         { id: string; name: string; home?: string; model?: string; mcp?: string[] }[]
     >;
+    /** Who a session is: its explicit identity first, the agent whose home holds its folder after (Team's rule). */
+    persona?: (
+        read: Pick<DocumentReader, "snapshot">,
+        conversationId: ConversationId,
+        context: Context,
+    ) => Promise<{ id: string; name: string } | undefined>;
     mcpScope?: (
         read: Pick<DocumentReader, "snapshot">,
         conversationId: ConversationId,
@@ -2742,6 +3303,8 @@ type TeamApi = {
 };
 
 const TEAM_API = Symbol.for("pi-pocket-team.team");
+/** Team's set of identity listeners, shared by every load (Team's `IDENTITY_LISTENERS`). */
+const IDENTITY_LISTENERS = Symbol.for("pi-pocket-team.identity-changed");
 /** The bridges by agent, shared by every load of this module: a new load waits until the old one's has stopped. */
 const RUNNING = Symbol.for("pi-pocket-team.events-bridge.running");
 /** The hidden tokens by agent, shared by every load: a reload keeps them hidden, with no gap. */
@@ -2749,6 +3312,16 @@ const HIDERS = Symbol.for("pi-pocket-team.events-bridge.hiders");
 
 const teamApi = (): TeamApi | undefined =>
     (globalThis as unknown as Record<symbol, TeamApi | undefined>)[TEAM_API];
+
+/** The listeners Team calls after a session's explicit identity changed (a `Set` on `globalThis`, made on first use). */
+const identityListeners = (): Set<(session: number) => void> => {
+    const shared = globalThis as unknown as Record<
+        symbol,
+        Set<(session: number) => void> | undefined
+    >;
+
+    return (shared[IDENTITY_LISTENERS] ??= new Set<(session: number) => void>());
+};
 
 /** 1 agent's bridge in the shared map: running, or ending (`stopping`). */
 export type Slot = { bridge: AgentBridge; stopping?: Promise<void> };
@@ -3112,6 +3685,19 @@ export default async function createEventsBridge(
         await hideStored();
     }
 
+    // Team tells every module when a session's explicit identity changes: each bridge checks its events session again
+    // before the next delivery. The set is shared, so a reload of either side keeps the listener that is there now.
+    const onIdentityChanged = (session: number) => {
+        for (const bridge of mine.values()) {
+            bridge.identityChanged(session);
+        }
+    };
+
+    if (ready) {
+        identityListeners().add(onIdentityChanged);
+        web.onDispose(() => identityListeners().delete(onIdentityChanged));
+    }
+
     const first = setTimeout(() => void sweep(), 1_000);
     const every = setInterval(() => void sweep(), 10 * 60_000);
 
@@ -3141,6 +3727,42 @@ export default async function createEventsBridge(
         );
     }
 
+    /**
+     * Checks the identity of each recorded events session that this process has not verified yet: Team says who the
+     * session is (its explicit identity first, its folder after), and the bridge then delivers to it or marks it gone.
+     * When Team is off, or a read throws, nothing is proven: the session waits for a later check.
+     */
+    const checkIdentities = async (
+        read: Pick<DocumentReader, "snapshot">,
+        context: Context,
+    ): Promise<void> => {
+        if (teamApi()?.persona === undefined) {
+            return;
+        }
+
+        for (const bridge of mine.values()) {
+            const check = bridge.identityToCheck();
+
+            if (check === undefined) {
+                continue;
+            }
+
+            let persona: { id: string; name: string } | undefined;
+
+            try {
+                persona = await teamApi()?.persona?.(
+                    read,
+                    check.session as unknown as ConversationId,
+                    context,
+                );
+            } catch {
+                continue;
+            }
+
+            await bridge.identity(check.session, persona?.id, check.epoch);
+        }
+    };
+
     /** The gate of a tool call: the agent's bridge, or an error that says why not. */
     const gated = async (
         api: { conversationId: ConversationId } & Pick<DocumentReader, "snapshot">,
@@ -3156,7 +3778,12 @@ export default async function createEventsBridge(
             throw new Error(`The events bridge is not for this session: ${gate.why}.`);
         }
 
-        return { ...gate, bridge: await bridgeOf(gate.agent, gate.gateway) };
+        const bridge = await bridgeOf(gate.agent, gate.gateway);
+
+        // A tool call has a reader too: the recorded events session's identity is checked here as well.
+        await checkIdentities(api, context);
+
+        return { ...gate, bridge };
     };
 
     const text = (value: string) => ({ output: [{ type: "text" as const, text: value }] });
@@ -3342,19 +3969,13 @@ export default async function createEventsBridge(
                     return undefined;
                 }
 
+                // The identity check of the recorded events sessions, in any session's turn: it reads those sessions,
+                // not this one, so this session's own scope does not matter. A read that fails proves nothing.
+                await checkIdentities(input.read, context);
+
                 const scope = await teamApi()
                     ?.mcpScope?.(input.read, input.conversationId, context)
                     .catch(() => undefined);
-
-                // The identity check of the events sessions: a read that failed (blocked) proves nothing.
-                if (scope?.kind === "agent" || scope?.kind === "root") {
-                    for (const bridge of mine.values()) {
-                        bridge.identity(
-                            Number(input.conversationId),
-                            scope.kind === "agent" ? scope.id : undefined,
-                        );
-                    }
-                }
 
                 if (scope?.kind !== "agent") {
                     return undefined;
