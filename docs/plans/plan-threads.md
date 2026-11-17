@@ -230,8 +230,12 @@ type PlanTask = {
             noChange?: { reason: string; evidence: string }; // at most 1000 and 5000 characters
         };
     }[];
-    /** Carried from an older graph as done, with the planning session's reason (section 5.4). */
-    carried?: { graph: number; why: string };
+    /**
+     * Carried from an older graph as done, with the planning session's reason (section 5.4). `recheck`: set by the desk
+     * when a dep of the carried task is not carried (the why says why that change does not touch it): the whole-plan
+     * check rechecks the task (#178 P7). Absent in older graphs.
+     */
+    carried?: { graph: number; why: string; recheck?: true };
 };
 
 type Consult = {
@@ -388,11 +392,24 @@ leaves every attempt as it was, and sets the named tasks back to `ready`, so the
 
 **Carry.** A new graph (after a scope change) can mark a task as carried from the approved graph only when the task
 is `done` there (by the rule in section 5.3, so a task that is waiting, delegated, stopped or named by a failed round is
-not), and all of these are the same: the id, the agent, the repository, optional `after`, the acceptance lines, and the deps, and every
-dep is itself carried. The desk checks this; the planning session's reason does not replace it.
+not), and all of these are the same: the id, the agent, the repository, optional `after`, the acceptance lines, and the
+deps. The desk checks this; the planning session's reason does not replace it.
 The planning session gives a reason for each carried task (`carried.why`), and the page shows the carried tasks at
 Approve. A carried task keeps its attempts and stays `done`. Every other task is new work. A graph whose tasks are all
 carried goes from `approved` straight to `verifying` in the Approve commit (section 5.1).
+
+**A dep that is not carried (#178 P7).** Every dep of a carried task is normally carried too. It may be new work instead,
+when the carried task's `why` names that dep as a word and says why the dep's change does not touch it: the desk then
+stores `carried.recheck: true` in `plan tasks` (`draftGraph`), and the caller never gives the field. A graph that was
+stored without `recheck` keeps the older rule, and its dep is refused. The whole-plan brief lists each recheck task in
+its `Recheck:` line, and `plan verify` refuses an entry for it whose evidence has no `rechecked`. A later scope change keeps the mark on a carried task while no verification round bound to the
+approval of its graph (`verification.bound`) passed that task, also when every dep is carried by then (`needsRecheck`).
+
+**A running task that stays the same (#178 P6).** A task of the approved graph that still runs (it is `delegated`, or it
+has an open attempt) refuses the approval only when the new graph changes it or leaves it out: `agent`, `repo`, `after`,
+the acceptance lines (in order) or the deps (`taskChange`). When the new graph keeps it unchanged, the approval goes: the
+task keeps its open attempt and its state (`delegated`), starts no second delivery (it is not `ready`, so `plan-approved`
+names no task for it), and the plan is `building`. The plan thread's event says `; kept running: t3 (T3)`.
 
 ## 6. The Desk page on a phone
 
@@ -809,17 +826,19 @@ Each line below differs from the design above, or settles what it left open, and
   commit, sends with a request id made from the key and the target, and tries 3 times, 60 seconds apart (counted from
   each failure, by the task clock); after that, 1 event on the plan thread and 1 notice. A closed thread, or one with
   no address, gets no message.
-- **Approve is refused while a task of the old approved graph is delegated** ("t3 is delegated (T575): wait for its
-  end, or stop it with Stop and revise"). Decision 5 lets unnamed tasks go on; this keeps 2 workers from ever doing 1
-  task. Once the task is done, the next graph can carry it. The scope change's news, the planning session's message
-  and the `plan revise` answer name each task that still runs ("The approval waits for these running tasks to end; no
-  second scope change can stop them while this one is in force: t2 (T5).", #178 P6).
+- **Approve is refused while a changed or missing task of the old approved graph runs** ("t3 is delegated (T575):
+  wait for its end, or stop it with Stop and revise"). Decision 5 lets unnamed tasks go on; this keeps 2 workers from
+  ever doing 1 task. A task that the new graph keeps unchanged is kept instead: it goes on with its open attempt, and
+  no second delivery starts (#178 P6). Once the task is done, the next graph can carry it. The scope change's news, the
+  planning session's message and the `plan revise` answer name each task that still runs ("Approval waits for t2 (T5)
+  unless the new graph keeps t2 unchanged; no second scope change can stop it while this one is in force.", #178 P6).
 - **A watch's pass on a task thread with no PR is refused** while its attempt is open and it has no merged PR, no PR
   that is open or not read yet, and no `plan nochange`: the close would make the task ready again, and a second
   delivery would do it again (#178 P4). A fail is never refused.
 - **The carry rule is checked in `plan tasks`, in `plan ready`, and again at Approve**, because the old graph can change
   after the draft (a failed round, a stopped task). `carried.why` is 1 to 300 characters on 1 line; the desk sets
-  `carried.graph`. At Approve, a carried task takes its attempts from the old graph again.
+  `carried.graph`, and `carried.recheck` when a dep of the task is not carried (#178 P7). At Approve, a carried task
+  takes its attempts from the old graph again.
 - **An all-carried approval sends only `plan-verify`**, not `plan-approved`: nothing is left to delegate.
 
 **Delivery and verification**

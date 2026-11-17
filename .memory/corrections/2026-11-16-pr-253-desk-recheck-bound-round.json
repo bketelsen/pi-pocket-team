@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "desk.ts",
+  "correction": "an owed recheck was discharged by any passing round with a time at or after the approval, so a round of an older approval could discharge it; only a round whose verification thread is bound to the approval of the graph that marked the recheck discharges it now",
+  "evidence": "bketelsen/pi-pocket-team#253: cross-review (openai/gpt-6.1-sol) re-review 1 of 35ad74e0c724813306d8a39a0f3592e0f3846df6, finding 1 (medium, blocking)",
+  "promoted_to": "desk-plans.test.ts: a later scope change keeps a recheck that no round passed (#178 P7, PR #253 review)"
+}

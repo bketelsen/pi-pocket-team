@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "desk.ts",
+  "correction": "taskChange compared deps as a sorted list, so a repeated dep id made an unchanged running task look changed and refused the approval; deps now compare as a set",
+  "evidence": "bketelsen/pi-pocket-team#253: cross-review (openai/gpt-6.1-sol) of 6e46f3058dcb8d5dab3cc974af2ac6d58a07c1bd, finding 2 (medium, blocking)",
+  "promoted_to": "desk-plans.test.ts: deps compare as a set: their order and a repeated id change nothing (PR #253 review)"
+}
