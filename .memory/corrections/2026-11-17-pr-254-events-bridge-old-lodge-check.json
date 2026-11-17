@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-17",
+  "scope": "events-bridge.ts",
+  "correction": "a lodge check of the events bridge that a pause and a sign-in overtook could still pause the bridge or reconcile its subscriptions with its old answer; an old check now changes nothing",
+  "evidence": "bketelsen/pi-pocket-team#254: cross-review (openai/gpt-6.1-sol) of 68044e837faa1f54c3fc54aaa05debdff89c763f, finding 3 (medium, blocking)",
+  "promoted_to": "events-bridge.test.ts: a lodge check that a sign-in overtook changes nothing"
+}

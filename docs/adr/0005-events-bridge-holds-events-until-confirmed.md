@@ -31,7 +31,10 @@ tool call, a prompt section, a route) can read Team's document.
   Team calls the listeners in `Symbol.for("pi-pocket-team.identity-changed")`
   after each explicit identity change; the bridge then asks again, and a read
   that started before the change counts for nothing. A session that the bridge
-  makes counts as confirmed. When Team names another agent or none, the next
+  makes counts as confirmed only when its start began in this process (a start
+  marked in the store before a restart can return an older session for the
+  same key). Each delivery checks the gates again right before it calls Pocket.
+  When Team names another agent or none, the next
   delivery makes a new session.
 - No event leaves the bridge (batch, digest, `events_pending`) while it is
   paused, or before lodge confirmed the client in this process: at start and

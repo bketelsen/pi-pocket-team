@@ -123,6 +123,10 @@ export const TAKEN_KEEP = 100;
 export const NOTICE_RETRY_MS = 30_000;
 /** A pull waits this long for an event; lodge allows 60 s at most. */
 export const PULL_MS = 30_000;
+/** Why events_pending holds the events: the events session waits for Team's identity check. */
+export const SESSION_HELD = "your events session waits for Team's identity check";
+/** Why events_pending holds the events: lodge has not confirmed this client and its subscriptions in this process. */
+export const LODGE_HELD = "lodge has not confirmed the subscriptions yet";
 /** The redirect address of the sign-in. Nothing listens there: the owner pastes the address the browser shows. */
 export const SIGN_IN_REDIRECT = "http://127.0.0.1:8792/events-bridge/callback";
 /** A subscription's name, as lodge takes it. */
@@ -229,6 +233,11 @@ export type AgentState = {
     session?: { id: number; generation: number; gone?: true };
     /** Events sessions made so far: each start has its own key. */
     generation: number;
+    /**
+     * The generation of a session start that began. A start with the same key after a restart can return a session made
+     * before it, which no check confirmed: then the session is not verified, and it waits for a check.
+     */
+    starting?: number;
     /** `tries` and `nextAt`: the notice's tries; a notice that did not go waits longer each time. */
     paused?: {
         reason: string;
@@ -1726,6 +1735,11 @@ export class AgentBridge {
         try {
             listed = await this.#deps.lodge.list();
         } catch (error) {
+            // An answer of an old check changes nothing: no pause, no revoke.
+            if (epoch !== this.#lodgeEpoch) {
+                return false;
+            }
+
             if (error instanceof AuthRequired) {
                 await this.#authFailed(error);
             }
@@ -1737,10 +1751,19 @@ export class AgentBridge {
             return false;
         }
 
+        // The list of a check that a pause or a sign-in overtook is old: it reconciles nothing.
+        if (epoch !== this.#lodgeEpoch) {
+            return false;
+        }
+
         const there = new Set(listed.value.map((each) => each.name));
 
         for (const name of Object.keys(this.#state!.subs)) {
             if (!there.has(name)) {
+                if (epoch !== this.#lodgeEpoch) {
+                    return false;
+                }
+
                 await this.#resubscribe(name, "lodge does not list it");
             }
         }
@@ -2008,9 +2031,14 @@ export class AgentBridge {
             return this.#heldAnswer(this.#state!, `paused: ${paused.reason}`);
         }
 
+        // The events session waits for Team's check: it takes no event yet.
+        if (this.#sessionWaits()) {
+            return this.#heldAnswer(this.#state!, SESSION_HELD);
+        }
+
         // Only an event that can go needs lodge's confirmation: with none, there is nothing to hold.
         if (!this.#lodgeChecked && this.#giveable().length > 0 && !(await this.checkLodge())) {
-            return this.#heldAnswer(this.#state!, "lodge has not confirmed the subscriptions yet");
+            return this.#heldAnswer(this.#state!, LODGE_HELD);
         }
 
         return this.#change((state) => {
@@ -2020,9 +2048,17 @@ export class AgentBridge {
                 return done;
             }
 
-            // A pause that came during the check: nothing goes.
+            // A hold that came during the checks: nothing goes, and the answer is kept for no call.
             if (state.paused !== undefined) {
                 return this.#heldAnswer(state, `paused: ${state.paused.reason}`);
+            }
+
+            if (this.#sessionWaits()) {
+                return this.#heldAnswer(state, SESSION_HELD);
+            }
+
+            if (!this.#lodgeChecked && this.#giveable(state).length > 0) {
+                return this.#heldAnswer(state, LODGE_HELD);
             }
 
             const digest = this.#giveable(state);
@@ -2151,7 +2187,8 @@ export class AgentBridge {
      * The standing events session, checked at each delivery: it is there, not archived, in the agent's home, and its
      * identity is the one this process verified. Else a new one, `<Agent> events` in the agent's home, with a key of its
      * own, from the sign-in's conversation. A recorded session that no check confirmed yet throws `SessionUnchecked`:
-     * its folder alone does not say whose it is.
+     * its folder alone does not say whose it is. A session made now counts as confirmed only when this start began in
+     * this process: one that a restarted start has to reuse (the same key) may be older, so it waits for a check.
      */
     async #session(): Promise<number> {
         const state = this.#state!;
@@ -2174,6 +2211,16 @@ export class AgentBridge {
         const generation = state.generation + 1;
         // The identity this new session is made under: an identity change while it starts needs a check after it.
         const epoch = this.#identityEpoch;
+        // A start of this generation began before: the same key can give back a session made before that start.
+        const replay = state.starting === generation;
+
+        // The mark goes first, in its own write: a start cut off after this leaves the mark, and its session waits.
+        if (!replay) {
+            await this.#change((next) => {
+                next.starting = generation;
+            });
+        }
+
         const id = await this.#deps.sessions.start(
             state.source,
             {
@@ -2187,12 +2234,15 @@ export class AgentBridge {
         await this.#change((next) => {
             next.generation = generation;
             next.session = { id, generation };
+            delete next.starting;
         });
 
-        // A session made in the agent's home is the agent's: no check is needed, unless Team said otherwise meanwhile.
-        if (this.#identityEpoch === epoch) {
-            this.#verified = id;
+        // A session whose start began in this process, under this identity, is the agent's. A replayed start is not.
+        if (replay || this.#identityEpoch !== epoch) {
+            throw new SessionUnchecked(id);
         }
+
+        this.#verified = id;
 
         return id;
     }
@@ -2522,11 +2572,23 @@ export class AgentBridge {
         // After the waits: the batch as the store has it now, and the try marked before it starts.
         const go = await this.#change((state) => {
             const batch = state.batches[batchId];
-            const sub = batch === undefined ? undefined : state.subs[batch.sub];
 
             if (batch === undefined) {
                 return undefined;
             }
+
+            // The gates, right before the try: a pause or an identity change since `#target` stops it, with no mark.
+            if (this.#held() || this.#verified !== target) {
+                return undefined;
+            }
+
+            // The batch and its wakes before this change changes them: a hold after the write puts them back.
+            const kept = structuredClone(batch);
+            const wakes =
+                state.wakes[batch.sub] === undefined
+                    ? undefined
+                    : structuredClone(state.wakes[batch.sub]);
+            const sub = state.subs[batch.sub];
 
             const ids = batch.events.filter((id) => state.pending[id] !== undefined);
 
@@ -2572,10 +2634,35 @@ export class AgentBridge {
             batch.target = target;
             batch.inflight = true;
 
-            return { sub, events: ids.map((id) => structuredClone(state.pending[id]!)) };
+            return {
+                sub,
+                events: ids.map((id) => structuredClone(state.pending[id]!)),
+                kept,
+                wakes,
+            };
         });
 
         if (go === undefined) {
+            return;
+        }
+
+        // The gates again, right before the delivery (no wait between them and it): a hold puts the store back, and
+        // no try counts and no batch moves.
+        if (this.#held() || this.#verified !== target) {
+            await this.#change((state) => {
+                if (state.batches[batchId] === undefined) {
+                    return;
+                }
+
+                state.batches[batchId] = go.kept;
+
+                if (go.wakes === undefined) {
+                    delete state.wakes[go.kept.sub];
+                } else {
+                    state.wakes[go.kept.sub] = go.wakes;
+                }
+            });
+
             return;
         }
 
@@ -2786,6 +2873,14 @@ export class AgentBridge {
                 return undefined;
             }
 
+            // The gates, right before the try: a pause or an identity change since `#target` stops it, with no mark.
+            if (this.#held() || this.#verified !== target) {
+                return undefined;
+            }
+
+            // The message before this change changes it: a hold after the write puts it back.
+            const kept = structuredClone(attempt);
+
             attempt.ids = attempt.ids.filter((id) => state.pending[id] !== undefined);
 
             if (attempt.ids.length === 0) {
@@ -2820,10 +2915,25 @@ export class AgentBridge {
                 events: attempt.ids.map((id) => structuredClone(state.pending[id]!)),
                 waiting,
                 dropped: state.digest.dropped,
+                kept,
             };
         });
 
         if (go === undefined) {
+            return;
+        }
+
+        // The gates again, right before the delivery (no wait between them and it): a hold puts the message back, and
+        // no try counts.
+        if (this.#held() || this.#verified !== target) {
+            await this.#change((state) => {
+                if (state.digest.attempt === undefined) {
+                    return;
+                }
+
+                state.digest.attempt = go.kept;
+            });
+
             return;
         }
 
@@ -2968,6 +3078,11 @@ export class AgentBridge {
 
             await failed();
 
+            return;
+        }
+
+        // The gates right before the delivery: the session is the verified one, and nothing holds it.
+        if (this.#verified !== session || this.#sessionWaits()) {
             return;
         }
 
