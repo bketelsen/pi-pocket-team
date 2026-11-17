@@ -6245,24 +6245,38 @@ describe("the approval of a new graph", () => {
         assert.equal(taskOf(v3, "t1").carried?.recheck, undefined);
         assert.equal(carryProblem(made.plan, v3.tasks), undefined);
 
-        // A round since the approval of v2 that passed t2 discharges the recheck.
-        made.plan.verification = {
-            threads: [],
-            rounds: [
-                {
-                    at: tick(14),
-                    by: "lucilla",
-                    reviewer: "openai/gpt-6.1-sol",
-                    heads: {},
-                    pass: false,
-                    tasks: [
-                        { task: "t1", pass: true, evidence: "Fine." },
-                        { task: "t2", pass: true, evidence: "Rechecked: fine." },
-                        { task: "t3", pass: false, evidence: "Not done." },
-                    ],
-                    key: "verify:1",
-                },
+        /** 1 round of thread `thread` that passed t2, at `at`. */
+        const passedT2 = (thread: string, key: string, at: number) => ({
+            at,
+            by: "lucilla",
+            reviewer: "openai/gpt-6.1-sol",
+            heads: {},
+            pass: false,
+            tasks: [
+                { task: "t1", pass: true, evidence: "Fine." },
+                { task: "t2", pass: true, evidence: "Rechecked: fine." },
+                { task: "t3", pass: false, evidence: "Not done." },
             ],
+            key,
+            thread,
+        });
+
+        // A round of the older approval passed t2, at a later time: a time does not bind it, so the recheck stays.
+        made.plan.verification = {
+            threads: ["T20"],
+            bound: { T20: { rev: made.plan.rev, graph: 1, approval: "approve:1" } },
+            rounds: [passedT2("T20", "verify:1", tick(14))],
+        };
+        assert.equal(needsRecheck(made.plan, v3Tasks, taskOf(v3, "t2")), true);
+
+        // A round bound to the approval of v2 that passed t2 discharges the recheck.
+        made.plan.verification = {
+            threads: ["T20", "T21"],
+            bound: {
+                T20: { rev: made.plan.rev, graph: 1, approval: "approve:1" },
+                T21: { rev: made.plan.rev, graph: 2, approval: "approve:2" },
+            },
+            rounds: [passedT2("T20", "verify:1", tick(14)), passedT2("T21", "verify:2", tick(15))],
         };
         assert.equal(needsRecheck(made.plan, v3Tasks, taskOf(v3, "t2")), false);
     });

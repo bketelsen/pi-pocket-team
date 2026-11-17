@@ -17802,7 +17802,7 @@ export function taskChange(
 
 /**
  * Whether a carried task needs a recheck in the new graph: it keeps a dep that is not carried in the same graph, or the
- * approved graph marked it for a recheck that no verification round since that approval passed. A later scope change
+ * approved graph marked it for a recheck that no verification round bound to that graph's approval passed. A later scope change
  * never drops a recheck that is still owed (#178 P7).
  */
 export function needsRecheck(plan: Plan, tasks: readonly PlanTask[], task: PlanTask): boolean {
@@ -17821,10 +17821,14 @@ export function needsRecheck(plan: Plan, tasks: readonly PlanTask[], task: PlanT
     }
 
     const approval = [...plan.approvals].reverse().find((each) => each.graph === approved.version);
+    const bound = plan.verification?.bound ?? {};
 
+    // Only a round bound to that approval discharges the recheck: a time does not say which approval a round checked.
     return !(plan.verification?.rounds ?? []).some(
         (round) =>
-            round.at >= (approval?.at ?? 0) &&
+            approval !== undefined &&
+            round.thread !== undefined &&
+            bound[round.thread]?.approval === approval.key &&
             round.tasks.some((each) => each.task === task.id && each.pass),
     );
 }
