@@ -334,6 +334,68 @@ export function reviewedHeads(data, ctx) {
 }
 
 /**
+ * The worker models of each reviewed PR, sorted and distinct. Explicit PR calls join only that PR; calls with no PR
+ * join the session's work since the last round of another PR, through this PR's last round call. Earlier spawns set
+ * the model of later sends; a send with no spawn is not worker work. A worker with no model is `(parent)`.
+ */
+export function prWorkers(data, ctx) {
+    const heads = reviewedHeads(data, ctx).filter((item) => item.ref !== null);
+    const sessions = new Map();
+    const models = new Map();
+
+    for (const item of heads) {
+        const prs = sessions.get(item.session) ?? new Map();
+        const span = prs.get(item.ref) ?? { first: item.at, last: item.at };
+
+        span.first = Math.min(span.first, item.at);
+        span.last = Math.max(span.last, item.at);
+        prs.set(item.ref, span);
+        sessions.set(item.session, prs);
+        models.set(item.ref, models.get(item.ref) ?? new Set());
+    }
+
+    for (const [session, prs] of sessions) {
+        for (const [ref, span] of prs) {
+            span.start = heads
+                .filter(
+                    (item) => item.session === session && item.ref !== ref && item.at < span.first,
+                )
+                .reduce((latest, item) => Math.max(latest, item.at), -Infinity);
+        }
+    }
+
+    const latestSpawn = new Map();
+
+    for (const item of reviewCalls(data)) {
+        const { call, key } = item;
+
+        if (call.action === "spawn") {
+            latestSpawn.set(key, call);
+        }
+
+        const spawn = latestSpawn.get(key);
+
+        if (item.round || !spawn || isCrossReviewSpawn(spawn)) {
+            continue;
+        }
+
+        const model =
+            typeof spawn.model === "string" && spawn.model.length > 0 ? spawn.model : "(parent)";
+
+        for (const [ref, span] of sessions.get(call.c) ?? []) {
+            if (
+                call.at <= span.last &&
+                (item.pr.ref === ref || (item.pr.ref === null && call.at > span.start))
+            ) {
+                models.get(ref).add(model);
+            }
+        }
+    }
+
+    return new Map([...models].map(([ref, values]) => [ref, [...values].sort()]));
+}
+
+/**
  * The cross-review rounds of the window, oldest first: `{ ref, head, at, session, reviewer }`; `ref` may be null. The
  * earlier calls set the rounds and the PRs, and are not counted.
  */

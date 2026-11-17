@@ -986,6 +986,73 @@ test("Q1's lines: review rounds, 3-failure stops and CI reruns follow decided ac
     assert.match(missing, /- CI reruns: no flaky scan\./);
 });
 
+const q1WorkerReport = (workers: object, available = true) =>
+    renderReport(
+        baseReport({
+            date: "2026-11-15",
+            ctx: { ...ctx, now: Date.parse("2026-11-16T04:30:00Z") },
+            metrics: {
+                Q1: {
+                    day: { complete: true, prs: [] },
+                    window: { days: 30, covered: 0 },
+                    totals: { acceptance: null, merged: 0, closedUnmerged: 0, reverted: 0 },
+                    rounds: { available: true, totals: { prs: 8, median: 2, p90: 3 } },
+                    prRounds: { available, workers },
+                },
+            },
+        }),
+    );
+
+test("Q1's worker line gives 2 New York weeks, models by PR count, none last and n/a for missing weeks", () => {
+    const lines = q1WorkerReport({
+        "deepseek/deepseek-flash": {
+            prs: 2,
+            weeks: { "2026-11-02": { prs: 2, mean: 3 } },
+        },
+        none: { prs: 1, weeks: { "2026-11-09": { prs: 1, mean: 1 } } },
+        "openai/gpt-6.1-sol": {
+            prs: 5,
+            weeks: {
+                "2026-11-09": { prs: 2, mean: 1.5 },
+                "2026-11-02": { prs: 3, mean: 2 },
+            },
+        },
+    }).split("\n");
+    const at = lines.findIndex((line) => line.startsWith("- Review rounds ("));
+
+    assert.ok(at >= 0);
+    assert.equal(
+        lines[at + 1],
+        "- Review rounds by worker model (mean reviewed heads per PR, week of 2026-11-09 and week of 2026-11-02): openai/gpt-6.1-sol 1.5 over 2 and 2 over 3; deepseek/deepseek-flash n/a over 0 and 3 over 2; none 1 over 1 and n/a over 0.",
+    );
+});
+
+test("Q1's worker line caps models at 6, breaks PR-count ties by name and keeps none last", () => {
+    const workers = Object.fromEntries(
+        ["g", "f", "e", "d", "c", "b", "a"].map((label) => [label, { prs: 1, weeks: {} }]),
+    );
+    const line = q1WorkerReport(workers)
+        .split("\n")
+        .find((line) => line.startsWith("- Review rounds by worker model"));
+
+    assert.equal(
+        line,
+        "- Review rounds by worker model (mean reviewed heads per PR, week of 2026-11-09 and week of 2026-11-02): a n/a over 0 and n/a over 0; b n/a over 0 and n/a over 0; c n/a over 0 and n/a over 0; d n/a over 0 and n/a over 0; e n/a over 0 and n/a over 0; f n/a over 0 and n/a over 0; none n/a over 0 and n/a over 0.",
+    );
+});
+
+test("Q1's worker line is absent without available model-attributed PRs", () => {
+    assert.doesNotMatch(q1WorkerReport({}), /Review rounds by worker model/);
+    assert.doesNotMatch(
+        q1WorkerReport({ none: { prs: 1, weeks: {} } }),
+        /Review rounds by worker model/,
+    );
+    assert.doesNotMatch(
+        q1WorkerReport({ "other/model": { prs: 1, weeks: {} } }, false),
+        /Review rounds by worker model/,
+    );
+});
+
 test("the metrics show R2's table after the R1 lines, a rate only from 10 decided, and nothing with 0 routes", () => {
     const row = (over = {}) => ({
         tierRule: "v1",
@@ -1048,7 +1115,7 @@ test("the metrics show R2's table after the R1 lines, a rate only from 10 decide
     );
     assert.match(
         markdown,
-        /\n\| tier rule \| tier \| arm \| assigned \| count \| accepted \| pending \| unknown \| decided \| rate \| cost per accepted \| median rounds \| hand fixes \| deviations \|\n\|---/,
+        /\n\| tier rule \| tier \| arm \| assigned \| count \| accepted \| pending \| unknown \| decided \| rate \| cost per accepted \| median rounds per PR \| hand fixes \| deviations \|\n\|---/,
     );
     assert.match(
         markdown,

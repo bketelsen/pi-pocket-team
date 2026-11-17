@@ -3731,6 +3731,8 @@ test("loadData and Q1: a spawn 60 days ago with a send and a blocking answer 29 
             calls: 1,
             first: new Date(NOW - 29 * DAY).toISOString().slice(0, 16) + "Z",
             last: new Date(NOW - 29 * DAY).toISOString().slice(0, 16) + "Z",
+            worker: "none",
+            models: [],
         },
     ]);
     assert.deepEqual(

@@ -12,6 +12,7 @@ import {
     headIn,
     ownersOf,
     prRefsIn,
+    prWorkers,
     reviewPoints,
     reviewRounds,
     reviewedHeads,
@@ -418,6 +419,126 @@ test("reviewRounds and reviewPoints: a spawn 60 days ago still sets the round an
         ),
         [["acme/widgets#4", SHA_C, "1"]],
     );
+});
+
+// ---------- prWorkers ----------
+
+const workerSpawn = (
+    id: number,
+    at: number,
+    model: string | null,
+    name = "coder",
+    refs: string[] = [],
+) => ({
+    id,
+    c: t1.session,
+    at,
+    action: "spawn",
+    name,
+    model,
+    tools: null,
+    review: false,
+    brief: "Write the code",
+    refs,
+    bare: [],
+    head: null,
+});
+
+test("prWorkers: a worker spawn with no model contributes (parent)", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, null),
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(prWorkers(data, { now: NOW }), new Map([["acme/widgets#4", ["(parent)"]]]));
+});
+
+test("prWorkers: 2 worker models are distinct and sorted", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol", "worker-gpt"),
+            workerSpawn(2, at + MINUTE, "deepseek/deepseek-flash", "worker-deepseek"),
+            workerSpawn(3, at + 2 * MINUTE, "openai/gpt-6.1-sol", "worker-gpt-again"),
+            {
+                ...spawn(4, at + 3 * MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["deepseek/deepseek-flash", "openai/gpt-6.1-sol"]]]),
+    );
+});
+
+test("prWorkers: a send with no earlier spawn contributes no model", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            { ...send(1, at, { refs: ["acme/widgets#4"] }), name: "missing-worker" },
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(prWorkers(data, { now: NOW }), new Map([["acme/widgets#4", []]]));
+});
+
+test("prWorkers: a call at the last review counts, but a later explicit-PR worker call does not", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "deepseek/deepseek-flash", "early"),
+            { ...spawn(2, at, { refs: ["acme/widgets#4"], head: SHA_A }), model: "other/model" },
+            workerSpawn(3, at + MINUTE, "openai/gpt-6.1-sol", "late", ["acme/widgets#4"]),
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["deepseek/deepseek-flash"]]]),
+    );
+});
+
+test("prWorkers: before start, only a worker call that names the PR counts", () => {
+    const at = ago(DAY);
+    const workersOf = (refs: string[]) =>
+        prWorkers(
+            emptyData({
+                threads: threadMap(t1),
+                reviewCalls: [
+                    workerSpawn(1, at, "openai/gpt-6.1-sol", "coder", refs),
+                    {
+                        ...spawn(2, at + MINUTE, { refs: ["acme/widgets#3"], head: SHA_A }),
+                        model: "other/model",
+                    },
+                    {
+                        ...spawn(3, at + 2 * MINUTE, { refs: ["acme/widgets#4"], head: SHA_B }),
+                        model: "other/model",
+                    },
+                ],
+            }),
+            { now: NOW },
+        );
+
+    // The worker is before #3's review (the start for #4) and before #4's last review.
+    assert.deepEqual(workersOf([]).get("acme/widgets#4"), []);
+    assert.deepEqual(workersOf(["acme/widgets#4"]).get("acme/widgets#4"), ["openai/gpt-6.1-sol"]);
+    assert.deepEqual(workersOf(["acme/widgets#4"]).get("acme/widgets#3"), []);
 });
 
 // ---------- reviewedHeads ----------
