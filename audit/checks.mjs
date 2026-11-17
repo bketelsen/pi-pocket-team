@@ -3407,6 +3407,7 @@ function r2Numbers(list) {
         .reduce((sum, item) => sum + item.cost, 0);
     const roundsByRef = new Map();
 
+    // Every item uses the same roundsByRef source, so a ref's first pair equals all its later pairs.
     for (const item of list) {
         for (const [ref, rounds] of item.prRounds ?? []) {
             if (!roundsByRef.has(ref)) {

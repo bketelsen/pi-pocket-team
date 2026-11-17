@@ -2,7 +2,7 @@
 // and answers. No real text is here.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DAY, MINUTE } from "./common.mjs";
+import { DAY, MINUTE, newYorkWeek } from "./common.mjs";
 import { NOW, ago, emptyData, thread, threadMap } from "./fixtures/builders.mjs";
 import {
     ANSWER,
@@ -539,6 +539,105 @@ test("prWorkers: before start, only a worker call that names the PR counts", () 
     assert.deepEqual(workersOf([]).get("acme/widgets#4"), []);
     assert.deepEqual(workersOf(["acme/widgets#4"]).get("acme/widgets#4"), ["openai/gpt-6.1-sol"]);
     assert.deepEqual(workersOf(["acme/widgets#4"]).get("acme/widgets#3"), []);
+});
+
+test("prWorkers: a pre-window PR round excludes earlier no-PR work from a window PR", () => {
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, ago(31.5 * DAY), "openai/gpt-6.1-sol"),
+            {
+                ...spawn(2, ago(31 * DAY), { refs: ["acme/widgets#3"], head: SHA_A }),
+                model: "other/model",
+            },
+            {
+                ...spawn(3, ago(DAY), { refs: ["acme/widgets#4"], head: SHA_B }),
+                model: "other/model",
+            },
+            send(4, ago(DAY) + MINUTE, { head: SHA_C }),
+        ],
+    });
+
+    // #3 is outside the result window, but still sets the start boundary for #4.
+    assert.deepEqual(prWorkers(data, { now: NOW }), new Map([["acme/widgets#4", []]]));
+});
+
+test("prWorkers: a worker call naming 2 desk-owner PRs contributes to both", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol", "coder", ["acme/widgets#4", "acme/widgets#5"]),
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+            {
+                ...spawn(3, at + 2 * MINUTE, { refs: ["acme/widgets#5"], head: SHA_B }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([
+            ["acme/widgets#4", ["openai/gpt-6.1-sol"]],
+            ["acme/widgets#5", ["openai/gpt-6.1-sol"]],
+        ]),
+    );
+});
+
+test("prWorkers: a round with no PR is no start boundary", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol"),
+            { ...spawn(2, at + MINUTE, {}), model: "other/model" },
+            {
+                ...spawn(3, at + 2 * MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["openai/gpt-6.1-sol"]]]),
+    );
+});
+
+test("prWorkers: a call naming only another owner's PR counts as no-PR work", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol", "coder", ["stranger/widgets#9"]),
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["openai/gpt-6.1-sol"]]]),
+    );
+});
+
+test("newYorkWeek: Monday boundaries follow New York dates across both DST changes", () => {
+    for (const [time, week] of [
+        ["2026-11-16T04:30Z", "2026-11-09"],
+        ["2026-11-16T05:30Z", "2026-11-16"],
+        ["2026-11-01T05:30Z", "2026-10-26"],
+        ["2026-11-02T04:30Z", "2026-10-26"],
+        ["2026-11-02T05:30Z", "2026-11-02"],
+        ["2026-03-09T03:30Z", "2026-03-02"],
+    ]) {
+        assert.equal(newYorkWeek(Date.parse(time!)), week, time);
+    }
 });
 
 // ---------- reviewedHeads ----------

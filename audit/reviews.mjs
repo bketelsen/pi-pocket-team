@@ -334,39 +334,44 @@ export function reviewedHeads(data, ctx) {
 }
 
 /**
- * The worker models of each reviewed PR, sorted and distinct. Explicit PR calls join only that PR; calls with no PR
- * join the session's work since the last round of another PR, through this PR's last round call. Earlier spawns set
- * the model of later sends; a send with no spawn is not worker work. A worker with no model is `(parent)`.
+ * The worker models of each PR reviewed in the window, sorted and distinct. Spans and their start boundaries use
+ * all round calls with a PR, with no time window; a round with no PR is no boundary. Explicit PR calls join each
+ * desk-owner PR they name; `callPr` keeps only desk-owner refs, so a call naming only another owner's PR has no PR.
+ * Calls with no PR join the session's work since the last round of another PR before this PR's first round, through
+ * this PR's last round call. Earlier spawns set the model of later sends; a send with no spawn is not worker work.
+ * A worker with no model is `(parent)`.
  */
 export function prWorkers(data, ctx) {
     const heads = reviewedHeads(data, ctx).filter((item) => item.ref !== null);
+    const calls = reviewCalls(data);
+    const rounds = calls.filter((item) => item.round && item.pr.ref !== null);
     const sessions = new Map();
-    const models = new Map();
+    const models = new Map(heads.map((item) => [item.ref, new Set()]));
 
-    for (const item of heads) {
-        const prs = sessions.get(item.session) ?? new Map();
-        const span = prs.get(item.ref) ?? { first: item.at, last: item.at };
+    for (const { call, pr } of rounds) {
+        const prs = sessions.get(call.c) ?? new Map();
+        const span = prs.get(pr.ref) ?? { first: call.at, last: call.at };
 
-        span.first = Math.min(span.first, item.at);
-        span.last = Math.max(span.last, item.at);
-        prs.set(item.ref, span);
-        sessions.set(item.session, prs);
-        models.set(item.ref, models.get(item.ref) ?? new Set());
+        span.first = Math.min(span.first, call.at);
+        span.last = Math.max(span.last, call.at);
+        prs.set(pr.ref, span);
+        sessions.set(call.c, prs);
     }
 
     for (const [session, prs] of sessions) {
         for (const [ref, span] of prs) {
-            span.start = heads
+            span.start = rounds
                 .filter(
-                    (item) => item.session === session && item.ref !== ref && item.at < span.first,
+                    (item) =>
+                        item.call.c === session && item.pr.ref !== ref && item.call.at < span.first,
                 )
-                .reduce((latest, item) => Math.max(latest, item.at), -Infinity);
+                .reduce((latest, item) => Math.max(latest, item.call.at), -Infinity);
         }
     }
 
     const latestSpawn = new Map();
 
-    for (const item of reviewCalls(data)) {
+    for (const item of calls) {
         const { call, key } = item;
 
         if (call.action === "spawn") {
@@ -384,8 +389,11 @@ export function prWorkers(data, ctx) {
 
         for (const [ref, span] of sessions.get(call.c) ?? []) {
             if (
+                models.has(ref) &&
                 call.at <= span.last &&
-                (item.pr.ref === ref || (item.pr.ref === null && call.at > span.start))
+                (item.pr.ref === ref ||
+                    item.pr.refs.includes(ref) ||
+                    (item.pr.ref === null && call.at > span.start))
             ) {
                 models.get(ref).add(model);
             }
