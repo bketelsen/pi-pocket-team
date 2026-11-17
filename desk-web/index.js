@@ -439,7 +439,9 @@ export const taskLine = (task) =>
         task.repo,
         task.state,
         `deps: ${(task.deps ?? []).join(", ") || "none"}`,
-        task.carried === undefined ? "" : `carried: ${task.carried.why}`,
+        task.carried === undefined
+            ? ""
+            : `carried${task.carried.recheck === true ? " (recheck)" : ""}: ${task.carried.why}`,
     ]
         .filter(Boolean)
         .join(" · ");

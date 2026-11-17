@@ -5116,7 +5116,7 @@ describe("a scope change", () => {
             {
                 supervisor: 7,
                 to: "session-31",
-                text: '[desk] Plan T1 is under revision ("The key moves."), by Brian. Stopped tasks: t1 (T2); the other tasks go on. The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: t3 (T3). Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.',
+                text: '[desk] Plan T1 is under revision ("The key moves."), by Brian. Stopped tasks: t1 (T2); the other tasks go on. Approval waits for t3 (T3) unless the new graph keeps t3 unchanged; no second scope change can stop it while this one is in force. Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.',
                 requestId: planSendId("T1", "revise:1", "planning"),
             },
         ]);
@@ -5126,7 +5126,7 @@ describe("a scope change", () => {
         // The approval waits for t3, which still runs: the news says so (#178 P6).
         assert.equal(
             done.item.line,
-            '[desk] T1 plan under revision by Brian: "The key moves.". Stopped: t1 (T2). The other tasks go on. The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: t3 (T3). No new task is delegated until Brian approves a new revision.',
+            '[desk] T1 plan under revision by Brian: "The key moves.". Stopped: t1 (T2). The other tasks go on. Approval waits for t3 (T3) unless the new graph keeps t3 unchanged; no second scope change can stop it while this one is in force. No new task is delegated until Brian approves a new revision.',
         );
         assert(state.threads.T2?.events.some((event) => event.key === "plan-stopped:revise:1"));
     });
@@ -5151,6 +5151,16 @@ describe("a scope change", () => {
 
         assert.deepEqual(runningTasks(plan), ["t1 (T2)", "t3 (T3)"]);
         assert.equal(approvalWaitText([]), "");
+        // 1 running task: the approval waits for it, unless the new graph keeps it unchanged (#178 P6).
+        assert.equal(
+            approvalWaitText(["t3 (T3)"]),
+            " Approval waits for t3 (T3) unless the new graph keeps t3 unchanged; no second scope change can stop it while this one is in force.",
+        );
+        // 2 running tasks: each one holds the approval.
+        assert.equal(
+            approvalWaitText(["t2 (T5)", "t3 (T6)"]),
+            " Approval waits for t2 (T5), t3 (T6), each unless the new graph keeps it unchanged; no second scope change can stop them while this one is in force.",
+        );
         // While a scope change is in force, a second one (Stop and revise, plan revise) is refused: the words never
         // offer it (#181 review).
         assert.doesNotMatch(approvalWaitText(["t3 (T3)"]), /Stop and revise/);
@@ -5620,6 +5630,25 @@ describe("the carry rule", () => {
         );
     });
 
+    test("a changed task is refused even when the desk marked it for a recheck (#178 P7)", () => {
+        const { plan } = revisedPlan();
+
+        assert.equal(
+            carryProblem(
+                plan,
+                carried({
+                    acceptance: ["The ISO is signed twice."],
+                    carried: {
+                        graph: 1,
+                        why: "t3 is merged, and its change does not touch this.",
+                        recheck: true,
+                    },
+                }),
+            ),
+            "t1 is carried, but its acceptance lines changed: a changed task is new work.",
+        );
+    });
+
     test("a task that is not done, not in the graph, or whose dep is not carried is refused", () => {
         const { plan, graph } = revisedPlan();
 
@@ -5743,6 +5772,52 @@ describe("the approval of a new graph", () => {
             ids.includes(task.id) ? { ...task, carried: { graph: 1, why: "It is merged." } } : task,
         );
 
+    /**
+     * The building plan with t1 merged, a scope change that names nothing, and a draft graph that keeps t3 unchanged:
+     * t3 still runs on T3 (#178 P6).
+     */
+    function redraftedKeeping(): {
+        state: DeskState;
+        plan: Plan;
+        old: TaskGraph;
+        draft: TaskGraph;
+    } {
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        assert(
+            !(
+                "error" in
+                revisePlan(made.state, "T1", {
+                    key: "revise:1",
+                    by: "Brian",
+                    at: tick(6),
+                    why: "Add a step.",
+                    tasks: [],
+                })
+            ),
+        );
+        assert(
+            !(
+                "error" in
+                draftGraph(made.state, "T1", {
+                    key: "graph:2",
+                    at: tick(7),
+                    rev: made.plan.rev,
+                    tasks: withCarry(["t1"]),
+                })
+            ),
+        );
+        assert(!("error" in readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) })));
+
+        return {
+            state: made.state,
+            plan: made.plan,
+            old: made.graph,
+            draft: made.plan.graphs.at(-1) ?? assert.fail("a draft"),
+        };
+    }
+
     test("a carried task keeps its attempts and stays done; a task after it is ready; the scope change ends", () => {
         const { state, plan, old, draft } = redrafted(withCarry(["t1"]));
         const attempts = JSON.stringify(taskOf(old, "t1").attempts);
@@ -5776,39 +5851,120 @@ describe("the approval of a new graph", () => {
         assert.match(done.item.line, /t2, t3/);
     });
 
-    test("approve is refused while a task of the old graph is delegated", () => {
-        // The scope change names nothing that is delegated here: t3 stays delegated on T3 (decision 5).
-        const made = buildingPlan();
+    test("an unchanged running task is kept: it goes on, and no second delivery starts", () => {
+        const { state, plan, old, draft } = redraftedKeeping();
+        const attempts = JSON.stringify(taskOf(old, "t3").attempts);
 
-        merged(made.graph, "t1", tick(5));
-        revisePlan(made.state, "T1", {
-            key: "revise:1",
-            by: "Brian",
-            at: tick(6),
-            why: "Add a step.",
-            tasks: [],
-        });
-        draftGraph(made.state, "T1", {
-            key: "graph:2",
-            at: tick(7),
-            rev: made.plan.rev,
-            tasks: withCarry(["t1"]),
-        });
-        assert(!("error" in readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) })));
-        assert.equal(taskOf(made.graph, "t3").state, "delegated");
+        const done = approve(state, plan);
 
-        const snapshot = JSON.stringify(made.state);
-        const refused = approve(made.state, made.plan);
+        assert(!("error" in done), "the new graph is approved");
+        assert.equal(plan.state, "building", "a task already runs");
+        assert.equal(draft.state, "approved");
+        assert.equal(old.state, "superseded");
+        // t3 is unchanged in the new graph: it keeps its open attempt and goes on.
+        assert.equal(taskOf(draft, "t3").state, "delegated");
+        assert.equal(JSON.stringify(taskOf(draft, "t3").attempts), attempts);
+        assert.equal(taskOf(draft, "t3").attempts.at(-1)?.thread, "T3");
+        assert.equal(taskOf(draft, "t3").attempts.at(-1)?.end, undefined);
+        assert.equal(
+            deliverCheck(state, "T1", "t3", { agent: "teg", repo: "frostyard/nsl" }),
+            "t3 is delegated: a task starts when it is ready.",
+        );
+        // The ready tasks are the new work only: no second delivery of t3.
+        assert.equal(taskOf(draft, "t2").state, "ready", "its dep is carried as done");
+        assert.equal(done.item.kind, "plan-approved");
+        assert.match(done.item.line, /\{ id: "T1", task \}: t2\.$/);
+        assert(
+            state.threads.T1?.events.some((event) => event.text.includes("kept running: t3 (T3)")),
+            "the plan thread names the kept task",
+        );
+    });
+
+    test("a replayed approval of a kept graph changes nothing", () => {
+        const { state, plan } = redraftedKeeping();
+
+        assert(!("error" in approve(state, plan)));
+
+        const snapshot = JSON.stringify(state);
+        const again = approvePlan(state, "T1", {
+            rev: plan.rev,
+            graph: 2,
+            key: "approve:2",
+            by: "brian",
+            at: tick(9),
+        });
+
+        assert(!("error" in again) && again.replay);
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("approve is refused while a changed or missing task of the old graph runs", () => {
+        /** The building plan with t1 merged, its scope change drafted with these tasks, and ready. */
+        const draftedWith = (newTasks: PlanTask[]) => {
+            const made = buildingPlan();
+
+            merged(made.graph, "t1", tick(5));
+            assert(
+                !(
+                    "error" in
+                    revisePlan(made.state, "T1", {
+                        key: "revise:1",
+                        by: "Brian",
+                        at: tick(6),
+                        why: "Add a step.",
+                        tasks: [],
+                    })
+                ),
+            );
+            assert(
+                !(
+                    "error" in
+                    draftGraph(made.state, "T1", {
+                        key: "graph:2",
+                        at: tick(7),
+                        rev: made.plan.rev,
+                        tasks: newTasks,
+                    })
+                ),
+            );
+            assert(!("error" in readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) })));
+            assert.equal(taskOf(made.graph, "t3").state, "delegated");
+
+            return made;
+        };
+
+        // t3 still runs on T3 (decision 5), and the new graph changes it: the approval is refused.
+        const changed = draftedWith(
+            withCarry(["t1"]).map((task) =>
+                task.id === "t3"
+                    ? { ...task, acceptance: ["The check is published twice."] }
+                    : task,
+            ),
+        );
+        const snapshot = JSON.stringify(changed.state);
+        const refused = approve(changed.state, changed.plan);
 
         assert.equal(
             (refused as { error: string }).error,
             "t3 is delegated (T3): wait for its end, or stop it with Stop and revise.",
         );
-        assert.equal(JSON.stringify(made.state), snapshot);
+        assert.equal(JSON.stringify(changed.state), snapshot);
 
-        // t3 ends as merged: the approval goes.
-        merged(made.graph, "t3", tick(9));
-        assert(!("error" in approve(made.state, made.plan)));
+        // t3 left out of the new graph: it is refused too.
+        const missing = draftedWith(withCarry(["t1"]).filter((task) => task.id !== "t3"));
+
+        assert.equal(
+            (approve(missing.state, missing.plan) as { error: string }).error,
+            "t3 is delegated (T3): wait for its end, or stop it with Stop and revise.",
+        );
+
+        // t3 ends as merged: the approval goes, and the draft has t3 as new work.
+        merged(changed.graph, "t3", tick(9));
+        assert(!("error" in approve(changed.state, changed.plan)));
+        assert.equal(
+            taskOf(changed.plan.graphs.at(-1) ?? assert.fail("a draft"), "t3").state,
+            "ready",
+        );
     });
 
     test("the carry rule is checked again at the approval", () => {
@@ -5898,6 +6054,89 @@ describe("the approval of a new graph", () => {
             renderTasks(draft),
             /- \*\*t1\*\* Sign the ISO .* · carried as done: It is merged\./,
         );
+    });
+
+    test("a carried task may keep a dep that is not carried, and the desk marks it for a recheck (#178 P7)", () => {
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        planFacts(made.state, "T1", tick(5));
+        // t2 runs after t1, and its PR merges: its dep t1 is done.
+        taskThread(made.state, "T4");
+        assert(!("error" in startTask(made.state, "T1", "t2", "T4", tick(6))));
+        prOn(made.state, "T4", "frostyard/snow#2", "MERGED");
+        planFacts(made.state, "T1", tick(6));
+        assert.equal(taskOf(made.graph, "t2").state, "done");
+
+        /** The new graph: t1 changed, t2 carried with this why, and t3 as it is. */
+        const newTasks = (why: string): PlanTask[] =>
+            threeTasks().map((task) =>
+                task.id === "t2"
+                    ? { ...task, carried: { graph: 1, why } }
+                    : task.id === "t1"
+                      ? { ...task, acceptance: ["The ISO is signed.", "The log names the key."] }
+                      : task,
+            );
+        const why = "t1's new acceptance line does not touch the signature check.";
+
+        assert(
+            !(
+                "error" in
+                revisePlan(made.state, "T1", {
+                    key: "revise:1",
+                    by: "Brian",
+                    at: tick(7),
+                    why: "Add a step.",
+                    tasks: ["t3"],
+                })
+            ),
+        );
+        assert(
+            !(
+                "error" in
+                draftGraph(made.state, "T1", {
+                    key: "graph:2",
+                    at: tick(7),
+                    rev: made.plan.rev,
+                    tasks: newTasks(why),
+                })
+            ),
+        );
+
+        const draft = made.plan.graphs.at(-1) ?? assert.fail("a draft");
+
+        assert.deepEqual(taskOf(draft, "t2").carried, { graph: 1, why, recheck: true });
+        assert.equal(taskOf(draft, "t1").carried, undefined, "a changed task is new work");
+
+        // The desk marks the recheck; a why that does not name the dep is refused, with its own words.
+        assert.equal(
+            carryProblem(
+                made.plan,
+                newTasks("The new line does not touch the check.").map((task) =>
+                    task.id === "t2" && task.carried !== undefined
+                        ? {
+                              ...task,
+                              carried: {
+                                  graph: 1,
+                                  why: task.carried.why,
+                                  recheck: true as const,
+                              },
+                          }
+                        : task,
+                ),
+            ),
+            "t2 is carried, but its dep t1 is not carried: name t1 in its carried why, and say why its change does not touch t2.",
+        );
+
+        assert(!("error" in readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) })));
+
+        const attempts = JSON.stringify(taskOf(made.graph, "t2").attempts);
+
+        assert(!("error" in approve(made.state, made.plan)));
+        assert.equal(made.plan.state, "approved");
+        assert.equal(taskOf(draft, "t2").state, "done");
+        assert.equal(JSON.stringify(taskOf(draft, "t2").attempts), attempts);
+        assert.equal(taskOf(draft, "t1").state, "ready", "the changed task is new work");
     });
 });
 
@@ -7575,6 +7814,60 @@ describe("the whole-plan check", () => {
         );
         assert.equal(JSON.stringify(state), snapshot);
     });
+
+    test("a carried task with a dep that changed is checked again: its evidence says rechecked (#178 P7)", () => {
+        const { state, graph } = verifyingPlan();
+        const t2 = taskOf(graph, "t2");
+
+        t2.carried = { graph: 1, why: "t1's new line does not touch it.", recheck: true };
+        deliverVerify(state, "T5");
+
+        const snapshot = JSON.stringify(state);
+        const refused = recordVerify(state, "T1", {
+            key: "verify:1",
+            at: tick(15),
+            thread: "T5",
+            reviewer: "openai/gpt-6.1-sol",
+            tasks: allTasks(),
+        });
+
+        assert.equal(
+            (refused as { error: string }).error,
+            't2 is carried for a recheck: its evidence says "rechecked" and what was rechecked.',
+        );
+        assert.equal(JSON.stringify(state), snapshot, "a refusal changes nothing");
+
+        // A fail is refused in the same way.
+        assert.equal(
+            (
+                recordVerify(state, "T1", {
+                    key: "verify:1",
+                    at: tick(15),
+                    thread: "T5",
+                    reviewer: "openai/gpt-6.1-sol",
+                    tasks: allTasks(["t2"]),
+                }) as { error: string }
+            ).error,
+            't2 is carried for a recheck: its evidence says "rechecked" and what was rechecked.',
+        );
+        assert.equal(JSON.stringify(state), snapshot);
+
+        // The evidence says what was rechecked: the round is recorded.
+        const done = recordVerify(state, "T1", {
+            key: "verify:1",
+            at: tick(15),
+            thread: "T5",
+            reviewer: "openai/gpt-6.1-sol",
+            tasks: allTasks().map((each) =>
+                each.task === "t2"
+                    ? { ...each, evidence: "Rechecked: the new key signs the ISO." }
+                    : each,
+            ),
+        });
+
+        assert(!("error" in done) && !done.replay, "the round is recorded");
+        assert.equal(done.pass, true);
+    });
 });
 
 describe("the task and verify briefs", () => {
@@ -7666,6 +7959,41 @@ describe("the task and verify briefs", () => {
             /Rounds so far: 0; 0 failed since the approval\. The budget is 1 review and 3 re-reviews/,
         );
         assert.match(brief, /plan \{ action: "verify", reviewer:/);
+    });
+
+    test("the verify brief names a carried task that a dep change sends to a recheck (#178 P7)", () => {
+        const made = buildingPlan();
+        const plain = planVerifyBrief(made.plan, "Snow ISO signing", made.graph);
+
+        assert.doesNotMatch(plain, /Recheck:/, "no recheck task, no line");
+        assert.doesNotMatch(
+            planAttemptsText(made.graph, quoted).join("\n"),
+            /carried for a recheck/,
+        );
+
+        taskOf(made.graph, "t2").carried = {
+            graph: 1,
+            why: "t1's new line does not touch it.",
+            recheck: true,
+        };
+
+        const brief = planVerifyBrief(made.plan, "Snow ISO signing", made.graph);
+
+        assert(
+            brief.includes(
+                'Recheck: t2 is carried as done, but a dep changed: check each again against its acceptance lines and its deps, and write "rechecked" in its evidence.',
+            ),
+            "the brief names the recheck task",
+        );
+        // It is in foot, before the line that records the result.
+        assert(
+            brief.indexOf("Recheck:") <
+                brief.indexOf('Record the result with plan { action: "verify"'),
+        );
+        assert.match(
+            planAttemptsText(made.graph, quoted).join("\n"),
+            /^- t2 Verify the signature · lucilla in frostyard\/snow · waiting · carried for a recheck$/m,
+        );
     });
 });
 
@@ -9158,6 +9486,16 @@ const model = scriptedModel((request) => {
         return answer("ok");
     }
 
+    if (text.endsWith("plan recheck start test")) {
+        return call("team_delegate", {
+            agent: "lucilla",
+            repository: "home",
+            title: "Recheck plan",
+            task: "Sign the ISO twice.",
+            plan: { start: true },
+        });
+    }
+
     if (text.endsWith("plan start test")) {
         return call("team_delegate", {
             agent: "lucilla",
@@ -9290,6 +9628,31 @@ const model = scriptedModel((request) => {
                     repo: "frostyard/nsl",
                     acceptance: ["The check is published."],
                     carried: { why: "It merged, and the key change does not touch it." },
+                },
+            ],
+        });
+    }
+
+    if (text.endsWith("plan tasks recheck test")) {
+        return call("plan", {
+            action: "tasks",
+            rev: writeRev,
+            tasks: [
+                {
+                    id: "t1",
+                    title: "Sign the ISO",
+                    agent: "lucilla",
+                    repo: "frostyard/snow",
+                    acceptance: ["The ISO is signed.", "The log names the key."],
+                },
+                {
+                    id: "t2",
+                    title: "Check the signature",
+                    agent: "lucilla",
+                    repo: "frostyard/snow",
+                    acceptance: ["The signature verifies."],
+                    deps: ["t1"],
+                    carried: { why: "t1's new line does not touch the check." },
                 },
             ],
         });
@@ -12627,6 +12990,182 @@ describe("with the Pi Pocket app", () => {
         assert.equal(graph.tasks.find((each) => each.id === "t3")?.state, "done");
         assert.equal(graph.tasks.find((each) => each.id === "t1")?.state, "ready");
         assert.equal(graph.tasks.find((each) => each.id === "t2")?.state, "waiting");
+    });
+
+    test("the plan tasks tool marks a carried task whose dep is not carried for a recheck (#178 P7)", async () => {
+        const source = await supervisor("plan-recheck");
+        const at = Date.now();
+        // Earlier tests of this file leave their plans open: this plan gets a place of its own, then the settings go back.
+        const settings = readFileSync(configPath, "utf8");
+        let plan: string | undefined;
+        let rev = "";
+
+        /** A thread for one attempt of the graph, as a delivery leaves it. */
+        const attemptThread = (id: string): string => `T${String(80 + Number(id.slice(1)))}`;
+
+        writeFileSync(
+            configPath,
+            JSON.stringify({
+                digest: { minutes: 0 },
+                cap: 100,
+                plans: { root: plansFolder, max: 20 },
+            }),
+        );
+
+        try {
+            await say(app, source, "plan recheck start test");
+            await until(
+                async () =>
+                    Object.values((await deskSnapshot())?.threads ?? {}).some(
+                        (each) => each.origin === "plan" && each.title === "Recheck plan",
+                    ),
+                "the plan thread",
+                20_000,
+            );
+
+            const started = Object.values((await deskSnapshot())?.threads ?? {}).find(
+                (each) => each.origin === "plan" && each.title === "Recheck plan",
+            );
+
+            plan = started?.id ?? assert.fail("the plan thread");
+
+            const planning = started?.session as ConversationId;
+
+            // The plan of the test, from the desk's document.
+            const mine = async (): Promise<Plan | undefined> =>
+                planOf(await deskSnapshot(), plan ?? "");
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const stored = planOf(state, plan ?? "") ?? assert.fail("the plan");
+
+                delete stored.pending;
+                assert(
+                    !(
+                        "error" in
+                        draftGraph(state, plan ?? "", {
+                            key: "graph:recheck",
+                            at,
+                            rev: stored.rev,
+                            tasks: [
+                                {
+                                    id: "t1",
+                                    title: "Sign the ISO",
+                                    agent: "lucilla",
+                                    repo: "frostyard/snow",
+                                    acceptance: ["The ISO is signed."],
+                                    deps: [],
+                                    state: "waiting",
+                                    attempts: [],
+                                },
+                                {
+                                    id: "t2",
+                                    title: "Check the signature",
+                                    agent: "lucilla",
+                                    repo: "frostyard/snow",
+                                    acceptance: ["The signature verifies."],
+                                    deps: ["t1"],
+                                    state: "waiting",
+                                    attempts: [],
+                                },
+                            ],
+                        })
+                    ),
+                );
+                assert(!("error" in readyPlan(state, plan ?? "", { key: "ready:recheck", at })));
+                assert(
+                    !(
+                        "error" in
+                        approvePlan(state, plan ?? "", {
+                            rev: stored.rev,
+                            graph: 1,
+                            key: "approve:recheck",
+                            by: "brian",
+                            at,
+                        })
+                    ),
+                );
+
+                // Both tasks merged, as a sweep leaves them: t2 is done, and so is its dep t1.
+                const graph = stored.graphs[0] ?? assert.fail("the approved graph");
+
+                for (const id of ["t1", "t2"]) {
+                    const task = graph.tasks.find((each) => each.id === id) ?? assert.fail(id);
+
+                    taskThread(state, attemptThread(id));
+                    task.state = "done";
+                    task.attempts = [
+                        {
+                            thread: attemptThread(id),
+                            at,
+                            prs: [{ ref: "frostyard/snow#7", head: "d".repeat(40) }],
+                            end: { at, how: "merged" },
+                        },
+                    ];
+                }
+
+                // A scope change in force: the planning session drafts the new graph.
+                assert(
+                    !(
+                        "error" in
+                        revisePlan(state, plan ?? "", {
+                            key: "revise:recheck",
+                            by: "Brian",
+                            at,
+                            why: "Add a step.",
+                            tasks: [],
+                        })
+                    ),
+                );
+                rev = stored.rev;
+            }, context);
+
+            writeRev = rev;
+            await say(app, planning, "plan tasks recheck test");
+            await until(
+                async () => ((await mine())?.graphs.length ?? 0) === 2,
+                "the new draft graph",
+                20_000,
+            );
+
+            const stored = (await mine()) ?? assert.fail("the plan");
+            const draft = stored.graphs.at(-1) ?? assert.fail("the draft graph");
+            const t2 = draft.tasks.find((each) => each.id === "t2") ?? assert.fail("t2");
+
+            assert.equal(draft.state, "draft");
+            // The caller gave only a why: the desk set the recheck itself.
+            assert.deepEqual(t2.carried, {
+                graph: 1,
+                why: "t1's new line does not touch the check.",
+                recheck: true,
+            });
+            assert.equal(
+                draft.tasks.find((each) => each.id === "t1")?.carried,
+                undefined,
+                "the changed task is new work",
+            );
+        } finally {
+            if (plan !== undefined) {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const stored = planOf(state, plan ?? "");
+
+                    if (
+                        stored !== undefined &&
+                        stored.state !== "done" &&
+                        stored.state !== "dropped"
+                    ) {
+                        dropPlan(state, plan ?? "", {
+                            by: "brian",
+                            why: "the test ends",
+                            at: Date.now(),
+                        });
+                    }
+                }, context);
+            }
+
+            writeFileSync(configPath, settings);
+        }
     });
 
     test("the task sessions record no change, and the plan verifies after a restart", async () => {
