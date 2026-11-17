@@ -4,7 +4,17 @@
 // source: the functions take the findings, the earlier days and the LLM result, and return plain values.
 import fs from "node:fs";
 import path from "node:path";
-import { HOUR, MINUTE, SECRET, iso, money, moneyFine, newYorkClock } from "./common.mjs";
+import {
+    DAY,
+    HOUR,
+    MINUTE,
+    SECRET,
+    iso,
+    money,
+    moneyFine,
+    newYorkClock,
+    newYorkWeek,
+} from "./common.mjs";
 
 /** Weight of a severity in the rank. */
 export const WEIGHT = { high: 3, medium: 2, low: 1 };
@@ -305,8 +315,8 @@ const unique = (list) => [...new Set(list)];
 
 const plural = (count, word, many = `${word}s`) => `${count} ${count === 1 ? word : many}`;
 
-/** Q1's lines after decided acceptance: review rounds, 3-failure stops and CI reruns. */
-const q1Lines = (q1) => {
+/** Q1's lines after decided acceptance: review rounds, weekly worker means, 3-failure stops and CI reruns. */
+const q1Lines = (q1, now) => {
     const lines = [];
     const { rounds, stops, ciReruns } = q1;
 
@@ -317,6 +327,30 @@ const q1Lines = (q1) => {
             rounds.available
                 ? `- Review rounds (30 days, reviewed heads per PR): ${plural(t.prs, "PR")}, median ${t.median ?? "n/a"}, P90 ${t.p90 ?? "n/a"}.`
                 : `- Review rounds: not available (${rounds.reason}).`,
+        );
+    }
+
+    const workers = q1.prRounds?.available === true ? q1.prRounds.workers : undefined;
+    const labels = Object.keys(workers ?? {})
+        .filter((label) => label !== "none")
+        .sort((a, b) => workers[b].prs - workers[a].prs || a.localeCompare(b))
+        .slice(0, 6);
+
+    if (labels.length > 0) {
+        const week = newYorkWeek(now);
+        const weeks = [week, newYorkWeek(Date.parse(`${week}T12:00:00Z`) - 7 * DAY)];
+        const values = [...labels, "none"].map((label) => {
+            const means = weeks.map((week) => {
+                const row = workers[label]?.weeks?.[week];
+
+                return row?.prs > 0 ? `${row.mean} over ${row.prs}` : "n/a over 0";
+            });
+
+            return `${label} ${means.join(" and ")}`;
+        });
+
+        lines.push(
+            `- Review rounds by worker model (mean reviewed heads per PR, week of ${weeks[0]} and week of ${weeks[1]}): ${values.join("; ")}.`,
         );
     }
 
@@ -364,7 +398,7 @@ const r2Lines = (r2) => {
     const lines = [
         `- R2: routed threads end to end (${plural(r2.routes, "thread")}, ${r2.windowDays}-day revert window; rounds: last 30 days).`,
         "",
-        "| tier rule | tier | arm | assigned | count | accepted | pending | unknown | decided | rate | cost per accepted | median rounds | hand fixes | deviations |",
+        "| tier rule | tier | arm | assigned | count | accepted | pending | unknown | decided | rate | cost per accepted | median rounds per PR | hand fixes | deviations |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         ...rows
             .slice(0, R2_ROWS)
@@ -427,7 +461,7 @@ const r2Lines = (r2) => {
     return lines;
 };
 
-const metricLines = (metrics, github) => {
+const metricLines = (metrics, github, now) => {
     const lines = [];
     const a1 = metrics.A1;
     const a2 = metrics.A2;
@@ -565,7 +599,7 @@ const metricLines = (metrics, github) => {
         lines.push(
             `- Decided acceptance (${q1.window.days} days, ${q1.window.covered} covered): ${t.acceptance ?? "n/a"}, merged ${t.merged}, closed unmerged ${t.closedUnmerged}, reverted ${t.reverted}. Today's record: ${plural(day.prs.length, "PR")}${day.complete ? "" : ` (day record incomplete: ${day.reason})`}.`,
         );
-        lines.push(...q1Lines(q1));
+        lines.push(...q1Lines(q1, now));
     }
 
     lines.push(
@@ -793,7 +827,7 @@ export function renderReport({
         "",
         "## Metrics",
         "",
-        ...metricLines(metrics, github),
+        ...metricLines(metrics, github, ctx.now),
         "",
         "## Skipped checks",
         "",

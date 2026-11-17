@@ -334,6 +334,76 @@ export function reviewedHeads(data, ctx) {
 }
 
 /**
+ * The worker models of each PR reviewed in the window, sorted and distinct. Spans and their start boundaries use
+ * all round calls with a PR, with no time window; a round with no PR is no boundary. Explicit PR calls join each
+ * desk-owner PR they name; `callPr` keeps only desk-owner refs, so a call naming only another owner's PR has no PR.
+ * Calls with no PR join the session's work since the last round of another PR before this PR's first round, through
+ * this PR's last round call. Earlier spawns set the model of later sends; a send with no spawn is not worker work.
+ * A worker with no model is `(parent)`.
+ */
+export function prWorkers(data, ctx) {
+    const heads = reviewedHeads(data, ctx).filter((item) => item.ref !== null);
+    const calls = reviewCalls(data);
+    const rounds = calls.filter((item) => item.round && item.pr.ref !== null);
+    const sessions = new Map();
+    const models = new Map(heads.map((item) => [item.ref, new Set()]));
+
+    for (const { call, pr } of rounds) {
+        const prs = sessions.get(call.c) ?? new Map();
+        const span = prs.get(pr.ref) ?? { first: call.at, last: call.at };
+
+        span.first = Math.min(span.first, call.at);
+        span.last = Math.max(span.last, call.at);
+        prs.set(pr.ref, span);
+        sessions.set(call.c, prs);
+    }
+
+    for (const [session, prs] of sessions) {
+        for (const [ref, span] of prs) {
+            span.start = rounds
+                .filter(
+                    (item) =>
+                        item.call.c === session && item.pr.ref !== ref && item.call.at < span.first,
+                )
+                .reduce((latest, item) => Math.max(latest, item.call.at), -Infinity);
+        }
+    }
+
+    const latestSpawn = new Map();
+
+    for (const item of calls) {
+        const { call, key } = item;
+
+        if (call.action === "spawn") {
+            latestSpawn.set(key, call);
+        }
+
+        const spawn = latestSpawn.get(key);
+
+        if (item.round || !spawn || isCrossReviewSpawn(spawn)) {
+            continue;
+        }
+
+        const model =
+            typeof spawn.model === "string" && spawn.model.length > 0 ? spawn.model : "(parent)";
+
+        for (const [ref, span] of sessions.get(call.c) ?? []) {
+            if (
+                models.has(ref) &&
+                call.at <= span.last &&
+                (item.pr.ref === ref ||
+                    item.pr.refs.includes(ref) ||
+                    (item.pr.ref === null && call.at > span.start))
+            ) {
+                models.get(ref).add(model);
+            }
+        }
+    }
+
+    return new Map([...models].map(([ref, values]) => [ref, [...values].sort()]));
+}
+
+/**
  * The cross-review rounds of the window, oldest first: `{ ref, head, at, session, reviewer }`; `ref` may be null. The
  * earlier calls set the rounds and the PRs, and are not counted.
  */

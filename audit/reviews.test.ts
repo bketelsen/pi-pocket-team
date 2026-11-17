@@ -2,7 +2,7 @@
 // and answers. No real text is here.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DAY, MINUTE } from "./common.mjs";
+import { DAY, MINUTE, newYorkWeek } from "./common.mjs";
 import { NOW, ago, emptyData, thread, threadMap } from "./fixtures/builders.mjs";
 import {
     ANSWER,
@@ -12,6 +12,7 @@ import {
     headIn,
     ownersOf,
     prRefsIn,
+    prWorkers,
     reviewPoints,
     reviewRounds,
     reviewedHeads,
@@ -418,6 +419,225 @@ test("reviewRounds and reviewPoints: a spawn 60 days ago still sets the round an
         ),
         [["acme/widgets#4", SHA_C, "1"]],
     );
+});
+
+// ---------- prWorkers ----------
+
+const workerSpawn = (
+    id: number,
+    at: number,
+    model: string | null,
+    name = "coder",
+    refs: string[] = [],
+) => ({
+    id,
+    c: t1.session,
+    at,
+    action: "spawn",
+    name,
+    model,
+    tools: null,
+    review: false,
+    brief: "Write the code",
+    refs,
+    bare: [],
+    head: null,
+});
+
+test("prWorkers: a worker spawn with no model contributes (parent)", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, null),
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(prWorkers(data, { now: NOW }), new Map([["acme/widgets#4", ["(parent)"]]]));
+});
+
+test("prWorkers: 2 worker models are distinct and sorted", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol", "worker-gpt"),
+            workerSpawn(2, at + MINUTE, "deepseek/deepseek-flash", "worker-deepseek"),
+            workerSpawn(3, at + 2 * MINUTE, "openai/gpt-6.1-sol", "worker-gpt-again"),
+            {
+                ...spawn(4, at + 3 * MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["deepseek/deepseek-flash", "openai/gpt-6.1-sol"]]]),
+    );
+});
+
+test("prWorkers: a send with no earlier spawn contributes no model", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            { ...send(1, at, { refs: ["acme/widgets#4"] }), name: "missing-worker" },
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(prWorkers(data, { now: NOW }), new Map([["acme/widgets#4", []]]));
+});
+
+test("prWorkers: a call at the last review counts, but a later explicit-PR worker call does not", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "deepseek/deepseek-flash", "early"),
+            { ...spawn(2, at, { refs: ["acme/widgets#4"], head: SHA_A }), model: "other/model" },
+            workerSpawn(3, at + MINUTE, "openai/gpt-6.1-sol", "late", ["acme/widgets#4"]),
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["deepseek/deepseek-flash"]]]),
+    );
+});
+
+test("prWorkers: before start, only a worker call that names the PR counts", () => {
+    const at = ago(DAY);
+    const workersOf = (refs: string[]) =>
+        prWorkers(
+            emptyData({
+                threads: threadMap(t1),
+                reviewCalls: [
+                    workerSpawn(1, at, "openai/gpt-6.1-sol", "coder", refs),
+                    {
+                        ...spawn(2, at + MINUTE, { refs: ["acme/widgets#3"], head: SHA_A }),
+                        model: "other/model",
+                    },
+                    {
+                        ...spawn(3, at + 2 * MINUTE, { refs: ["acme/widgets#4"], head: SHA_B }),
+                        model: "other/model",
+                    },
+                ],
+            }),
+            { now: NOW },
+        );
+
+    // The worker is before #3's review (the start for #4) and before #4's last review.
+    assert.deepEqual(workersOf([]).get("acme/widgets#4"), []);
+    assert.deepEqual(workersOf(["acme/widgets#4"]).get("acme/widgets#4"), ["openai/gpt-6.1-sol"]);
+    assert.deepEqual(workersOf(["acme/widgets#4"]).get("acme/widgets#3"), []);
+});
+
+test("prWorkers: a pre-window PR round excludes earlier no-PR work from a window PR", () => {
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, ago(31.5 * DAY), "openai/gpt-6.1-sol"),
+            {
+                ...spawn(2, ago(31 * DAY), { refs: ["acme/widgets#3"], head: SHA_A }),
+                model: "other/model",
+            },
+            {
+                ...spawn(3, ago(DAY), { refs: ["acme/widgets#4"], head: SHA_B }),
+                model: "other/model",
+            },
+            send(4, ago(DAY) + MINUTE, { head: SHA_C }),
+        ],
+    });
+
+    // #3 is outside the result window, but still sets the start boundary for #4.
+    assert.deepEqual(prWorkers(data, { now: NOW }), new Map([["acme/widgets#4", []]]));
+});
+
+test("prWorkers: a worker call naming 2 desk-owner PRs contributes to both", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol", "coder", ["acme/widgets#4", "acme/widgets#5"]),
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+            {
+                ...spawn(3, at + 2 * MINUTE, { refs: ["acme/widgets#5"], head: SHA_B }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([
+            ["acme/widgets#4", ["openai/gpt-6.1-sol"]],
+            ["acme/widgets#5", ["openai/gpt-6.1-sol"]],
+        ]),
+    );
+});
+
+test("prWorkers: a round with no PR is no start boundary", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol"),
+            { ...spawn(2, at + MINUTE, {}), model: "other/model" },
+            {
+                ...spawn(3, at + 2 * MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["openai/gpt-6.1-sol"]]]),
+    );
+});
+
+test("prWorkers: a call naming only another owner's PR counts as no-PR work", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            workerSpawn(1, at, "openai/gpt-6.1-sol", "coder", ["stranger/widgets#9"]),
+            {
+                ...spawn(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_A }),
+                model: "other/model",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        prWorkers(data, { now: NOW }),
+        new Map([["acme/widgets#4", ["openai/gpt-6.1-sol"]]]),
+    );
+});
+
+test("newYorkWeek: Monday boundaries follow New York dates across both DST changes", () => {
+    for (const [time, week] of [
+        ["2026-11-16T04:30Z", "2026-11-09"],
+        ["2026-11-16T05:30Z", "2026-11-16"],
+        ["2026-11-01T05:30Z", "2026-10-26"],
+        ["2026-11-02T04:30Z", "2026-10-26"],
+        ["2026-11-02T05:30Z", "2026-11-02"],
+        ["2026-03-09T03:30Z", "2026-03-02"],
+    ]) {
+        assert.equal(newYorkWeek(Date.parse(time!)), week, time);
+    }
 });
 
 // ---------- reviewedHeads ----------

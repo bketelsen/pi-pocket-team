@@ -16,6 +16,7 @@ import {
     iso,
     median,
     newYorkDate,
+    newYorkWeek,
     quote,
     refsIn,
     safeLine,
@@ -23,6 +24,7 @@ import {
 import {
     REVIEW_WINDOW_DAYS,
     isCrossReviewSpawn,
+    prWorkers,
     reviewPoints,
     reviewedHeads,
     threadAt as q1ThreadAt,
@@ -2659,9 +2661,11 @@ const round2 = (value) => Math.round(value * 100) / 100;
  * send to a name whose latest spawn in that session was one. The PR of a call is the first desk-owner ref its message
  * names, else its bare PR number in its desk thread's repository; a send with none takes the PR of the latest earlier
  * call to that name. Per PR: `rounds` (its reviewed heads), `heads` (the distinct known heads of them), `calls` (all
- * its round calls, superseded ones too), `first` and `last` (its first and last round call). `totals.rounds` sums the
- * reviewed heads, `totals.calls` the round calls with a PR, and `unattributed` counts the round calls with no PR;
- * `mean`, `median`, `p90` and `atLeast3` are over the reviewed heads. No findings.
+ * its round calls, superseded ones too), `first` and `last` (its first and last round call), `worker` (`none`, 1 model,
+ * or `mixed`) and `models` (the sorted distinct worker models). `totals.rounds` sums the reviewed heads,
+ * `totals.calls` the round calls with a PR, and `unattributed` counts the round calls with no PR; `mean`, `median`,
+ * `p90` and `atLeast3` are over the reviewed heads. `workers` groups PR counts and round statistics by worker label,
+ * with `weeks` grouped by the Monday of each PR's last round call's New York date. No findings.
  */
 function q1PrRounds(data, ctx) {
     const unavailable = q1Unavailable(data, "reviews", "reviewCalls");
@@ -2671,6 +2675,41 @@ function q1PrRounds(data, ctx) {
     }
 
     const { rows, unattributed } = q1PrHeads(data, ctx);
+    const modelsOf = prWorkers(data, ctx);
+    const workers = {};
+    const prs = rows.map((row) => {
+        const models = modelsOf.get(row.ref) ?? [];
+        const worker = models.length === 0 ? "none" : models.length === 1 ? models[0] : "mixed";
+        const week = newYorkWeek(row.last);
+        const group = workers[worker] ?? { counts: [], weeks: {} };
+
+        group.counts.push(row.rounds);
+        group.weeks[week] = [...(group.weeks[week] ?? []), row.rounds];
+        workers[worker] = group;
+
+        return {
+            ref: row.ref,
+            rounds: row.rounds,
+            heads: row.heads,
+            calls: row.calls,
+            first: iso(row.first),
+            last: iso(row.last),
+            worker,
+            models,
+        };
+    });
+
+    const stats = (counts) => {
+        const rounds = counts.reduce((total, count) => total + count, 0);
+
+        return {
+            prs: counts.length,
+            rounds,
+            mean: round2(rounds / counts.length),
+            median: medianOrNull(counts),
+        };
+    };
+
     const counts = rows.map((row) => row.rounds);
     const sum = counts.reduce((total, count) => total + count, 0);
 
@@ -2688,14 +2727,26 @@ function q1PrRounds(data, ctx) {
             atLeast3: counts.filter((count) => count >= 3).length,
             unattributed,
         },
-        prs: rows.map((row) => ({
-            ref: row.ref,
-            rounds: row.rounds,
-            heads: row.heads,
-            calls: row.calls,
-            first: iso(row.first),
-            last: iso(row.last),
-        })),
+        workers: sortedKeys(
+            Object.fromEntries(
+                Object.entries(workers).map(([worker, group]) => [
+                    worker,
+                    {
+                        ...stats(group.counts),
+                        p90: p90(group.counts),
+                        weeks: sortedKeys(
+                            Object.fromEntries(
+                                Object.entries(group.weeks).map(([week, values]) => [
+                                    week,
+                                    stats(values),
+                                ]),
+                            ),
+                        ),
+                    },
+                ]),
+            ),
+        ),
+        prs,
     };
 }
 
@@ -3338,7 +3389,10 @@ function r2Reverts(prs) {
     return reverted;
 }
 
-/** The R2 numbers of some thread records: 1 row without its keys, or the totals. */
+/**
+ * The R2 numbers of some thread records: 1 row without its keys, or the totals. Review rounds per PR: a thread with
+ * 2 PRs gives 2 values. Each distinct PR ref contributes only its first pair across the records.
+ */
 function r2Numbers(list) {
     const count = (outcome) => list.filter((item) => item.outcome === outcome).length;
     const accepted = count("accepted");
@@ -3351,7 +3405,18 @@ function r2Numbers(list) {
                 item.cost !== null,
         )
         .reduce((sum, item) => sum + item.cost, 0);
-    const rounds = list.map((item) => item.rounds).filter((value) => value !== null);
+    const roundsByRef = new Map();
+
+    // Every item uses the same roundsByRef source, so a ref's first pair equals all its later pairs.
+    for (const item of list) {
+        for (const [ref, rounds] of item.prRounds ?? []) {
+            if (!roundsByRef.has(ref)) {
+                roundsByRef.set(ref, rounds);
+            }
+        }
+    }
+
+    const rounds = [...roundsByRef.values()];
     const blockers = list.map((item) => item.blockers).filter((value) => value !== null);
     const known = list.filter((item) => item.edits !== null);
     const workers = {};
@@ -3389,6 +3454,7 @@ function r2Numbers(list) {
                 : null,
         costPerAccepted: accepted === 0 ? null : dollars(decidedCost / accepted),
         medianRounds: rounds.length === 0 ? null : median(rounds),
+        roundPrs: rounds.length,
         blockers: blockers.length === 0 ? null : blockers.reduce((sum, value) => sum + value, 0),
         handFixRate:
             known.length === 0
@@ -3418,7 +3484,8 @@ function r2Numbers(list) {
  * (`R2_WHY`), and `reopenedBy` the rework kinds of the `reopened` ones (`reopenKind`; a thread counts each kind once),
  * and `reopenedNotRework` the other kinds of every thread's reopenings. Rounds and blocking points come from Q1's `prRounds` and `blockers` (the last 30 days only), hand fixes from
  * `parentEdits`: each is null (unknown) when its source is missing, and rounds and blocking points are null for a
- * thread with no PR. No GitHub call: Q1's stored records only.
+ * thread with no PR. Review rounds per PR: a thread with 2 PRs gives 2 values, with each ref counted once in the
+ * median and `roundPrs`. No GitHub call: Q1's stored records only.
  *
  * `eligible` is the share of routed night shifts a routed worker could take: no named worker, a Jev kind of
  * `R2_KINDS`, a bench repository, and a route that says no risk path is named (`riskPathNamed: false`; `null` or no
@@ -3555,10 +3622,14 @@ export function checkR2(data, ctx) {
             ],
             cost: costRows.length === 0 ? null : costRows.reduce((sum, row) => sum + row.cost, 0),
             // A thread with no PR has no rounds and no blocking points: unknown, not 0.
-            rounds:
+            prRounds:
                 roundsByRef === null || refs.length === 0
                     ? null
-                    : refs.reduce((sum, ref) => sum + (roundsByRef.get(ref) ?? 0), 0),
+                    : // A PR with no reviewed head in Q1's 30 days (no cross-review, or 1 before the window) has no
+                      // value: a 0 would pull the median down for PRs that were never reviewed in the window.
+                      refs
+                          .filter((ref) => roundsByRef.has(ref))
+                          .map((ref) => [ref, roundsByRef.get(ref)]),
             blockers:
                 points === null || refs.length === 0
                     ? null

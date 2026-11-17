@@ -79,6 +79,13 @@ export function newYorkDate(ms) {
     }).format(ms);
 }
 
+/** The Monday `YYYY-MM-DD` of the week (Monday to Sunday) that holds the America/New_York date of a time. */
+export function newYorkWeek(ms) {
+    const date = new Date(`${newYorkDate(ms)}T00:00:00Z`);
+
+    return new Date(date.getTime() - ((date.getUTCDay() + 6) % 7) * DAY).toISOString().slice(0, 10);
+}
+
 /** The clock time `HH:MM` of a time in America/New_York. */
 export function newYorkClock(ms) {
     return new Intl.DateTimeFormat("en-GB", {

@@ -97,8 +97,12 @@ What exists today:
   median and P90), 3-failure stops (2 in 7 days per repository), and CI reruns from the flaky-test scan.
 - **Q1 `prRounds` and `blockers`** (measurement only, no finding): cross-review rounds per PR from the session
   records (`rounds`: the reviewed heads, `heads`, `calls`, mean, median, P90, PRs with 3 or more rounds, round calls
-  with no PR), and every blocking
-  point of a reviewer answer with its PR, its reviewed head, the PR's state and its guard: a test or an `AGENTS.md`
+  with no PR). Each PR also records `worker` (`none`, 1 model or `mixed`) and sorted distinct `models`.
+  `prRounds.workers` records PR counts, rounds, mean, median and P90 by worker label, with `weeks` for Monday weeks
+  from the New York date of each PR's last round call ([module reference](modules/daily-audit.md)). The oldest week
+  can be partial at the 30-day edge. The report shows weekly means and PR counts. The worker-model trial review
+  compares a worker's mean rounds per worker-written PR against the baseline week. The same metrics also record every
+  blocking point of a reviewer answer with its PR, its reviewed head, the PR's state and its guard: a test or an `AGENTS.md`
   file of the PR's own diff that is new or changed at the final head against the reviewed head, and the lines added to
   the old single corrections file (`CORRECTIONS_FILE` in `audit/sources.mjs`) between them plus the new record files under `.memory/corrections/` (a record moved out
   of the old file after the reviewed head is not new). `rate` is guarded points over evaluated points, null at 0.
@@ -118,8 +122,8 @@ What exists today:
 
 Gaps:
 
-- **No comparison by model, by prompt version or by task kind** outside R1. `x.desk.usage` keeps the model, but no
-  metric groups outcomes by it.
+- **Comparison by model is partial.** R1 groups thread outcomes by model. Q1 groups review rounds per PR by worker
+  model. No metric compares prompt versions or groups PR acceptance by worker model.
 - **No cost per merged PR.** Usage and PR outcomes are both collected; nothing joins them.
 - **Sample minimums are first guesses.** Q1's thresholds wait to be tuned after 2 weeks of records. A new comparison
   must state its minimum before it makes a claim.

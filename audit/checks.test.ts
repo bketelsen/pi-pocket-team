@@ -3894,6 +3894,18 @@ test("Q1 prRounds: reviewed heads per PR from the session records; a send takes 
             atLeast3: 1,
             unattributed: 1,
         },
+        workers: {
+            none: {
+                prs: 2,
+                rounds: 4,
+                mean: 2,
+                median: 2,
+                p90: 3,
+                weeks: {
+                    "2026-10-19": { prs: 2, rounds: 4, mean: 2, median: 2 },
+                },
+            },
+        },
         prs: [
             {
                 ref: "acme/widgets#4",
@@ -3902,6 +3914,8 @@ test("Q1 prRounds: reviewed heads per PR from the session records; a send takes 
                 calls: 4,
                 first: "2026-10-21T14:00Z",
                 last: "2026-10-21T14:02Z",
+                worker: "none",
+                models: [],
             },
             {
                 ref: "acme/widgets#5",
@@ -3910,11 +3924,170 @@ test("Q1 prRounds: reviewed heads per PR from the session records; a send takes 
                 calls: 1,
                 first: "2026-10-21T14:03Z",
                 last: "2026-10-21T14:03Z",
+                worker: "none",
+                models: [],
             },
         ],
     });
     // No finding comes from it.
     assert.deepEqual(ids(result), []);
+});
+
+test("Q1 prRounds: a multi-PR worker sequence attributes bare PRs and excludes reviewer models", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const worker = "openai/gpt-6.1-sol";
+    const reviewer = "github-copilot/claude-sonnet-5.5";
+    const reviewCalls = [
+        named(
+            { ...reviewerSpawn(s, at, "review-pr5-fix"), model: reviewer },
+            ["acme/widgets#5"],
+            [],
+            HEAD_A,
+        ),
+        named(
+            { ...coderSpawn(s, at + MINUTE, "pr5-test-fix"), model: worker, tools: null },
+            [],
+            [5],
+        ),
+        named({ ...reviewerSpawn(s, at + 2 * MINUTE, "review-agents-md"), model: worker }, [
+            "acme/widgets#16",
+        ]),
+        named({
+            ...coderSpawn(s, at + 3 * MINUTE, "agents-symlink-fix"),
+            model: worker,
+            tools: null,
+        }),
+        named(sendTo(s, at + 4 * MINUTE, "review-agents-md"), ["acme/widgets#17"], [], HEAD_B),
+        named(sendTo(s, at + 5 * MINUTE, "agents-symlink-fix")),
+        named(sendTo(s, at + 6 * MINUTE, "review-agents-md"), ["acme/widgets#17"], [], HEAD_C),
+        named({
+            ...coderSpawn(s, at + 7 * MINUTE, "release-cask-fix"),
+            model: worker,
+            tools: null,
+        }),
+        named(
+            { ...reviewerSpawn(s, at + 8 * MINUTE, "review-release-fix"), model: reviewer },
+            ["acme/widgets#18"],
+            [],
+            HEAD_A,
+        ),
+    ];
+    const reviewAnswers = [0, 2, 4, 6, 8].map((index) =>
+        answerOf(s, at + index * MINUTE + MINUTE / 2, reviewCalls[index]!.name),
+    );
+    const result = checkQ1(
+        emptyData({ decided: todayEmpty, threads: threadMap(t1), reviewCalls, reviewAnswers }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(
+        result.metrics.prRounds.prs.map((row: { ref: string; worker: string; rounds: number }) => [
+            row.ref,
+            row.worker,
+            row.rounds,
+        ]),
+        [
+            // The only GPT call for #16 is its reviewer; `pr5-test-fix` names another PR.
+            ["acme/widgets#16", "none", 1],
+            ["acme/widgets#17", worker, 2],
+            ["acme/widgets#18", worker, 1],
+            // `pr5-test-fix` names PR 5 but comes after its last review call.
+            ["acme/widgets#5", "none", 1],
+        ],
+    );
+});
+
+test("Q1 prRounds: 2 distinct worker models give worker mixed", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [
+                named({ ...coderSpawn(s, at, "gpt"), model: "openai/gpt-6.1-sol", tools: null }),
+                named({ ...coderSpawn(s, at + MINUTE, "deepseek"), tools: null }),
+                named(reviewerSpawn(s, at + 2 * MINUTE), ["acme/widgets#4"], [], HEAD_A),
+            ],
+        }),
+        q1Ctx([]),
+    );
+    const row = result.metrics.prRounds.prs[0];
+
+    assert.equal(row.worker, "mixed");
+    assert.deepEqual(row.models, ["deepseek/deepseek-flash", "openai/gpt-6.1-sol"]);
+});
+
+test("Q1 prRounds: worker summaries use 2 New York weeks across the Monday UTC edge", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const now = Date.parse("2026-11-17T14:00:00Z");
+    const fixtures = [
+        { pr: 1, model: "openai/gpt-6.1-sol", rounds: 1, last: "2026-11-16T04:30:00Z" },
+        { pr: 2, model: "openai/gpt-6.1-sol", rounds: 3, last: "2026-11-16T05:30:00Z" },
+        { pr: 3, model: "deepseek/deepseek-flash", rounds: 2, last: "2026-11-15T12:00:00Z" },
+        { pr: 4, model: "deepseek/deepseek-flash", rounds: 4, last: "2026-11-16T12:00:00Z" },
+        { pr: 5, model: "deepseek/deepseek-flash", rounds: 1, last: "2026-11-16T13:00:00Z" },
+    ];
+    const records = fixtures.map(({ pr, model, rounds, last }) => {
+        const at = Date.parse(last);
+        const ref = `acme/widgets#${pr}`;
+        const review = roundsOf(s, rounds, at, ref, pr * 10);
+
+        assert.ok(at <= now && at >= now - 30 * DAY, `${last} must be in the review window`);
+
+        return {
+            calls: [
+                named(
+                    {
+                        ...coderSpawn(s, at - rounds * MINUTE, `worker-pr${pr}`),
+                        model,
+                        tools: null,
+                    },
+                    [ref],
+                ),
+                ...review.calls,
+            ],
+            answers: review.answers,
+        };
+    });
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: records.flatMap((record) => record.calls),
+            reviewAnswers: records.flatMap((record) => record.answers),
+        }),
+        { ...q1Ctx([]), now, since: now - DAY, date: "2026-11-17" },
+    );
+
+    assert.deepEqual(result.metrics.prRounds.workers, {
+        "deepseek/deepseek-flash": {
+            prs: 3,
+            rounds: 7,
+            mean: 2.33,
+            median: 2,
+            p90: 4,
+            weeks: {
+                "2026-11-09": { prs: 1, rounds: 2, mean: 2, median: 2 },
+                "2026-11-16": { prs: 2, rounds: 5, mean: 2.5, median: 2.5 },
+            },
+        },
+        "openai/gpt-6.1-sol": {
+            prs: 2,
+            rounds: 4,
+            mean: 2,
+            median: 2,
+            p90: 3,
+            weeks: {
+                "2026-11-09": { prs: 1, rounds: 1, mean: 1, median: 1 },
+                "2026-11-16": { prs: 1, rounds: 3, mean: 3, median: 3 },
+            },
+        },
+    });
 });
 
 test("Q1 blockers: points of answers with their PR, head, state and guard; ambiguous and unmatched answers", () => {
@@ -4465,8 +4638,8 @@ test("R2: cost per accepted, median rounds and blocking points from Q1; without 
     assert.equal(withQ1.sources.q1, true);
     assert.equal(withQ1.totals.accepted, 1);
     assert.equal(withQ1.totals.costPerAccepted, 4);
-    // T1 3 rounds, T2 4; T3 has no PR, so no rounds.
-    assert.equal(withQ1.totals.medianRounds, 3.5);
+    // Per PR, not per thread: rounds [2, 1, 4] give median 2; T3 has no PR.
+    assert.equal(withQ1.totals.medianRounds, 2);
     assert.equal(withQ1.totals.blockers, 1);
 
     const without = checkR2(data, r2Ctx()).metrics;
@@ -4497,6 +4670,74 @@ test("R2: a thread with no PR has no rounds and no blocking points, so it does n
     assert.equal(both.blockers, 1);
     assert.equal(r2Totals([r2Thread("T2")], r2Ctx([], results)).medianRounds, null);
     assert.equal(r2Totals([r2Thread("T2")], r2Ctx([], results)).blockers, null);
+});
+
+test("R2: review rounds count distinct PRs, not thread sums or duplicate PR links", () => {
+    const results = {
+        Q1: {
+            findings: [],
+            metrics: {
+                prRounds: {
+                    available: true,
+                    prs: [
+                        { ref: "acme/widgets#1", rounds: 1 },
+                        { ref: "acme/widgets#2", rounds: 3 },
+                        { ref: "acme/widgets#3", rounds: 2 },
+                    ],
+                },
+            },
+        },
+    };
+    const threads = [
+        r2Thread("T1", {
+            prs: { "acme/widgets#1": r2Link("MERGED"), "acme/widgets#2": r2Link("MERGED") },
+        }),
+        r2Thread("T2", { prs: { "acme/widgets#3": r2Link("MERGED") } }),
+    ];
+    const metricsOf = (items: object[]) =>
+        checkR2(emptyData({ threads: threadMap(...items) }), r2Ctx([], results)).metrics;
+    const original = metricsOf(threads);
+
+    // Per PR, not per thread: [1, 3, 2] has median 2; thread sums [4, 2] would give 3.
+    assert.equal(original.totals.medianRounds, 2);
+    assert.equal(original.totals.roundPrs, 3);
+    assert.equal(original.rows.length, 1);
+    assert.equal(original.rows[0]!.medianRounds, 2);
+    assert.equal(original.rows[0]!.roundPrs, 3);
+
+    const duplicate = metricsOf([
+        ...threads,
+        r2Thread("T3", { prs: { "acme/widgets#1": r2Link("MERGED") } }),
+    ]);
+
+    assert.equal(duplicate.totals.medianRounds, 2);
+    assert.equal(duplicate.totals.roundPrs, 3);
+    assert.equal(duplicate.rows[0]!.medianRounds, 2);
+    assert.equal(duplicate.rows[0]!.roundPrs, 3);
+
+    const withoutPr = metricsOf([...threads, r2Thread("T4")]);
+
+    assert.equal(withoutPr.totals.medianRounds, 2);
+    assert.equal(withoutPr.totals.roundPrs, 3);
+    assert.equal(withoutPr.rows[0]!.roundPrs, 3);
+
+    // PRs with no reviewed head in Q1's 30 days (a hygiene merge, or a review before the window) add no value: as 0s,
+    // [1, 3, 2, 0, 0] would give a median of 1.
+    const unreviewed = metricsOf([
+        ...threads,
+        r2Thread("T5", {
+            prs: { "acme/widgets#8": r2Link("MERGED"), "acme/widgets#9": r2Link("MERGED") },
+        }),
+    ]);
+
+    assert.equal(unreviewed.totals.medianRounds, 2);
+    assert.equal(unreviewed.totals.roundPrs, 3);
+
+    // A thread whose PRs have no reviewed head has no value either.
+    const only = metricsOf([r2Thread("T5", { prs: { "acme/widgets#8": r2Link("MERGED") } })]);
+
+    assert.equal(only.totals.medianRounds, null);
+    assert.equal(only.totals.roundPrs, 0);
 });
 
 test("R2: notAcceptedWhy counts each thread that is not accepted in the first reason found", () => {
