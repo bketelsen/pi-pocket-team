@@ -2129,6 +2129,170 @@ describe("events bridge: the gates hold right before a delivery", () => {
         assert.equal(r.bridge.state.digest.attempt, undefined);
     });
 
+    test("a revoke during a batch try's write: no revoked event reaches Pocket", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+
+        let land: () => void = () => undefined;
+
+        // The delivery's start writes first; the try's own write is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        // Only a revoke: no pause, no identity change.
+        const revoking = r.bridge.revoke([sub.name], "the consumer is gone");
+
+        r.file.gate = undefined;
+        land();
+        await ticking;
+        await revoking;
+        await r.bridge.tick();
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.deepEqual(r.bridge.state.batches, {});
+        assert.deepEqual(r.bridge.state.pending, {});
+    });
+
+    test("a revoke of 1 subscription during a digest try's write: its events never go, the other's go", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks", "digest");
+        const b = await subscribe(r, "notes", "digest");
+        const ea = event();
+        const eb = event();
+
+        await receive(r.bridge, a.name, ea);
+        await receive(r.bridge, b.name, eb);
+        r.clock.now = digestTime("2026-11-17");
+
+        let land: () => void = () => undefined;
+
+        // The message's own write passes; the try's write is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        const revoking = r.bridge.revoke([a.name], "the consumer of A is gone");
+
+        r.file.gate = undefined;
+        land();
+        await ticking;
+        await revoking;
+
+        // That try did not go.
+        assert.equal(r.sessions.delivered.length, 0);
+
+        // The next try sends B's event only.
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.doesNotMatch(sent[0]!.delivery.payload, new RegExp(ea.id));
+        assert.match(sent[0]!.delivery.payload, new RegExp(eb.id));
+    });
+
+    test("a session moved to another agent's home during a batch try's write takes no wake", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+
+        let land: () => void = () => undefined;
+
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        // The folder moves: Team's folder rule now names another agent.
+        r.sessions.folders.set(first, "/home/agents/duncan");
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        assert.equal(
+            r.sessions.delivered.some((each) => each.target === first),
+            false,
+        );
+    });
+
+    test("a session moved to another agent's home during a digest try's write takes no wake", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now = digestTime("2026-11-17");
+
+        let land: () => void = () => undefined;
+
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        r.sessions.folders.set(first, "/home/agents/duncan");
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        assert.equal(
+            r.sessions.delivered.some((each) => each.target === first),
+            false,
+        );
+    });
+
+    test("a new session moved to another agent's home before the pause notice: no notice goes there", async () => {
+        const r = await rig();
+
+        await subscribe(r);
+
+        // The standing session is gone: the notice makes a new one.
+        r.bridge.archived(r.bridge.state.session!.id, true);
+        await until(() => r.bridge.state.session?.gone === true);
+        await r.bridge.pause("lodge refused the refresh");
+
+        let land: () => void = () => undefined;
+
+        // The start's mark writes first; the write that records the new session is the one this holds.
+        r.file.pass = 1;
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const ticking = r.bridge.tick();
+
+        await until(() => r.file.holding === 1);
+
+        // The new session is the newest one the fake made, in Moneo's home.
+        const newest = Math.max(...[...r.sessions.folders.keys()]);
+
+        assert.equal(r.sessions.folders.get(newest), HOME);
+        r.sessions.folders.set(newest, "/home/agents/duncan");
+        r.file.gate = undefined;
+        land();
+        await ticking;
+
+        assert.equal(
+            r.sessions.delivered.some((each) => each.target === newest),
+            false,
+        );
+    });
+
     test("a pause during a new session's start: the batch does not go", async () => {
         const r = await rig();
         const sub = await subscribe(r);

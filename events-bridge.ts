@@ -2079,11 +2079,9 @@ export class AgentBridge {
             return this.#heldAnswer(this.#state!, LODGE_HELD);
         }
 
-        const revokes = { all: this.#revokes.all, subs: new Map(this.#revokes.subs) };
-        // An event of a subscription that a revoke reached since `revokes` stays deleted.
-        const revoked = (sub: string) =>
-            this.#revokes.all !== revokes.all ||
-            (this.#revokes.subs.get(sub) ?? 0) !== (revokes.subs.get(sub) ?? 0);
+        // An event of a subscription that a revoke reached since this mark stays deleted.
+        const mark = this.#revokeMark();
+        const revoked = (sub: string) => this.#revokedSince(mark, sub);
         const result = await this.#change((state) => {
             const done = state.taken?.[call];
 
@@ -2181,6 +2179,22 @@ export class AgentBridge {
 
             answer = trimmed;
         }
+    }
+
+    /**
+     * The revoke counts now. Take it before the change that selects events is queued: a revoke after it is seen, and a
+     * revoke before it has run its deletion before that change.
+     */
+    #revokeMark(): { all: number; subs: Map<string, number> } {
+        return { all: this.#revokes.all, subs: new Map(this.#revokes.subs) };
+    }
+
+    /** A revoke or an unsubscribe reached the subscription since the mark: its events stay deleted, and none goes. */
+    #revokedSince(mark: { all: number; subs: Map<string, number> }, sub: string): boolean {
+        return (
+            this.#revokes.all !== mark.all ||
+            (this.#revokes.subs.get(sub) ?? 0) !== (mark.subs.get(sub) ?? 0)
+        );
     }
 
     /** Why the bridge holds the events now, in the words events_pending gives. */
@@ -2682,6 +2696,8 @@ export class AgentBridge {
 
         // The same session as a try that may have gone: Pocket's key holds there.
         const resumed = this.#mayHaveGone(before) && before.target === target;
+        // The revokes from here on stop the try (see `#revokeMark`).
+        const mark = this.#revokeMark();
         // After the waits: the batch as the store has it now, and the try marked before it starts.
         const go = await this.#change((state) => {
             const batch = state.batches[batchId];
@@ -2690,8 +2706,9 @@ export class AgentBridge {
                 return undefined;
             }
 
-            // The gates, right before the try: a pause or an identity change since `#target` stops it, with no mark.
-            if (this.#held() || this.#verified !== target) {
+            // The gates, right before the try: a pause, an identity change, a moved session or a revoke since `#target`
+            // stops it, with no mark.
+            if (this.#held() || !this.#usable(target) || this.#revokedSince(mark, batch.sub)) {
                 return undefined;
             }
 
@@ -2759,9 +2776,9 @@ export class AgentBridge {
             return;
         }
 
-        // The gates again, right before the delivery (no wait between them and it): a hold puts the store back, and
-        // no try counts and no batch moves.
-        if (this.#held() || this.#verified !== target) {
+        // The gates again, right before the delivery (no wait between them and it): a hold, a moved session or a revoke
+        // puts the store back, and no try counts and no batch moves (a revoke's own change then deletes the batch).
+        if (this.#held() || !this.#usable(target) || this.#revokedSince(mark, go.sub.name)) {
             await this.#change((state) => {
                 if (state.batches[batchId] === undefined) {
                     return;
@@ -2979,6 +2996,8 @@ export class AgentBridge {
         }
 
         const resumed = this.#mayHaveGone(before) && before.target === target;
+        // The revokes from here on stop the try (see `#revokeMark`).
+        const mark = this.#revokeMark();
         const go = await this.#change((state) => {
             const attempt = state.digest.attempt;
 
@@ -2986,8 +3005,17 @@ export class AgentBridge {
                 return undefined;
             }
 
-            // The gates, right before the try: a pause or an identity change since `#target` stops it, with no mark.
-            if (this.#held() || this.#verified !== target) {
+            // The gates, right before the try: a pause, an identity change, a moved session or a revoke of 1 of its
+            // subscriptions since `#target` stops it, with no mark.
+            if (
+                this.#held() ||
+                !this.#usable(target) ||
+                attempt.ids.some((id) => {
+                    const pending = state.pending[id];
+
+                    return pending !== undefined && this.#revokedSince(mark, pending.sub);
+                })
+            ) {
                 return undefined;
             }
 
@@ -3036,9 +3064,14 @@ export class AgentBridge {
             return;
         }
 
-        // The gates again, right before the delivery (no wait between them and it): a hold puts the message back, and
-        // no try counts.
-        if (this.#held() || this.#verified !== target) {
+        // The gates again, right before the delivery (no wait between them and it): a hold, a moved session or a revoke
+        // of 1 of its subscriptions puts the message back, and no try counts. The next try leaves out the events that
+        // the revoke deleted, and sends the others.
+        if (
+            this.#held() ||
+            !this.#usable(target) ||
+            go.events.some((each) => this.#revokedSince(mark, each.sub))
+        ) {
             await this.#change((state) => {
                 if (state.digest.attempt === undefined) {
                     return;
@@ -3195,7 +3228,7 @@ export class AgentBridge {
         }
 
         // The gates right before the delivery: the session is the verified one, and nothing holds it.
-        if (this.#verified !== session || this.#sessionWaits()) {
+        if (!this.#usable(session) || this.#sessionWaits()) {
             return;
         }
 
