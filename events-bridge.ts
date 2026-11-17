@@ -1172,6 +1172,11 @@ export class AgentBridge {
     #checking: Promise<boolean> | undefined;
     /** Counts the pauses and sign-ins: a lodge check that started before one confirms nothing. */
     #lodgeEpoch = 0;
+    /**
+     * Counts the revokes, of every subscription (`all`) and of each one by name: an events_pending answer that a revoke
+     * overtook puts no event of a revoked subscription back, and puts the others back.
+     */
+    #revokes = { all: 0, subs: new Map<string, number>() };
 
     constructor(deps: BridgeDeps) {
         this.#deps = deps;
@@ -1620,6 +1625,14 @@ export class AgentBridge {
 
     /** Deletes the undelivered events (and batches) of subscriptions: a revoke. `all` for every subscription. */
     async revoke(subs: readonly string[] | "all", why: string): Promise<void> {
+        if (subs === "all") {
+            this.#revokes.all++;
+        } else {
+            for (const name of subs) {
+                this.#revokes.subs.set(name, (this.#revokes.subs.get(name) ?? 0) + 1);
+            }
+        }
+
         await this.#change((state) => {
             const names = subs === "all" ? Object.keys(state.subs) : subs;
 
@@ -1764,7 +1777,7 @@ export class AgentBridge {
                     return false;
                 }
 
-                await this.#resubscribe(name, "lodge does not list it");
+                await this.#resubscribe(name, "lodge does not list it", epoch);
             }
         }
 
@@ -1811,9 +1824,10 @@ export class AgentBridge {
 
     /**
      * A subscription that lodge does not list: its undelivered events go (they never reach the agent), and the bridge
-     * makes it again. 403 and 404 end it: the grant gives nothing under it.
+     * makes it again. 403 and 404 end it: the grant gives nothing under it. With an `epoch` (a check's), an answer that a
+     * pause or a sign-in overtook acts nowhere: no pause, no revoke, no end.
      */
-    async #resubscribe(name: string, reason: string): Promise<void> {
+    async #resubscribe(name: string, reason: string, epoch?: number): Promise<void> {
         const sub = this.#state!.subs[name];
 
         if (sub === undefined) {
@@ -1827,6 +1841,11 @@ export class AgentBridge {
         try {
             again = await this.#deps.lodge.put(name, sub.topic);
         } catch (error) {
+            // An answer of a check that a pause or a sign-in overtook changes nothing: no pause, no revoke.
+            if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+                return;
+            }
+
             if (error instanceof AuthRequired) {
                 await this.#authFailed(error);
             }
@@ -1835,6 +1854,8 @@ export class AgentBridge {
         }
 
         if (again.ok) {
+            // The consumer lodge made is real: the local record names it, or the pulls find it gone. It is no action
+            // on the client, so an old check applies it too.
             await this.#change((state) => {
                 const live = state.subs[name];
 
@@ -1845,7 +1866,16 @@ export class AgentBridge {
                 }
             });
         } else if (again.status === 403 || again.status === 404) {
+            if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+                return;
+            }
+
             await this.#change((state) => {
+                // The queue can run this change later: the check again, inside it.
+                if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+                    return;
+                }
+
                 this.#end(
                     state,
                     name,
@@ -2041,24 +2071,32 @@ export class AgentBridge {
             return this.#heldAnswer(this.#state!, LODGE_HELD);
         }
 
-        return this.#change((state) => {
+        const revokes = { all: this.#revokes.all, subs: new Map(this.#revokes.subs) };
+        // An event of a subscription that a revoke reached since `revokes` stays deleted.
+        const revoked = (sub: string) =>
+            this.#revokes.all !== revokes.all ||
+            (this.#revokes.subs.get(sub) ?? 0) !== (revokes.subs.get(sub) ?? 0);
+        const result = await this.#change((state) => {
             const done = state.taken?.[call];
 
             if (done !== undefined) {
-                return done;
+                return { taken: done, fresh: false };
             }
 
             // A hold that came during the checks: nothing goes, and the answer is kept for no call.
             if (state.paused !== undefined) {
-                return this.#heldAnswer(state, `paused: ${state.paused.reason}`);
+                return {
+                    taken: this.#heldAnswer(state, `paused: ${state.paused.reason}`),
+                    fresh: false,
+                };
             }
 
             if (this.#sessionWaits()) {
-                return this.#heldAnswer(state, SESSION_HELD);
+                return { taken: this.#heldAnswer(state, SESSION_HELD), fresh: false };
             }
 
             if (!this.#lodgeChecked && this.#giveable(state).length > 0) {
-                return this.#heldAnswer(state, LODGE_HELD);
+                return { taken: this.#heldAnswer(state, LODGE_HELD), fresh: false };
             }
 
             const digest = this.#giveable(state);
@@ -2077,8 +2115,52 @@ export class AgentBridge {
             state.digest.dropped = 0;
             (state.taken ??= {})[call] = taken;
 
-            return taken;
+            return { taken, fresh: true };
         });
+
+        // A hold that came during the answer's own write takes its events back: none was given, and the call is kept
+        // for no replay. A revoke that ran meanwhile keeps its deletion. An answer with no event of its own takes
+        // nothing back: it holds nothing.
+        const gave = result.taken.events.length > 0 || result.taken.dropped > 0;
+
+        if (result.fresh && gave && this.#held()) {
+            const answer = result.taken;
+
+            await this.#change((state) => {
+                for (const each of answer.events) {
+                    const id = each.event.id;
+
+                    if (!revoked(each.sub) && state.pending[id] === undefined) {
+                        state.pending[id] = structuredClone(each);
+                        delete state.seen[id];
+                    }
+                }
+
+                // This call set the count to 0: the answer reported what it had.
+                if (answer.dropped > 0) {
+                    state.digest.dropped = answer.dropped;
+                }
+
+                if (state.taken !== undefined) {
+                    delete state.taken[call];
+                }
+            });
+
+            return this.#heldAnswer(this.#state!, this.#heldReason());
+        }
+
+        return result.taken;
+    }
+
+    /** Why the bridge holds the events now, in the words events_pending gives. */
+    #heldReason(): string {
+        const paused = this.#state!.paused;
+
+        if (paused !== undefined) {
+            return `paused: ${paused.reason}`;
+        }
+
+        return this.#sessionWaits() ? SESSION_HELD : LODGE_HELD;
     }
 
     /** The digest events that events_pending may give now: the oldest first, and not the message on its way. */

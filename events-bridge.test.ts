@@ -98,6 +98,12 @@ class FakeLodge implements Lodge {
     });
     readonly subs = new Map<string, LodgeSub>();
     puts = 0;
+    /** Holds `put` until the test opens it. */
+    putGate: Promise<void> | undefined;
+    /** The `put` calls that wait on `putGate` now. */
+    putting = 0;
+    /** An answer to give instead of the real one, when set (after `putGate`). */
+    putAnswer: (() => LodgeAnswer<LodgeSub>) | undefined;
 
     async token(): Promise<string> {
         if (this.tokenError !== undefined) {
@@ -113,6 +119,19 @@ class FakeLodge implements Lodge {
 
     async put(name: string, topic: string): Promise<LodgeAnswer<LodgeSub>> {
         this.puts++;
+        this.putting++;
+
+        try {
+            await this.putGate;
+        } finally {
+            this.putting--;
+        }
+
+        const answer = this.putAnswer?.();
+
+        if (answer !== undefined) {
+            return answer;
+        }
 
         const sub: LodgeSub = {
             name,
@@ -2284,6 +2303,201 @@ describe("events bridge: lodges answers that a pause or a sign-in overtook", () 
         assert.equal(taken.held, "lodge has not confirmed the subscriptions yet");
         assert.equal(r.bridge.state.taken?.["9:call-resumed"], undefined);
         assert.equal(Object.keys(r.bridge.state.pending).length, 1);
+    });
+});
+
+describe("events bridge: a lodge answer that arrives after its check", () => {
+    test("an obsolete put that fails to sign in pauses nothing and deletes no other subscription's events", async () => {
+        const r = await rig();
+        const a = await subscribe(r, "marks.bookmark", "now");
+        const b = await subscribe(r, "marks.folder", "now");
+
+        const kept = event();
+
+        await receive(r.bridge, b.name, kept);
+
+        // lodge lost A's consumer: the check must subscribe it again, and that put waits.
+        r.lodge.subs.delete(a.name);
+
+        let refuse: (error: Error) => void = () => undefined;
+
+        r.lodge.putGate = new Promise<void>((_resolve, reject) => (refuse = reject));
+
+        const checking = r.bridge.checkLodge();
+
+        await until(() => r.lodge.putting > 0);
+
+        // A pause and a sign-in while that put waits: its answer is old.
+        await r.bridge.pause("lodge refused the refresh");
+        await r.bridge.resume(ORIGIN);
+
+        r.lodge.putGate = undefined;
+        refuse(new AuthRequired("lodge refused the token", true));
+
+        assert.equal(await checking, false);
+        assert.equal(r.bridge.paused, undefined);
+        // B's event never went, and the old 401 is no revoke of the client this bridge has now.
+        assert.notEqual(r.bridge.state.pending[kept.id], undefined);
+    });
+
+    test("an obsolete put that lodge refuses ends no subscription", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        r.lodge.subs.delete(sub.name);
+
+        let open: () => void = () => undefined;
+
+        r.lodge.putGate = new Promise((resolve) => (open = resolve));
+        r.lodge.putAnswer = () => ({ ok: false, status: 403, message: "the grant gives nothing" });
+
+        const checking = r.bridge.checkLodge();
+
+        await until(() => r.lodge.putting > 0);
+
+        await r.bridge.pause("lodge refused the refresh");
+        await r.bridge.resume(ORIGIN);
+
+        r.lodge.putGate = undefined;
+        open();
+
+        assert.equal(await checking, false);
+        // An answer of the old client ends nothing.
+        assert.notEqual(r.bridge.state.subs[sub.name], undefined);
+        assert.deepEqual(r.bridge.state.ended, []);
+    });
+});
+
+describe("events bridge: a hold during the events_pending write", () => {
+    test("an identity change during the answer's write takes the events back", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-take");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.held, "your events session waits for Team's identity check");
+        assert.equal(taken.more, 1);
+        assert.equal(r.bridge.state.taken?.["9:call-take"], undefined);
+        assert.equal(r.bridge.pendingCount(), 1);
+
+        // A check: the event comes once.
+        await verify(r.bridge);
+
+        const after = await r.bridge.takePending(10, "9:call-after");
+
+        assert.equal(after.events.length, 1);
+        assert.equal(after.held, undefined);
+        assert.equal(r.bridge.pendingCount(), 0);
+    });
+
+    test("a pause during the answer's write takes the events back", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-pause");
+
+        await until(() => r.file.holding === 1);
+
+        const pausing = r.bridge.pause("lodge refused the refresh");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await pausing;
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.held, "paused: lodge refused the refresh");
+        assert.equal(r.bridge.state.taken?.["9:call-pause"], undefined);
+        assert.equal(r.bridge.pendingCount(), 1);
+    });
+
+    test("a revoke during the answer's write keeps the events deleted", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-revoked");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        const revoking = r.bridge.revoke("all", "lodge refused the token");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await revoking;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        assert.equal(r.bridge.state.taken?.["9:call-revoked"], undefined);
+        // A revoke's deletion holds: the answer puts nothing back.
+        assert.equal(r.bridge.state.pending[e.id], undefined);
+        assert.equal(r.bridge.pendingCount(), 0);
+    });
+
+    test("a revoke of another subscription during the answer's write loses none of this one's events", async () => {
+        const r = await rig();
+        const kept = await subscribe(r, "marks", "digest");
+        const other = await subscribe(r, "notes", "digest");
+        const mine = event();
+
+        await receive(r.bridge, kept.name, mine);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-other");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+        const revoking = r.bridge.revoke([other.name], "the consumer is gone");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await revoking;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        // Only the other subscription was revoked: this event comes back, and waits for the next answer.
+        assert.equal(r.bridge.state.pending[mine.id]?.sub, kept.name);
+        assert.equal(r.bridge.pendingCount(), 1);
     });
 });
 

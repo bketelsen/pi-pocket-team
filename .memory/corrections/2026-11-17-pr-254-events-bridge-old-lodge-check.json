@@ -1,7 +1,7 @@
 {
   "date": "2026-11-17",
   "scope": "events-bridge.ts",
-  "correction": "a lodge check of the events bridge that a pause and a sign-in overtook could still pause the bridge or reconcile its subscriptions with its old answer; an old check now changes nothing",
-  "evidence": "bketelsen/pi-pocket-team#254: cross-review (openai/gpt-6.1-sol) of 68044e837faa1f54c3fc54aaa05debdff89c763f, finding 3 (medium, blocking)",
-  "promoted_to": "events-bridge.test.ts: a lodge check that a sign-in overtook changes nothing"
+  "correction": "a lodge check of the events bridge that a pause and a sign-in overtook could still pause the bridge, reconcile its subscriptions, or end one with its old answers (also the answers of the resubscriptions it started); an old check now changes nothing",
+  "evidence": "bketelsen/pi-pocket-team#254: cross-review (openai/gpt-6.1-sol) of 68044e837faa1f54c3fc54aaa05debdff89c763f, finding 3 (medium, blocking); re-review 1 at a75be20a4a2fd49f1ac3b2dde38be2cf4553d10c, finding 1 (medium, blocking)",
+  "promoted_to": "events-bridge.test.ts: a lodge check that a sign-in overtook changes nothing; an obsolete put that fails to sign in pauses nothing and deletes no other subscription's events; an obsolete put that lodge refuses ends no subscription"
 }
