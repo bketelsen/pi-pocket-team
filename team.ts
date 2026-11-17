@@ -68,6 +68,20 @@ type Persona = {
 /** Where another module finds this one's live API. */
 const TEAM_API = Symbol.for("pi-pocket-team.team");
 
+/**
+ * The listeners of explicit identity changes: a `Set<(session: number) => void>` on `globalThis`, so that it outlives a
+ * reload of either side. Team calls each one after a commit that sets or clears a session's explicit identity; the events
+ * bridge listens, so that it checks its events session's identity again before the next delivery.
+ */
+export const IDENTITY_LISTENERS = Symbol.for("pi-pocket-team.identity-changed");
+
+/** The shared set of identity listeners, made on first use. */
+export function identityListeners(): Set<(session: number) => void> {
+    const holder = globalThis as { [IDENTITY_LISTENERS]?: Set<(session: number) => void> };
+
+    return (holder[IDENTITY_LISTENERS] ??= new Set());
+}
+
 const localFolder = (path: unknown): string => {
     if (typeof path !== "string" || (!isAbsolute(path) && !path.startsWith("~/"))) {
         throw new Error("Team repository folders must be absolute paths or start with ~/.");
@@ -3157,8 +3171,18 @@ export default function createTeam(host: Host, web: Web) {
         `${taskText(persona, task, worktree)}\n\nThis task runs as a shift. Round 1 comes as a separate message that starts with [shift], ${request.startLabel === undefined ? "now" : `at ${request.startLabel}`}. Answer this message with one short line only, and do the work in the rounds. The shift reports to the source session by itself when it stops: do not send a report with team_message. A decision you need from Brian is the one exception: send it at once with team_message, status working or blocked, and the decision in its asks.`;
 
     /** Tell the tabs that a session's identity changed: the id only, so each tab asks the route (which checks access). */
-    const identityChanged = (conversationId: ConversationId) =>
+    const identityChanged = (conversationId: ConversationId) => {
         web.send("identity", { conversationId });
+
+        // Other modules (the events bridge) learn it too; a listener that throws stops no other one.
+        for (const listener of identityListeners()) {
+            try {
+                listener(Number(conversationId));
+            } catch {
+                // A listener's own failure is its own.
+            }
+        }
+    };
 
     web.client("team-web");
     web.route("GET", "agents", async () => ({

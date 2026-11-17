@@ -325,7 +325,7 @@ const tokenState = (n: string) =>
         clientInformation: { client_id: "lgc_AAECAwQFBgcICQoLDA0ODw" },
     }) as never;
 
-async function rig(options: { running?: boolean } = {}): Promise<Rig> {
+async function rig(options: { running?: boolean; check?: boolean } = {}): Promise<Rig> {
     const dir = scratch();
     const lodge = new FakeLodge();
     const sessions = new FakeSessions();
@@ -372,6 +372,15 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
 
         await bridge.open(GATEWAY);
 
+        // The gates of a bridge that starts now: lodge has confirmed the client in this process (a test that needs a
+        // bridge with no check yet passes `check: false`).
+        if (options.check !== false) {
+            await bridge.checkLodge();
+        }
+
+        // The check's own tick settles before the test goes on.
+        await bridge.tick();
+
         return bridge;
     };
 
@@ -397,6 +406,18 @@ async function rig(options: { running?: boolean } = {}): Promise<Rig> {
 /** The bridge stays idle: subscribe with the pulls stopped. */
 async function subscribe(r: Rig, topic = "marks.bookmark", mode: "now" | "digest" = "now") {
     return (await r.bridge.subscribe(topic, mode, ORIGIN)).sub;
+}
+
+/**
+ * The identity check that a bridge which just restarted needs: its recorded events session takes no wake until this
+ * process verified who it is. A restart forgets the check (it is never in the store).
+ */
+async function verify(bridge: AgentBridge, agent = "moneo"): Promise<void> {
+    const check = bridge.identityToCheck();
+
+    assert.notEqual(check, undefined, "the recorded session waits for its identity check");
+    await bridge.identity(check!.session, agent, check!.epoch);
+    await bridge.tick();
 }
 
 const receive = (bridge: AgentBridge, sub: string, value: unknown, acks: string[] = []) =>
@@ -752,6 +773,9 @@ describe("events bridge: restarts give 1 delivery", () => {
 
         const again = await r.restart();
 
+        // A restart forgets the session's identity check: it comes before the delivery.
+        await verify(again);
+
         r.clock.now += BATCH_MS;
         await again.tick();
         await again.tick();
@@ -779,6 +803,8 @@ describe("events bridge: restarts give 1 delivery", () => {
         await r.bridge.stop();
 
         const again = await r.restart();
+
+        await verify(again);
 
         r.clock.now += RETRY_MS[0];
         await again.tick();
@@ -1026,9 +1052,14 @@ describe("events bridge: the standing events session", () => {
 
         const fourth = r.bridge.state.session!.id;
 
-        r.bridge.identity(fourth, "moneo");
+        // Team changed an identity: the session is unchecked until a check says whose it is.
+        r.bridge.identityChanged(fourth);
+
+        const check = r.bridge.identityToCheck()!;
+
+        assert.equal(check.session, fourth);
         assert.equal(r.bridge.state.session?.gone, undefined);
-        r.bridge.identity(fourth, undefined);
+        await r.bridge.identity(fourth, undefined, check.epoch);
         await until(() => r.bridge.state.session?.gone === true);
 
         // Brian's chat never got a wake.
@@ -1046,11 +1077,363 @@ describe("events bridge: the standing events session", () => {
 
         const again = await r.restart();
 
+        await verify(again);
+
         await receive(again, sub.name, event());
         r.clock.now += BATCH_MS;
         await again.tick();
         assert.equal(r.sessions.started.length, 1);
         assert.equal(r.sessions.sent().length, 1);
+    });
+});
+
+describe("events bridge: the identity of the events session", () => {
+    test("Team says the session is another agent: it takes no wake, and the batch goes to a new session", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        // Team changed an identity: the session is unchecked, and it is still in Moneo's home.
+        r.bridge.identityChanged(first);
+
+        const check = r.bridge.identityToCheck()!;
+
+        assert.equal(check.session, first);
+
+        await receive(r.bridge, sub.name, event());
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+
+        // Now Team's answer: the session's identity is Duncan's, so it is gone, and the batch goes by itself.
+        await r.bridge.identity(first, "duncan", check.epoch);
+        await until(() => r.bridge.state.session?.gone === true);
+        await until(() => r.sessions.sent().length === 1);
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.notEqual(sent[0]!.target, first);
+        assert.equal(sent[0]!.target, r.bridge.state.session!.id);
+        assert.equal(r.sessions.started.length, 2);
+    });
+
+    test("after a restart, a recorded session that no one checked takes no wake: the batch waits for its check", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        r.clock.now += BATCH_MS;
+        await again.tick();
+
+        // No delivery, and no new session: the batch keeps its state and counts no try.
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(r.sessions.started.length, 1);
+        assert.equal(Object.values(again.state.batches)[0]?.tries, 0);
+        assert.equal(Object.values(again.state.batches)[0]?.state, "open");
+        assert.equal(Object.keys(again.state.pending).length, 1);
+
+        await verify(again);
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+        assert.equal(r.sessions.started.length, 1);
+        assert.deepEqual(again.state.pending, {});
+    });
+
+    test("an identity change clears the check: no delivery until a new one, and the old check's answer is ignored", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        r.bridge.identityChanged(first);
+
+        // A check that started before the next change answers for the old epoch: its answer proves nothing now.
+        const stale = r.bridge.identityToCheck()!;
+
+        assert.equal(stale.session, first);
+        r.bridge.identityChanged(first);
+        await r.bridge.identity(stale.session, "moneo", stale.epoch);
+        assert.deepEqual(r.bridge.identityToCheck(), {
+            session: first,
+            epoch: stale.epoch + 1,
+        });
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(Object.values(r.bridge.state.batches)[0]?.tries, 0);
+
+        const fresh = r.bridge.identityToCheck()!;
+
+        await r.bridge.identity(fresh.session, "moneo", fresh.epoch);
+        await r.bridge.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+    });
+
+    test("the pause notice waits for an unchecked events session", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        await again.pause("lodge refused the refresh");
+        await again.tick();
+
+        // The notice goes to the events session: an unchecked one holds it.
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(again.state.paused?.sent, undefined);
+
+        await verify(again);
+        await again.tick();
+
+        const notices = r.sessions.sent().filter((each) => each.delivery.key.includes("paused"));
+
+        assert.equal(notices.length, 1);
+        assert.equal(notices[0]!.target, first);
+        assert.equal(again.state.paused?.sent, true);
+    });
+});
+
+describe("events bridge: lodge confirms the client before any event goes", () => {
+    test("a refused refresh pauses the bridge: the stored batch and digest wait, and events_pending gives none", async () => {
+        const r = await rig();
+        const nowSub = await subscribe(r, "marks.bookmark", "now");
+        const digestSub = await subscribe(r, "marks.folder", "digest");
+
+        await receive(r.bridge, nowSub.name, event());
+        await receive(r.bridge, digestSub.name, event());
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        await verify(again);
+
+        // lodge revokes the client while the bridge is down: only a refused refresh tells it, and that is a pause.
+        r.lodge.tokenError = new AuthRequired("lodge refused the refresh");
+        assert.equal(await again.checkLodge(), false);
+        assert.equal(again.paused, "lodge refused the refresh");
+        assert.equal(again.state.paused?.sent, undefined);
+
+        // The batch's time, and then 08:00 the next morning: only the pause notice goes.
+        r.clock.now = T0 + BATCH_MS;
+        await again.tick();
+        r.clock.now = digestTime("2026-11-17");
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.match(sent[0]!.delivery.key, /-paused-/);
+        assert.equal(Object.keys(again.state.pending).length, 2);
+        assert.equal(Object.keys(again.state.batches).length, 1);
+
+        // events_pending gives no event, keeps no answer for the call, and takes none.
+        const taken = await again.takePending(10, "9:call-held");
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.more, 1);
+        assert.equal(taken.held, "paused: lodge refused the refresh");
+        assert.match(
+            pendingAnswer(taken, (line) => line),
+            /The events bridge holds your events now \(paused: lodge refused the refresh\): none were given\./,
+        );
+        assert.equal(again.state.taken?.["9:call-held"], undefined);
+        assert.equal(Object.keys(again.state.pending).length, 2);
+        await again.stop();
+    });
+
+    test("a pause while the bridge runs: batches and the digest wait, and events_pending gives none", async () => {
+        const r = await rig();
+        const nowSub = await subscribe(r, "marks.bookmark", "now");
+        const digestSub = await subscribe(r, "marks.folder", "digest");
+
+        await receive(r.bridge, nowSub.name, event());
+        await receive(r.bridge, digestSub.name, event());
+
+        await r.bridge.pause("lodge refused the refresh");
+
+        r.clock.now = digestTime("2026-11-17");
+        await r.bridge.tick();
+
+        assert.equal(r.bridge.paused, "lodge refused the refresh");
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.match(sent[0]!.delivery.key, /-paused-/);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 2);
+        assert.equal(r.bridge.pendingCount(), 1);
+
+        const taken = await r.bridge.takePending(10, "9:call-paused");
+
+        assert.deepEqual(taken.events, []);
+        assert.equal(taken.more, 1);
+        assert.equal(taken.held, "paused: lodge refused the refresh");
+        assert.equal(r.bridge.state.taken?.["9:call-paused"], undefined);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 2);
+    });
+
+    test("a restarted bridge delivers nothing before lodge has confirmed the client", async () => {
+        const r = await rig({ check: false });
+        const sub = await subscribe(r);
+        const first = r.bridge.state.session!.id;
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.stop();
+
+        const again = await r.restart();
+
+        // The session's check is done; lodge's answer is still missing.
+        await again.identity(first, "moneo", again.identityToCheck()!.epoch);
+        r.clock.now += BATCH_MS;
+        await again.tick();
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(Object.values(again.state.batches)[0]?.tries, 0);
+        assert.equal(Object.keys(again.state.pending).length, 1);
+
+        assert.equal(await again.checkLodge(), true);
+        await again.tick();
+
+        const sent = r.sessions.sent();
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.target, first);
+    });
+
+    test("checkLodge subscribes again a subscription that lodge does not list, and its events never go", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+
+        // lodge lost the subscription (a failed closed, or a revoke) in a way the bridge has not seen yet.
+        r.lodge.subs.delete(sub.name);
+        assert.equal(await r.bridge.checkLodge(), true);
+
+        assert.deepEqual(r.bridge.state.pending, {});
+        assert.deepEqual(r.bridge.state.batches, {});
+        assert.notEqual(r.bridge.state.subs[sub.name]?.consumer, sub.consumer);
+        assert.equal(r.lodge.puts, 2);
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+    });
+
+    test("events_pending holds the digest while lodge has not confirmed the subscriptions", async () => {
+        const r = await rig({ check: false });
+        const sub = await subscribe(r, "marks", "digest");
+
+        await receive(r.bridge, sub.name, event());
+
+        // lodge cannot answer yet: nothing is confirmed, so no event goes, and the answer is kept for no call.
+        r.lodge.listAnswer = () => ({ ok: false, status: 503, message: "lodge is busy" });
+
+        const held = await r.bridge.takePending(10, "9:call-unconfirmed");
+
+        assert.deepEqual(held.events, []);
+        assert.equal(held.more, 1);
+        assert.equal(held.held, "lodge has not confirmed the subscriptions yet");
+        assert.equal(r.bridge.state.taken?.["9:call-unconfirmed"], undefined);
+        assert.equal(r.bridge.pendingCount(), 1);
+
+        // lodge answers, and confirms the subscription: the event comes.
+        r.lodge.listAnswer = () => ({ ok: true, value: [...r.lodge.subs.values()] });
+        assert.equal(await r.bridge.checkLodge(), true);
+
+        const taken = await r.bridge.takePending(10, "9:call-confirmed");
+
+        assert.equal(taken.events.length, 1);
+        assert.equal(taken.held, undefined);
+        assert.equal(r.bridge.pendingCount(), 0);
+    });
+
+    test("after a sign-in the bridge delivers only once lodge has confirmed the client again", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+        await r.bridge.pause("lodge refused the refresh");
+        await r.bridge.resume(ORIGIN);
+
+        r.clock.now += BATCH_MS;
+        await r.bridge.tick();
+
+        assert.equal(r.sessions.delivered.length, 0);
+        assert.equal(Object.keys(r.bridge.state.pending).length, 1);
+
+        assert.equal(await r.bridge.checkLodge(), true);
+        await r.bridge.tick();
+
+        assert.equal(r.sessions.sent().length, 1);
+        assert.deepEqual(r.bridge.state.pending, {});
+    });
+
+    test("a lodge check that started before a pause and a sign-in confirms nothing: a new check must come", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+        const again = await r.restart();
+
+        await verify(again);
+        await receive(again, sub.name, event());
+
+        // The check waits on lodge's answer; meanwhile the bridge pauses and Brian signs it in again.
+        let open: () => void = () => undefined;
+
+        r.lodge.listGate = new Promise((resolve) => (open = resolve));
+
+        const listing = r.lodge.listing;
+        const old = again.checkLodge();
+
+        await until(() => r.lodge.listing === listing + 1);
+        await again.pause("lodge refused the refresh");
+        await again.resume(ORIGIN);
+        open();
+        r.lodge.listGate = undefined;
+
+        assert.equal(await old, false);
+        r.clock.now += BATCH_MS;
+        await again.tick();
+        assert.equal(r.sessions.delivered.length, 0);
+
+        // A check after the sign-in confirms the client: now the batch goes.
+        assert.equal(await again.checkLodge(), true);
+        await again.tick();
+        assert.equal(r.sessions.sent().length, 1);
+    });
+
+    test("a subscription made while the recorded events session waits for its check stands, and its wakes wait", async () => {
+        const r = await rig();
+
+        await subscribe(r);
+
+        const first = r.bridge.state.session!.id;
+        const again = await r.restart();
+
+        // After the restart, nobody checked the recorded session yet: the subscription still goes through.
+        const made = await again.subscribe("marks.folder", "now", ORIGIN);
+
+        assert.equal(made.session, first);
+        assert.equal(r.sessions.started.length, 1);
+        assert.notEqual(again.identityToCheck(), undefined);
     });
 });
 
@@ -1173,6 +1556,8 @@ describe("events bridge: deliveries keep their events, their key and their sessi
 
         // The restart is on the next day: the same message, with its key of the 17th, sends nothing again.
         const again = await r.restart();
+
+        await verify(again);
 
         r.clock.now = digestTime("2026-11-18");
         await again.tick();
@@ -1326,6 +1711,8 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         await r.bridge.stop();
 
         const again = await r.restart();
+
+        await verify(again);
 
         await receive(again, sub.name, event());
         r.clock.now += BATCH_MS;
@@ -1563,6 +1950,8 @@ describe("events bridge: deliveries keep their events, their key and their sessi
         await r.bridge.stop();
 
         const again = await r.restart();
+
+        await verify(again);
 
         // The 7th closes while the 6th still waits: the hour is full.
         r.clock.now = sixth + BATCH_MS;

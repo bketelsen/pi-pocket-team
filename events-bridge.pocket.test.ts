@@ -15,9 +15,18 @@ import {
     root,
     say,
     scriptedModel,
+    until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import {
+    cpSync,
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    utimesSync,
+    writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import type { ConversationId } from "@earendil-works/pi-durable";
@@ -215,5 +224,52 @@ describe("the events bridge in Pocket", () => {
 
         await say(app, plain, "TOOL:events_list");
         assert.match(await said(plain), /not for this session: this session has no named agent/);
+    });
+
+    test("a recorded events session that Team says is another agent is marked gone, and it gets no wake", async () => {
+        const file = join(store, "moneo.events.json");
+
+        // A session in Moneo's home whose explicit identity is Duncan's: its folder alone would say Moneo's.
+        const stray = await newSession(app, join(homes, "moneo"));
+        const duncan = (await roster(definitions)).find((each) => each.id === "duncan")!;
+
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(Identity, stray)).persona = duncan;
+        }, context);
+
+        // Moneo's store records it as the standing events session, and the module loads that store again.
+        const stored = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+
+        writeFileSync(
+            file,
+            JSON.stringify({
+                ...stored,
+                generation: 1,
+                session: { id: Number(stray), generation: 1 },
+            }),
+        );
+
+        await app.setExtensionEnabled(owner(app), "events-bridge.ts", false);
+        await app.setExtensionEnabled(owner(app), "events-bridge.ts", true);
+
+        // A Moneo turn runs the bridge's section, and its tool call checks the recorded session's identity.
+        const moneo = await sessionAs("moneo");
+
+        await say(app, moneo, "TOOL:events_list IDENTITY-CHECK");
+
+        await until(() => {
+            const now = JSON.parse(readFileSync(file, "utf8")) as {
+                session?: { id?: number; gone?: true };
+            };
+
+            return now.session?.gone === true;
+        }, "the events session of another agent to be marked gone");
+
+        const after = JSON.parse(readFileSync(file, "utf8")) as {
+            session?: { id: number; gone?: true };
+        };
+
+        assert.equal(after.session?.id, Number(stray));
+        assert.equal(after.session?.gone, true);
     });
 });

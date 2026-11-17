@@ -26,6 +26,7 @@ import createTeam, {
     AgentMemory,
     changeLesson,
     flat,
+    identityListeners,
     lessonsOf,
     MAX_AGENT_LESSONS,
     MAX_LESSON,
@@ -566,7 +567,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
     }
 });
 
-test("a change of identity sends one event with the conversation id, and no name", async () => {
+test("a change of identity sends one event with the conversation id, and no name, and tells the identity listeners", async () => {
     type Handler = (...args: never[]) => Promise<unknown>;
     const routes = new Map<string, Handler>();
     const commands = new Map<string, Handler>();
@@ -596,6 +597,20 @@ test("a change of identity sends one event with the conversation id, and no name
 
     const route = routes.get("POST session/:source/identity")!;
     const command = commands.get("team-agent")!;
+    // The events bridge's listener (events-bridge.ts): each explicit change, after its commit. One that throws stops no other.
+    const heard: number[] = [];
+    const listener = (session: number) => void heard.push(session);
+
+    const broken = () => {
+        throw new Error("a listener that fails");
+    };
+
+    identityListeners().add(broken);
+    identityListeners().add(listener);
+    after(() => {
+        identityListeners().delete(broken);
+        identityListeners().delete(listener);
+    });
 
     await route({ body: { agent: "teg" }, conversation: { id: 7 }, commit } as never);
     assert.deepEqual(sent, [["identity", { conversationId: 7 }]]);
@@ -613,6 +628,7 @@ test("a change of identity sends one event with the conversation id, and no name
     sent.length = 0;
     await command("clear" as never, { conversationId: 10, commit } as never);
     assert.deepEqual(sent, [["identity", { conversationId: 10 }]]);
+    assert.deepEqual(heard, [7, 8, 9, 10]);
 
     // A refused choice changes nothing and sends nothing.
     sent.length = 0;
@@ -620,4 +636,5 @@ test("a change of identity sends one event with the conversation id, and no name
         route({ body: { agent: "../missing" }, conversation: { id: 11 }, commit } as never),
     );
     assert.equal(sent.length, 0);
+    assert.deepEqual(heard, [7, 8, 9, 10]);
 });
