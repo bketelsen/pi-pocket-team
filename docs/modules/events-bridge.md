@@ -51,7 +51,7 @@ No event leaves the bridge (no batch, no digest, no `events_pending` answer) whi
 - lodge has not confirmed the client in this process: at start and after a sign-in, the bridge lists its subscriptions at lodge first. A refused token pauses it (a `401` also deletes the undelivered events). A subscription that lodge no longer lists loses its undelivered events, and the bridge subscribes it again. So a client revoked while the bridge was down never delivers the events stored before;
 - the events session waits for Team's confirmation (above). The pause notice waits for it too.
 
-A held batch keeps its state: no try counts, and a batch that has not started takes no place in the hour. A held `events_pending` call takes no event and stores no answer; a hold that comes during the answer's own store write puts its events back (except those of a subscription that a revoke reached meanwhile). A lodge check that a pause or a sign-in overtook changes nothing, also through the resubscriptions it started.
+A held batch keeps its state: no try counts, and a batch that has not started takes no place in the hour. A held `events_pending` call takes no event and stores no answer; a hold that comes during the answer's own store write puts its events back (except those of a subscription that a revoke or an unsubscribe reached meanwhile), and a revoke or an unsubscribe during that write removes its events from the answer. A lodge check that a pause or a sign-in overtook changes nothing, also through the resubscriptions it started.
 
 ## What it keeps
 

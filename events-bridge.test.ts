@@ -2499,6 +2499,105 @@ describe("events bridge: a hold during the events_pending write", () => {
         assert.equal(r.bridge.state.pending[mine.id]?.sub, kept.name);
         assert.equal(r.bridge.pendingCount(), 1);
     });
+
+    test("a revoke alone during the answer's write: the answer gives none of the revoked events", async () => {
+        const r = await rig();
+        const sub = await subscribe(r, "marks", "digest");
+        const e = event();
+
+        await receive(r.bridge, sub.name, e);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-revoke-alone");
+
+        await until(() => r.file.holding === 1);
+
+        // No other hold: only the revoke.
+        const revoking = r.bridge.revoke("all", "lodge refused the token");
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await revoking;
+
+        assert.deepEqual(taken.events, []);
+        assert.deepEqual(r.bridge.state.taken?.["9:call-revoke-alone"]?.events ?? [], []);
+        assert.equal(r.bridge.state.pending[e.id], undefined);
+    });
+
+    test("an unsubscribe during a held answer's write: none of its events come back", async () => {
+        const r = await rig();
+        const kept = await subscribe(r, "marks", "digest");
+        const other = await subscribe(r, "notes", "digest");
+        const mine = event();
+        const theirs = event();
+
+        await receive(r.bridge, kept.name, mine);
+        await receive(r.bridge, other.name, theirs);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const taking = r.bridge.takePending(10, "9:call-unsubscribed");
+
+        await until(() => r.file.holding === 1);
+
+        r.bridge.identityChanged(r.bridge.state.session!.id);
+
+        const unsubscribing = r.bridge.unsubscribe(other.name);
+
+        await until(() => !r.lodge.subs.has(other.name));
+        // 1 turn of the event loop: the unsubscribe goes on after lodge's answer, before the write lands.
+        await new Promise((resolve) => setImmediate(resolve));
+
+        r.file.gate = undefined;
+        land();
+
+        const taken = await taking;
+
+        await unsubscribing;
+
+        assert.deepEqual(taken.events, []);
+        assert.notEqual(taken.held, undefined);
+        assert.equal(r.bridge.state.pending[mine.id]?.sub, kept.name);
+        assert.equal(r.bridge.state.pending[theirs.id], undefined);
+    });
+
+    test("a sign-in during the revoke of a refused check: the check pauses nothing", async () => {
+        const r = await rig();
+        const sub = await subscribe(r);
+
+        await receive(r.bridge, sub.name, event());
+
+        // The check's list finds a refused token (a 401): its revoke's write waits.
+        r.lodge.tokenError = new AuthRequired("lodge refused the token", true);
+
+        let land: () => void = () => undefined;
+
+        r.file.gate = new Promise((resolve) => (land = resolve));
+
+        const checking = r.bridge.checkLodge();
+
+        await until(() => r.file.holding === 1);
+
+        // Brian signs the bridge in again while that write waits.
+        r.lodge.tokenError = undefined;
+
+        const resuming = r.bridge.resume(ORIGIN);
+
+        r.file.gate = undefined;
+        land();
+
+        assert.equal(await checking, false);
+        await resuming;
+        assert.equal(r.bridge.paused, undefined);
+    });
 });
 
 /** Wait for a condition of the bridge's own async work (its pulls and timers), by turns of the event loop. */

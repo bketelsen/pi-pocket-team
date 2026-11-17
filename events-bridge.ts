@@ -1658,9 +1658,14 @@ export class AgentBridge {
     }
 
     /** Only a new sign-in helps: pause the subscriptions, and post 1 notice to the events session for this pause. */
-    async #authFailed(error: AuthRequired): Promise<void> {
+    async #authFailed(error: AuthRequired, epoch?: number): Promise<void> {
         if (error.after401) {
             await this.revoke("all", error.message);
+        }
+
+        // A sign-in during the revoke's write ends the check that found the refusal: its pause would undo the sign-in.
+        if (epoch !== undefined && epoch !== this.#lodgeEpoch) {
+            return;
         }
 
         await this.pause(error.message);
@@ -1754,7 +1759,7 @@ export class AgentBridge {
             }
 
             if (error instanceof AuthRequired) {
-                await this.#authFailed(error);
+                await this.#authFailed(error, epoch);
             }
 
             return false;
@@ -1847,7 +1852,7 @@ export class AgentBridge {
             }
 
             if (error instanceof AuthRequired) {
-                await this.#authFailed(error);
+                await this.#authFailed(error, epoch);
             }
 
             return;
@@ -1990,6 +1995,9 @@ export class AgentBridge {
             );
         }
 
+        // Its waiting events go: an events_pending answer under way puts none of them back, and gives none.
+        this.#revokes.subs.set(name, (this.#revokes.subs.get(name) ?? 0) + 1);
+
         await this.#change((state) => {
             for (const [id, pending] of Object.entries(state.pending)) {
                 if (pending.sub === name) {
@@ -2122,10 +2130,13 @@ export class AgentBridge {
         // for no replay. A revoke that ran meanwhile keeps its deletion. An answer with no event of its own takes
         // nothing back: it holds nothing.
         const gave = result.taken.events.length > 0 || result.taken.dropped > 0;
+        const answer = result.taken;
 
-        if (result.fresh && gave && this.#held()) {
-            const answer = result.taken;
+        if (!result.fresh || !gave) {
+            return answer;
+        }
 
+        if (this.#held()) {
             await this.#change((state) => {
                 for (const each of answer.events) {
                     const id = each.event.id;
@@ -2149,7 +2160,23 @@ export class AgentBridge {
             return this.#heldAnswer(this.#state!, this.#heldReason());
         }
 
-        return result.taken;
+        // A revoke or an unsubscribe that came during the write: its events stay deleted, and the answer gives none of
+        // them (its stored copy for a replay neither).
+        const kept = answer.events.filter((each) => !revoked(each.sub));
+
+        if (kept.length < answer.events.length) {
+            const trimmed: Taken = { ...answer, events: kept };
+
+            await this.#change((state) => {
+                if (state.taken?.[call] !== undefined) {
+                    state.taken[call] = structuredClone(trimmed);
+                }
+            });
+
+            return trimmed;
+        }
+
+        return answer;
     }
 
     /** Why the bridge holds the events now, in the words events_pending gives. */
