@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-16",
+  "scope": "desk.ts",
+  "correction": "a carried task marked for a recheck lost the mark when a later scope change carried its changed dep too, so plan verify took its entry without the recheck; the desk now keeps the mark while no verification round since the approval of that graph passed the task",
+  "evidence": "bketelsen/pi-pocket-team#253: cross-review (openai/gpt-6.1-sol) of 6e46f3058dcb8d5dab3cc974af2ac6d58a07c1bd, finding 1 (medium, blocking)",
+  "promoted_to": "desk-plans.test.ts: a later scope change keeps a recheck that no round passed (#178 P7, PR #253 review)"
+}

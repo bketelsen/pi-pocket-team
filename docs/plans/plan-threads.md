@@ -402,7 +402,8 @@ carried goes from `approved` straight to `verifying` in the Approve commit (sect
 when the carried task's `why` names that dep as a word and says why the dep's change does not touch it: the desk then
 stores `carried.recheck: true` in `plan tasks` (`draftGraph`), and the caller never gives the field. A graph that was
 stored without `recheck` keeps the older rule, and its dep is refused. The whole-plan brief lists each recheck task in
-its `Recheck:` line, and `plan verify` refuses an entry for it whose evidence has no `rechecked`.
+its `Recheck:` line, and `plan verify` refuses an entry for it whose evidence has no `rechecked`. A later scope change keeps the mark on a carried task while no verification round since the
+approval of its graph passed that task, also when every dep is carried by then (`needsRecheck`).
 
 **A running task that stays the same (#178 P6).** A task of the approved graph that still runs (it is `delegated`, or it
 has an open attempt) refuses the approval only when the new graph changes it or leaves it out: `agent`, `repo`, `after`,

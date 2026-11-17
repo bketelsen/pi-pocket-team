@@ -17793,17 +17793,39 @@ export function taskChange(
         return "acceptance";
     }
 
-    const before = [...old.deps].sort().join(",");
-    const now = [...task.deps].sort().join(",");
+    // Deps are a set: their order and a repeated id do not change the task.
+    const before = [...new Set(old.deps)].sort().join(",");
+    const now = [...new Set(task.deps)].sort().join(",");
 
     return before === now ? undefined : "deps";
 }
 
-/** Whether a carried task keeps a dep that is not carried in the same graph: the desk marks it for a recheck. */
-export function needsRecheck(tasks: readonly PlanTask[], task: PlanTask): boolean {
-    return (
-        task.carried !== undefined &&
-        task.deps.some((dep) => tasks.find((each) => each.id === dep)?.carried === undefined)
+/**
+ * Whether a carried task needs a recheck in the new graph: it keeps a dep that is not carried in the same graph, or the
+ * approved graph marked it for a recheck that no verification round since that approval passed. A later scope change
+ * never drops a recheck that is still owed (#178 P7).
+ */
+export function needsRecheck(plan: Plan, tasks: readonly PlanTask[], task: PlanTask): boolean {
+    if (task.carried === undefined) {
+        return false;
+    }
+
+    if (task.deps.some((dep) => tasks.find((each) => each.id === dep)?.carried === undefined)) {
+        return true;
+    }
+
+    const approved = approvedGraphOf(plan);
+
+    if (approved?.tasks.find((each) => each.id === task.id)?.carried?.recheck !== true) {
+        return false;
+    }
+
+    const approval = [...plan.approvals].reverse().find((each) => each.graph === approved.version);
+
+    return !(plan.verification?.rounds ?? []).some(
+        (round) =>
+            round.at >= (approval?.at ?? 0) &&
+            round.tasks.some((each) => each.task === task.id && each.pass),
     );
 }
 
@@ -17947,7 +17969,9 @@ export function draftGraph(
                       carried: {
                           graph: approved?.version ?? 0,
                           why: flatLine(task.carried.why),
-                          ...(needsRecheck(request.tasks, task) ? { recheck: true as const } : {}),
+                          ...(needsRecheck(plan, request.tasks, task)
+                              ? { recheck: true as const }
+                              : {}),
                       },
                   },
         ),
@@ -37451,7 +37475,7 @@ export default function createDesk(host: Host, web: Web) {
 
                 // The desk sets a recheck, never the caller: a carried task with a dep that is not carried gets one.
                 for (const task of wanted) {
-                    if (task.carried !== undefined && needsRecheck(wanted, task)) {
+                    if (task.carried !== undefined && needsRecheck(plan, wanted, task)) {
                         task.carried.recheck = true;
                     }
                 }

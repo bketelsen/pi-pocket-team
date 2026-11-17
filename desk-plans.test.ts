@@ -84,7 +84,9 @@ import {
     planVerifyBrief,
     revisePlan,
     carryProblem,
+    needsRecheck,
     planSendId,
+    taskChange,
     taskDone,
     savePlanMarks,
     approvePlan,
@@ -6137,6 +6139,145 @@ describe("the approval of a new graph", () => {
         assert.equal(taskOf(draft, "t2").state, "done");
         assert.equal(JSON.stringify(taskOf(draft, "t2").attempts), attempts);
         assert.equal(taskOf(draft, "t1").state, "ready", "the changed task is new work");
+    });
+
+    test("a later scope change keeps a recheck that no round passed (#178 P7, PR #253 review)", () => {
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        planFacts(made.state, "T1", tick(5));
+        taskThread(made.state, "T4");
+        assert(!("error" in startTask(made.state, "T1", "t2", "T4", tick(6))));
+        prOn(made.state, "T4", "frostyard/snow#2", "MERGED");
+        planFacts(made.state, "T1", tick(6));
+
+        // Graph v2: t1 changed, t2 carried for a recheck, t3 new work.
+        assert(
+            !(
+                "error" in
+                revisePlan(made.state, "T1", {
+                    key: "revise:1",
+                    by: "Brian",
+                    at: tick(7),
+                    why: "Add a step.",
+                    tasks: ["t3"],
+                })
+            ),
+        );
+        assert(
+            !(
+                "error" in
+                draftGraph(made.state, "T1", {
+                    key: "graph:2",
+                    at: tick(7),
+                    rev: made.plan.rev,
+                    tasks: threeTasks().map((task) =>
+                        task.id === "t2"
+                            ? {
+                                  ...task,
+                                  carried: { graph: 1, why: "t1's new line does not touch it." },
+                              }
+                            : task.id === "t1"
+                              ? {
+                                    ...task,
+                                    acceptance: ["The ISO is signed.", "The log names the key."],
+                                }
+                              : task,
+                    ),
+                })
+            ),
+        );
+        assert(!("error" in readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) })));
+        assert(!("error" in approve(made.state, made.plan)));
+
+        const v2 = made.plan.graphs.at(-1) ?? assert.fail("graph v2");
+
+        assert.equal(taskOf(v2, "t2").carried?.recheck, true);
+
+        // The new t1 merges, and no verification round runs before a second scope change.
+        taskThread(made.state, "T7");
+        assert(!("error" in startTask(made.state, "T1", "t1", "T7", tick(10))));
+        prOn(made.state, "T7", "frostyard/snow#7", "MERGED");
+        planFacts(made.state, "T1", tick(11));
+        assert.equal(taskOf(v2, "t1").state, "done");
+        assert(
+            !(
+                "error" in
+                revisePlan(made.state, "T1", {
+                    key: "revise:2",
+                    by: "Brian",
+                    at: tick(12),
+                    why: "Another step.",
+                    tasks: [],
+                })
+            ),
+        );
+
+        // Graph v3 carries t1 and t2: every dep of t2 is carried now, but its recheck is still owed.
+        const v3Tasks = threeTasks().map((task) =>
+            task.id === "t3"
+                ? task
+                : {
+                      ...task,
+                      ...(task.id === "t1"
+                          ? { acceptance: ["The ISO is signed.", "The log names the key."] }
+                          : {}),
+                      carried: { graph: 2, why: "It is merged." },
+                  },
+        );
+
+        assert(
+            !(
+                "error" in
+                draftGraph(made.state, "T1", {
+                    key: "graph:3",
+                    at: tick(13),
+                    rev: made.plan.rev,
+                    tasks: v3Tasks,
+                })
+            ),
+        );
+
+        const v3 = made.plan.graphs.at(-1) ?? assert.fail("graph v3");
+
+        assert.equal(v3.version, 3);
+        assert.equal(taskOf(v3, "t2").carried?.recheck, true, "the owed recheck stays");
+        assert.equal(taskOf(v3, "t1").carried?.recheck, undefined);
+        assert.equal(carryProblem(made.plan, v3.tasks), undefined);
+
+        // A round since the approval of v2 that passed t2 discharges the recheck.
+        made.plan.verification = {
+            threads: [],
+            rounds: [
+                {
+                    at: tick(14),
+                    by: "lucilla",
+                    reviewer: "openai/gpt-6.1-sol",
+                    heads: {},
+                    pass: false,
+                    tasks: [
+                        { task: "t1", pass: true, evidence: "Fine." },
+                        { task: "t2", pass: true, evidence: "Rechecked: fine." },
+                        { task: "t3", pass: false, evidence: "Not done." },
+                    ],
+                    key: "verify:1",
+                },
+            ],
+        };
+        assert.equal(needsRecheck(made.plan, v3Tasks, taskOf(v3, "t2")), false);
+    });
+
+    test("deps compare as a set: their order and a repeated id change nothing (PR #253 review)", () => {
+        const base = threeTasks()[1] ?? assert.fail("t2");
+
+        assert.equal(
+            taskChange({ ...base, deps: ["t1", "t3"] }, { ...base, deps: ["t3", "t1", "t1"] }),
+            undefined,
+        );
+        assert.equal(
+            taskChange({ ...base, deps: ["t1"] }, { ...base, deps: ["t1", "t3"] }),
+            "deps",
+        );
     });
 });
 
