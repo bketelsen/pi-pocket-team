@@ -20,6 +20,70 @@ Brian (T822): "it needs to be deliberate and measured, not seat of the pants." T
 - At the review date: keep, undo or extend, by the threshold written before. Record the decision and the numbers.
   "Inconclusive" is a valid result: then extend or undo, never keep by default.
 
+## Experiment: fresh linked task sessions (pre-registered 2026-11-18)
+
+**Hypothesis.** A fresh `team_delegate` linked session for every new task reduces repeated context reads on long,
+multi-task sessions without increasing Q1 review rounds per PR. Same-task questions and continuations stay on their
+original thread; a new task never rotates or cancels work in flight, an open ask, a lease or restart state. The
+prompt rule is easy to undo, so the decision uses quality, not a causal cost threshold. See the
+[Team policy](modules/team.md#repository-ownership).
+
+**Baseline and window.** Freeze the 2026-11-18 Q1 snapshot before this policy takes effect:
+
+- Its 30-day window, `2026-10-20` through `2026-11-18`, covers 1385 PRs: median 2 review rounds, P90 3.
+- Its `2026-11-11T11:30Z` through `2026-11-18T11:30Z` recent subset covers 490 PRs: median 1, P90 3.
+- Recompute each baseline for exactly the post-policy agents and repositories, split by worker model, before the
+  quality comparison. Keep the frozen all-team rows only as descriptive context.
+- Murbella session `918743` shows the long-session case: 1032 calls, median request context 195,210.5 tokens, recorded
+  cost $143.68. Teg session `1142164` shows 1038 calls, median request context 139,525.5 tokens, recorded cost
+  $219.51, including $140.38 of cache-read cost. These sessions are diagnostic examples, not a matched cost control.
+- Request context means `input + cacheRead + cacheWrite` from each assistant call.
+
+The post-policy window starts at the actual installation time and ends on **2026-11-25**. Record the installation
+timestamp and installed commit as the policy version. Leave every existing task on its original thread. Count a task
+as completed only when `thread.state == "closed"`, `thread.closed.why == "done"`, and `thread.closed.outcome` is
+`completed` or `verified`.
+
+**Descriptive context measure.** It is evidence, not a keep criterion, because pi-pocket-team #266 (CI wait), #261
+(brief reads), and the `reserveTokens` setting change also affect request context in this period. For the population
+of every agent main session, exclude subagent conversations and supervisor/Clerk sessions. Split by provider/model.
+For the same duration before and after installation, report by model:
+
+- calls, sessions, median request context per call, P90 and maximum;
+- the share of calls above 150,000 request-context tokens;
+- cache-read cost per call and total recorded cost.
+
+Use each call's timestamp, never a session's final state. If a pre-install or post-install model has no calls, report
+it as missing, not 0. Include long sessions regardless of whether their thread closes. Name #266, #261, and the
+settings change beside the result. Do not interpret a cost movement as the policy's causal effect.
+
+At `2026-11-18T19:30:59.613Z`, `settings.json` changed
+`compaction.modelOverrides.<model>.reserveTokens` to `650000` for `github-copilot/mai-code-2`,
+`github-copilot/mai-code-2-flash`, `github-copilot/gpt-6-luna`, `github-copilot/claude-sonnet-5.5`,
+`github-copilot/claude-opus-5.5` and `anthropic/claude-opus-5-5`. The Murbella diagnostic is on the reserve list;
+the Teg diagnostic uses `openai/gpt-6-astra`. This extension cannot set per-role compaction through Pocket's public
+extension API, and this experiment changes neither configuration nor core compaction.
+
+**Quality guard.** Q1 review rounds are the decision metric. Attribute a post-policy PR through its `thread.prs` link.
+A review is finished only when the newest matching review call has a parsed `reviewAnswers.ready` value (true or
+false). Exclude and report a PR with no parsed answer or a missing link. Report pending PRs. The existing audit reads
+finished review calls in `metrics.Q1.prRounds`; this prompt-only change adds no collection, stored kind or field.
+
+For the affected agents and repositories, compare post-policy PRs with the frozen 30-day and recent Q1 rows after
+both are split by worker model. A median rise greater than 0 rounds or a nearest-rank P90 rise of 1 or more fails the
+guard. Also report the worker model, repository, agent, PR count and recent subset. The `openai/gpt-6.1-sol` worker
+trial ends on 2026-11-23; keep its rows separate from every other worker model instead of pooling them.
+
+**Minimum sample and decision.** Review on **2026-11-25**. The guard needs at least **8 finished reviewed PRs** across
+post-policy tasks and matching baseline cohorts. Worker-model strata with fewer than 3 finished PRs in treatment or
+baseline are reported as low sample, not used to fail independently; the aggregate still needs 8 treatment PRs and
+the same matched baseline population. If the 8-PR minimum is not met, extend and record a new review date.
+
+Keep the prompt rule when the sample is sufficient unless any sufficiently sized Q1 stratum fails, or the matched
+affected-agent/repository aggregate fails. Undo the rule if the quality guard fails. Context, cache-read cost and the
+share above 150,000 tokens are descriptive and cannot alone keep or undo the rule. Record the numbers, confounders and
+the keep/undo/extend decision here.
+
 ## 1. Collect
 
 **Principle.** Record as much as possible at the moment it happens: cheaply, durably, and in a store that exists.
