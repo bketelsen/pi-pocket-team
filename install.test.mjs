@@ -17,17 +17,18 @@ const made = [];
 /** A test file, in each form Node runs: .js, .mjs, .cjs, .ts, .mts and .cts. */
 const TEST_FILE = /\.test\.[cm]?[jt]s$/;
 
-/** Test files missing from the first `node --test` section of the script. */
+/** File lists from every `node --test` command joined by `&&`. */
+function testCommands(script) {
+    return script
+        .split(/\s*&&\s*/)
+        .map((section) => section.trim().split(/\s+/))
+        .filter((tokens) => tokens[0] === "node" && tokens[1] === "--test")
+        .map((tokens) => tokens.slice(2));
+}
+
+/** Test files missing from all `node --test` sections of the script. */
 export function missingTests(files, script) {
-    const testSection = script.split(/\s*&&\s*/).find((section) => {
-        const tokens = section.trim().split(/\s+/);
-
-        return tokens[0] === "node" && tokens[1] === "--test";
-    });
-
-    const named = testSection
-        ? new Set(testSection.trim().split(/\s+/).slice(2).filter(Boolean))
-        : new Set();
+    const named = new Set(testCommands(script).flat());
 
     return [...new Set(files)].filter((file) => TEST_FILE.test(file) && !named.has(file)).sort();
 }
@@ -322,6 +323,30 @@ test("the test script names every repository test file", async () => {
         [],
         `Checked ${testFiles.length} test files. Missing from the test script; add them to the "test" script: ${missing.join(", ")}`,
     );
+});
+
+test("the test script isolates desk plans and keeps the other files parallel", async () => {
+    const packageJson = JSON.parse(
+        await readFile(join(import.meta.dirname, "package.json"), "utf8"),
+    );
+    const testFiles = await listTestFiles();
+
+    // https://github.com/bketelsen/pi-pocket-team/issues/262: the shared plan app is load-sensitive.
+    assert.deepEqual(
+        testCommands(packageJson.scripts.test).map((files) => [...files].sort()),
+        [testFiles.filter((file) => file !== "desk-plans.test.ts"), ["desk-plans.test.ts"]],
+    );
+});
+
+test("missingTests includes sequential test commands but not syntax checks", () => {
+    assert.deepEqual(
+        missingTests(
+            ["a.test.ts", "b.test.ts", "c.test.ts"],
+            "node --test a.test.ts && node --check c.test.ts && node --test b.test.ts",
+        ),
+        ["c.test.ts"],
+    );
+    assert.deepEqual(missingTests(["a.test.ts"], "node --check a.test.ts"), ["a.test.ts"]);
 });
 
 test("missingTests uses test-section whole tokens", () => {

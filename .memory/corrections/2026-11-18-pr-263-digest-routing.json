@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk digest timing and Clerk routing",
+  "correction": "Keep digest timing independent of recipient selection. Due watches batch. Urgent queue reasons remain immediate but follow digest.clerk and digest.now; only escalation kinds always stay with the supervisor.",
+  "evidence": "https://github.com/bketelsen/pi-pocket-team/pull/263; human blocking review https://github.com/bketelsen/pi-pocket-team/pull/263#pullrequestreview-5964252763 at head 94aab4c5f91e7dfcc5f6eb6719053b339a79cd70 found due watches flushing batches and urgent queue items bypassing the configured Clerk.",
+  "promoted_to": "desk.test.ts: digest timing and Clerk routing are independent: due watches batch; urgent queue news does not"
+}
