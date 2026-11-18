@@ -20,6 +20,55 @@ Brian (T822): "it needs to be deliberate and measured, not seat of the pants." T
 - At the review date: keep, undo or extend, by the threshold written before. Record the decision and the numbers.
   "Inconclusive" is a valid result: then extend or undo, never keep by default.
 
+## Experiment: fresh linked task sessions (pre-registered 2026-11-18)
+
+**Hypothesis.** A fresh `team_delegate` linked session for every new task reduces repeated context reads on ordinary
+implementation work without increasing Q1 review rounds per PR. Same-task questions and continuations stay on their
+original thread; a new task never rotates or cancels work in flight, an open ask, a lease or restart state. See the
+[Team policy](modules/team.md#repository-ownership).
+
+**Baseline and window.** Freeze the 2026-11-18 measurement snapshot before this policy takes effect:
+
+- Q1's 30-day window, `2026-10-20` through `2026-11-18`, covers 1385 PRs: median 2 review rounds, P90 3. Its
+  `2026-11-11T11:30Z` through `2026-11-18T11:30Z` recent subset has 490 PRs: median 1, P90 3. Preserve those exact
+  cohorts when comparing affected agents and work repositories; do not select a different recent subset after
+  seeing the result.
+- Murbella session `918743`: 1032 calls, median request context 195,210.5 tokens, recorded cost $143.68.
+- Teg session `1142164`: 1038 calls, median request context 139,525.5 tokens, recorded cost $219.51, including
+  $140.38 cache-read cost. Cache-read cost per call is $140.38 / 1038 (about $0.13524); Murbella's cache-read
+  component was not supplied and must not be treated as 0.
+- Request context means `input + cacheRead + cacheWrite`. These session aggregates are diagnostic baselines, not
+  evidence that their task mix is comparable. Freeze the underlying pre-policy session records with the review.
+
+The post-policy window starts at the actual installation time of this change and ends at the review on
+**2026-11-25**. Record that installation timestamp and the installed commit as the policy version before collecting
+post-policy results. Count only new linked tasks started under this policy; leave existing tasks on their original
+threads. Compare ordinary implementation tasks with pre-policy ordinary implementation tasks in the frozen records,
+matched by agent, repository, model and task kind. Report each stratum and its sample, not only a pooled result.
+
+**Metrics and quality guard.** Read median request context and cache-read cost per call from the session records
+for those comparable tasks, including their worker subagents consistently before and after. Report cache-read cost
+per call as total cache-read cost divided by calls; do not substitute total session cost. Review Q1 review rounds
+per PR for the affected agents and work repositories against both frozen cohorts above: the all-PR baseline is
+median 2 / P90 3, and the recent subset baseline is median 1 / P90 3. Compare P90 on the matching cohort.
+The existing audit reads review rounds in `metrics.Q1.prRounds`; session records supply the cost signals. This
+prompt-only change adds no collection, stored kind or field; linked-session outcomes and desk reports already exist.
+
+**Confounders.** Split or disclose agent, repository, task kind and size, model/provider, worker and reviewer model,
+thinking level, time of day, cache pricing/hits, task completion bias and concurrent policy changes. MAI settings
+changed to `reserveTokens: 650000` at `2026-11-18T19:30:59.613Z`. Only about 6 minutes of post-settings data exists
+in the baseline measurement, so its effect is not established. Separate calls before and after that boundary; do
+not attribute a compaction-setting effect to this policy. This extension cannot set per-role compaction through
+Pocket's public extension API. This experiment changes neither configuration nor core compaction.
+
+**Minimum sample and decision.** Review on **2026-11-25** with at least **20 completed linked tasks** and
+**8 reviewed PRs**. Keep only if comparable ordinary implementation tasks show at least **20% lower median request
+context**, and Q1 has no quality regression: a median rise greater than **0 rounds**, or a P90 rise greater than
+**0.5 rounds**, fails the guard. Both the all-PR and recent-subset comparisons must pass. Report cache-read cost per
+call alongside the primary context threshold. If the sample is too small or comparability/baseline data is missing,
+extend and record a new review date; do not keep by default. If the sample is sufficient and the threshold or
+quality guard fails, undo this policy. Record the numbers and the keep/undo/extend decision here.
+
 ## 1. Collect
 
 **Principle.** Record as much as possible at the moment it happens: cheaply, durably, and in a store that exists.
