@@ -13454,6 +13454,7 @@ describe("the digest's rules", () => {
             "plan-verify",
             "plan-revise",
             "escalation-urgent",
+            "review-blocked",
         ];
         const routine = ["report", "shift", "closed", "queue", "plan-decided"];
 
@@ -14432,6 +14433,16 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
             action: "withdraw",
             ask: agentAskId,
             words: "Brian rotated it already.",
+        });
+    }
+
+    if (text.endsWith("report structured ready test")) {
+        return call("team_message", {
+            to: linkedAddressOf(request),
+            message:
+                "Ready. BLOCKED is a quoted test result. Brian must decide? Escalate this prose.",
+            status: "working",
+            review: { kind: "cross-review", outcome: "ready", reviewer: "test/reviewer" },
         });
     }
 
@@ -17985,6 +17996,7 @@ describe("the issue digest kinds", () => {
             "escalation",
             "escalation-urgent",
             "plan-amend",
+            "review-blocked",
         ]);
     });
 
@@ -27046,6 +27058,163 @@ describe("the desk in a Pi Pocket", () => {
                     task.record.kind === "x.desk.digest" &&
                     Number(task.record.conversationId) === Number(source),
             );
+
+        test("structured review filing is atomic, replay-safe, and Ready prose does not escalate", async () => {
+            digestOn();
+
+            try {
+                const { source, linked, thread } = await delegated("structured-verdict");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the review session to settle", 20_000);
+                await stopSweepers();
+                // A covered past time keeps the box available to inspect without a racing take.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).digests = {
+                        [String(Number(source))]: {
+                            items: [],
+                            scheduled: [1],
+                            queued: {},
+                            seq: 0,
+                        },
+                    };
+                }, context);
+                await say(app, linked, "report structured ready test");
+                await until(() => !app.isBusy(linked), "the structured report's turn", 20_000);
+                const ready = (await app.harness.snapshot(DeskReports, linked, context))
+                    ?.reports[0];
+
+                assert.equal(
+                    ready?.review?.kind,
+                    "cross-review",
+                    "team_message passes structured evidence through its schema",
+                );
+                const current = (await deskState())?.threads[thread.id];
+
+                assert.equal(current?.reviews?.length, 1);
+                assert.equal(current?.run.reportBlocked, false);
+                assert.equal(current?.run.reportAsks, false);
+                assert.equal((await boxOf(source))?.items[0]?.kind, "report");
+                assert.match(ready?.line ?? "", /cross-review: ready.*no PR.*current/);
+                assert.doesNotMatch(
+                    ready?.line ?? "",
+                    /BLOCKED|Brian must decide|Escalate this prose/,
+                );
+
+                const api = (globalThis as unknown as Record<symbol, import("./desk.ts").DeskApi>)[
+                    Symbol.for("pi-pocket-team.desk")
+                ]!;
+                const address = String(current?.run.returnAddress);
+                const file = async (
+                    key: string,
+                    outcome: "ready" | "not-ready" | "unclear",
+                    at: number,
+                    extra = {},
+                ) =>
+                    app.harness.commit(
+                        (tx) =>
+                            api.file(tx, linked, {
+                                to: address,
+                                key,
+                                from: "team_message",
+                                text: "Ready. Escalate?",
+                                at,
+                                digest: true,
+                                review: {
+                                    kind: "cross-review",
+                                    outcome,
+                                    reviewer: "test/reviewer",
+                                },
+                                ...extra,
+                            }),
+                        context,
+                    );
+
+                for (const outcome of ["not-ready", "unclear"] as const) {
+                    const filed = await file(`review:${outcome}`, outcome, 100);
+
+                    assert.match(filed?.line ?? "", /urgent: review needs action/);
+                    assert.equal((await boxOf(source))?.items.at(-1)?.kind, "review-blocked");
+                }
+
+                // A current negative at head B must survive a newer Ready that reviewed old head A.
+                const ref = "frostyard/test#701";
+                const head = "b".repeat(40);
+
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).threads[thread.id]!.prs[ref] = {
+                        via: "attached",
+                        head,
+                        state: "OPEN",
+                    };
+                }, context);
+                await file("review:new-head-negative", "not-ready", 110, {
+                    review: {
+                        kind: "owner-review",
+                        outcome: "not-ready",
+                        reviewer: "owner",
+                        ref,
+                        head,
+                    },
+                });
+                const stale = await file("review:old-head-ready", "ready", 120, {
+                    review: {
+                        kind: "owner-review",
+                        outcome: "ready",
+                        reviewer: "owner",
+                        ref,
+                        head: "a".repeat(40),
+                    },
+                });
+
+                assert.match(
+                    stale?.line ?? "",
+                    /ready.*stale.*another current review needs action/,
+                );
+                assert.equal((await boxOf(source))?.items.at(-1)?.kind, "review-blocked");
+                // Explicit blocked status and asks are not erased by Ready.
+                await file("review:explicit-block", "ready", 130, { status: "blocked" });
+                assert.equal((await deskState())?.threads[thread.id]?.run.reportBlocked, true);
+                await file("review:explicit-ask", "ready", 140, {
+                    asks: [{ question: "Choose the review scope?" }],
+                });
+                assert.equal((await deskState())?.threads[thread.id]?.asks.length, 1);
+
+                // Evict the first report; its verdict key must still suppress a late replay.
+                for (let index = 0; index < 10; index += 1) {
+                    await file(`review:later:${String(index)}`, "ready", 200 + index);
+                }
+
+                const before = JSON.stringify(await deskState());
+
+                assert(ready?.review);
+                const replay = await app.harness.commit(
+                    (tx) =>
+                        api.file(tx, linked, {
+                            to: address,
+                            key: ready.key,
+                            from: "team_message",
+                            text: "Changed replay",
+                            at: 999,
+                            review: { ...ready.review!, outcome: "not-ready" },
+                            digest: true,
+                        }),
+                    context,
+                );
+
+                assert.equal(replay?.held, true);
+                assert.equal(JSON.stringify(await deskState()), before);
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                digestOff();
+            }
+        });
 
         test("a filed report is held, and 1 digest message arrives at its time", async () => {
             digestOn();

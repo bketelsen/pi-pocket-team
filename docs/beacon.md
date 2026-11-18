@@ -69,9 +69,11 @@ Gaps:
   only.
 - **Wall time and rounds are partial.** A goal keeps only its newest 30 rounds (`KEPT_ROUNDS`), and a new goal in the
   same session writes over the old one. A thread keeps only its newest 50 events.
-- **Cross-review verdict.** Partly closed: the audit parses each reviewer answer for its verdict and its blocking
-  items (`loadReviewAnswers`). The parse reads free text: an answer in a format it does not know gives no item (Q1
-  counts a `Not ready` answer with no item as `unparsed`), and no module records the verdict as a field.
+- **Cross-review verdict.** Collection is explicit through `team_message.review`: the Desk records cross-review,
+  owner-review and plan-review evidence in `Thread.reviews` and `StoredReport.review`; `plan verify` records the
+  whole-plan verdict with its round. See [the contract](modules/desk.md#structured-review-verdicts).
+  The audit reads none of these fields yet. It still parses reviewer answers (`loadReviewAnswers`), so an unknown
+  format gives no item (Q1 counts a `Not ready` answer with no item as `unparsed`).
 - **Tool errors.** The audit reads errors of the team tools and the `plan` tool only (`loadToolErrors`), not of every
   tool.
 - **Outcome after merge.** Reverts are found by PR title and body (Q1). Nothing links a later fix PR to the PR it

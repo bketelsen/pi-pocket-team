@@ -7819,6 +7819,17 @@ describe("the whole-plan check", () => {
             t3: [],
         });
         assert.equal(plan.verification?.rounds[0]?.by, "lucilla");
+        assert.deepEqual(state.threads.T1?.reviews, [
+            {
+                kind: "plan-review",
+                outcome: "ready",
+                reviewer: "openai/gpt-6.1-sol",
+                at: tick(15),
+                key: "verify:1",
+            },
+        ]);
+        assert.equal(done.items[0]?.kind, "report");
+        assert.match(done.items[0]?.line ?? "", /plan-review: ready.*no PR.*current/);
 
         const snapshot = JSON.stringify(state);
 
@@ -7842,7 +7853,7 @@ describe("the whole-plan check", () => {
         );
     });
 
-    test("a fail sends the failed tasks back to ready with 1 item; a repair keeps the earlier attempt", () => {
+    test("a fail records urgent verdict news beside the repair item; a repair keeps the earlier attempt", () => {
         const { state, plan, graph } = verifyingPlan();
 
         deliverVerify(state, "T5");
@@ -7859,9 +7870,14 @@ describe("the whole-plan check", () => {
         assert.equal(JSON.stringify(t2.attempts), earlier, "a failed round changes no attempt");
         assert.deepEqual(
             done.items.map((item) => [item.kind, item.key]),
-            [["plan-approved", "plan-tasks:T1:v1:t2:3"]],
+            [
+                ["review-blocked", "review:verify:1"],
+                ["plan-approved", "plan-tasks:T1:v1:t2:3"],
+            ],
         );
         assert.equal(failedRounds(plan), 1);
+        assert.equal(state.threads.T1?.reviews?.[0]?.outcome, "not-ready");
+        assert.match(done.items[0]?.line ?? "", /plan-review: not-ready.*urgent/);
 
         // The repair: a new attempt; when it merges, the plan verifies again.
         (state.threads.T5 ?? assert.fail("T5")).state = "closed";
@@ -7895,9 +7911,13 @@ describe("the whole-plan check", () => {
 
             if (round < 4) {
                 assert.deepEqual(done.asks, []);
-                assert.equal(done.items.length, 1);
+                assert.equal(done.items.length, 2, "verdict plus repair");
             } else {
-                assert.equal(done.items.length, 0);
+                assert.equal(
+                    done.items.length,
+                    1,
+                    "the negative verdict stays urgent at the budget limit",
+                );
                 assert.equal(done.asks.length, 1);
 
                 const ask = state.threads[thread]?.asks[0];
@@ -8294,7 +8314,7 @@ describe("review batch 2", () => {
         assert.equal(taskOf(graph, "t2").state, "waiting", "its dep t1 is not done");
         assert.deepEqual(
             done.items.map((item) => item.key),
-            ["plan-tasks:T1:v1:t1:3"],
+            ["review:verify:1", "plan-tasks:T1:v1:t1:3"],
         );
         assert.equal(
             deliverCheck(state, "T1", "t2", { agent: "lucilla", repo: "frostyard/snow" }),
@@ -10930,8 +10950,12 @@ describe("a text-only amend of an approved plan", () => {
             item.line,
             '[desk] T1 plan amended by lucilla (text only; the state and the approved graph stay): "The key rotates.". Rev aaaaaaa → bbbbbbb, sections: idea, risks. The Desk page shows the changes since the approval.',
         );
-        assert.deepEqual(DIGEST_KINDS.slice(-2), ["escalation-urgent", "plan-amend"]);
-        assert.equal(DIGEST_KINDS.at(-1), "plan-amend");
+        assert.deepEqual(DIGEST_KINDS.slice(-3), [
+            "escalation-urgent",
+            "plan-amend",
+            "review-blocked",
+        ]);
+        assert.equal(DIGEST_KINDS.at(-2), "plan-amend");
         assert.equal(DIGEST_NOW.includes("plan-amend"), false, "an amend is not urgent");
     });
 

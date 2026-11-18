@@ -48,6 +48,13 @@ Escalation lines come first in the message, and the 30-line cap never cuts them:
 Desk page. The box's 100-item cap never removes an escalation: the oldest other items go, and a box of
 escalations only may hold more.
 
+Structured review news uses the existing `report` kind for Ready and adds `review-blocked` at the end of
+`DIGEST_KINDS`. Not-ready and unclear use that new kind, urgent by default, to the supervisor rather than the Clerk.
+Ready-only lines carry structured evidence, not report prose, and need no escalation. The optional
+`DigestItem.reviewKey` points to `Thread.reviews`: the take checks the PR head again and marks a verdict stale
+when it no longer matches. The digest keeps review lines visible even beside a closed-thread line.
+No default interval changes. See [the exact contract](../modules/desk.md#structured-review-verdicts).
+
 ## 3. Settings
 
 `~/.config/pi-pocket-team/desk.json` (or `PI_POCKET_DESK_CONFIG`), new key `digest`:

@@ -51,6 +51,23 @@ An agent session can use `watch` and `result` on its own thread only. It can `re
 
 Routine closure news does not start the Clerk. The digest omits a `closed: done, nothing remains` item only when current facts prove that same completed sweep close, with no open ask or uncertain PR state. A later event, active work, an unchecked or blocked report, a failed run, an unattached PR, or an unclear close keeps the item. This filter never removes report items: shift summaries, review results, blocked or failed reports, and unclear reports keep their routes. A report for the same thread stays as its own line when the close line is omitted. The stored thread, events, and reports stay unchanged. Without a Clerk, or when closure news routes to the supervisor, it stays unchanged.
 
+## Review verdicts
+
+A review task records its verdict explicitly through `team_message.review`: `kind` (`cross-review`, `owner-review`
+or `plan-review`), `outcome` (`ready`, `not-ready` or `unclear`), and `reviewer`. PR work gives both `ref`
+(`owner/name#N`) and the reviewed `head` SHA; no-PR work leaves both out. The Desk adds its time and replay key.
+Whole-plan checks use `plan verify`, which records the verdict with the round instead of a duplicate report.
+
+The thread's Reviews section, `desk read`, `desk list`, export and digest show the verdict. The newest matching
+verdict per kind and PR wins. A Ready at an old or unknown PR head is stale, not current, and cannot hide a
+Not-ready or unclear verdict. A pending digest checks staleness again when it sends. A current Ready alone needs
+no Clerk escalation and no prose-based `report-blocked`; explicit blocked status and asks still count.
+Not-ready and unclear go urgently by default as `review-blocked`. The interval stays unchanged.
+
+GitHub owner reviews require the reviewer task to submit `kind: "owner-review"` explicitly with the reviewed head.
+The sweep does not infer Ready from GitHub prose. This records evidence, not approval or merge authority.
+See [the complete contract and call path](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/desk.md#structured-review-verdicts).
+
 ## Asks, watches and the cap
 
 - **Asks.** A decision, a host action or a device check that exists only in words is filed as an ask, `T13c`. Options give 2 to 6 choices for a pick-one decision. A done or blocked report must say its asks, and `asks: []` is the agent's word that nothing waits on Brian. Some words in a report only look like a hold, and do not hold its thread: GitHub's merge state `BLOCKED` ("`mergeStateStatus` is BLOCKED"), a question inside double quotes, and a wait for Brian's answer next to the id of an ask that is already filed ("Open: T13c. I continue when Brian answers.").
@@ -117,7 +134,7 @@ Install the files, then turn on **Desk** in **Menu → Extensions**. Team must b
 
 ## Settings and storage
 
-`PI_POCKET_DESK_CONFIG` names the config file, default `~/.config/pi-pocket-team/desk.json`, and every part reads it each time, so a change needs no restart. Its keys include `authors`, `ownAuthors`, `cap`, `export`, `exportCommit`, `digest` (`minutes` 15 by default; `now`, the kinds that go at once, by default `shift-blocked`, `answer-action`, `repair`, `issue-urgent`, `report-blocked`, `plan-approved`, `plan-verify`, `plan-revise` and `escalation-urgent`; `clerk`, the kinds that go to the Clerk, by default `report`, `shift`, `closed`, `queue` and `plan-decided`), `queue`, `journal`, `plans`, `archive`, `board` (the goal board's limits: `atOnce` 8, `rounds` 250, `reserve` 2 and `keep` 14 days by default; a value out of its bounds falls back to its default with 1 warning) and `meter` (the subscription meter: `providers` `["anthropic"]`, `pollMinutes` 5, `digestAt` 75 and `holdAt` null by default; off without the key; a bad value falls back to its default with 1 warning).
+`PI_POCKET_DESK_CONFIG` names the config file, default `~/.config/pi-pocket-team/desk.json`, and every part reads it each time, so a change needs no restart. Its keys include `authors`, `ownAuthors`, `cap`, `export`, `exportCommit`, `digest` (`minutes` 15 by default; `now`, the kinds that go at once, by default `shift-blocked`, `answer-action`, `repair`, `issue-urgent`, `report-blocked`, `plan-approved`, `plan-verify`, `plan-revise`, `escalation-urgent` and `review-blocked`; `clerk`, the kinds that go to the Clerk, by default `report`, `shift`, `closed`, `queue` and `plan-decided`), `queue`, `journal`, `plans`, `archive`, `board` (the goal board's limits: `atOnce` 8, `rounds` 250, `reserve` 2 and `keep` 14 days by default; a value out of its bounds falls back to its default with 1 warning) and `meter` (the subscription meter: `providers` `["anthropic"]`, `pollMinutes` 5, `digestAt` 75 and `holdAt` null by default; off without the key; a bad value falls back to its default with 1 warning).
 
 Set the routine digest interval in `desk.json`, for example:
 
