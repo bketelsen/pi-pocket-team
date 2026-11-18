@@ -338,6 +338,27 @@ describe("HMAC", () => {
     });
 });
 
+/** A body deadline that the test holds and fires itself: no wall time decides when it ends. */
+function heldDeadlines() {
+    const held: (() => void)[] = [];
+    const deadlines: NonNullable<ListenerDeps["deadlines"]> = {
+        set: (run) => {
+            held.push(run);
+
+            return run;
+        },
+        clear: (handle) => {
+            const i = held.indexOf(handle as () => void);
+
+            if (i >= 0) {
+                held.splice(i, 1);
+            }
+        },
+    };
+
+    return { held, deadlines };
+}
+
 describe("Size", () => {
     test("exactly 1 MiB passes the size checks", async () => {
         const hooks = await listen();
@@ -432,21 +453,7 @@ describe("Size", () => {
     });
 
     test("a body that arrived during a stall is read before the deadline ends it: 202, not 408", async () => {
-        const held: (() => void)[] = [];
-        const deadlines = {
-            set: (run: () => void) => {
-                held.push(run);
-
-                return run;
-            },
-            clear: (handle: unknown) => {
-                const i = held.indexOf(handle as () => void);
-
-                if (i >= 0) {
-                    held.splice(i, 1);
-                }
-            },
-        };
+        const { held, deadlines } = heldDeadlines();
         const hooks = await listen({ deadlines });
 
         try {
@@ -479,21 +486,7 @@ describe("Size", () => {
     });
 
     test("a body still incomplete when the deadline ends is 408, with the bytes read and the expected length", async () => {
-        const held: (() => void)[] = [];
-        const deadlines = {
-            set: (run: () => void) => {
-                held.push(run);
-
-                return run;
-            },
-            clear: (handle: unknown) => {
-                const i = held.indexOf(handle as () => void);
-
-                if (i >= 0) {
-                    held.splice(i, 1);
-                }
-            },
-        };
+        const { held, deadlines } = heldDeadlines();
         const hooks = await listen({ deadlines });
 
         try {

@@ -1834,7 +1834,7 @@ export function createHookListener(deps: ListenerDeps) {
                 };
 
                 const deadline = deadlines.set(() => {
-                    immediate = setImmediate(() => finish({ error: "timeout", bytes: size }));
+                    immediate ??= setImmediate(() => finish({ error: "timeout", bytes: size }));
                 }, limits.bodyTimeoutMs);
 
                 req.on("data", (chunk: Buffer) => {
