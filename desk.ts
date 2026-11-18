@@ -14917,11 +14917,12 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
     ].join("\n");
 }
 
-/** One thread in full by default; brief reads omit routing and detailed run metadata. */
+/** One thread in full by default; brief reads can also hide bound session ids for another thread's agent. */
 export function readText(
     state: Readonly<DeskState> | undefined,
     id: string,
     brief = false,
+    hideBoundSession = false,
 ): string | undefined {
     const thread = threadById(state, id);
 
@@ -14984,7 +14985,7 @@ export function readText(
                   .join("\n")}`,
         events.length === 0
             ? "Events: none"
-            : `Events:\n${events.map((event) => `  ${iso(event.at)} · ${event.text}`).join("\n")}`,
+            : `Events:\n${events.map((event) => `  ${iso(event.at)} · ${brief && hideBoundSession && event.key === "bound" ? "session bound" : event.text}`).join("\n")}`,
     ].join("\n");
 }
 
@@ -35587,7 +35588,9 @@ export default function createDesk(host: Host, web: Web) {
                                 `${thread.id} is not this session's thread: this is its read-only copy. An agent can watch or record a result only on its own thread. For anything on ${thread.id}, ${(await hint()).replace(/^Ask/, "ask")}`,
                                 "",
                                 args.brief === true
-                                    ? (readText(state, thread.id, true) ?? "") +
+                                    ? host.text.defang(
+                                          readText(state, thread.id, true, true) ?? "",
+                                      ) +
                                       reportsText(reports, (value) => host.text.defang(value), true)
                                     : threadFile(
                                           thread,
