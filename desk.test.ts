@@ -190,6 +190,7 @@ import {
     parseWatchOn,
     parseWatchCondition,
     GITHUB_INT_MAX,
+    WATCH_CHECK_ATTEMPTS,
     readWatchCondition,
     applyWatchDecision,
     type WatchCondition,
@@ -6752,6 +6753,230 @@ describe("machine watch conditions", () => {
 
         data.runs.check_runs[0]!.conclusion = "failure";
         assert.equal((await readWatchCondition(condition, facts(), reader(data))).status, "fail");
+    });
+    test("404 Branch not protected means no classic requirements; effective rules can prove green (#270)", async () => {
+        for (const error of [
+            { stdout: JSON.stringify({ message: "Branch not protected", status: "404" }) },
+            {
+                stdout: JSON.stringify({ message: "Branch not protected" }),
+                stderr: "gh: Branch not protected (HTTP 404)",
+            },
+            { status: 404, message: "Branch not protected" },
+        ]) {
+            const api = reader();
+            const result = await readWatchCondition(condition, facts(), async (path) => {
+                if (path.includes("/protection/required_status_checks")) {
+                    throw error;
+                }
+
+                return api(path);
+            });
+
+            assert.equal(result.status, "pass");
+            assert.equal(result.head, head);
+        }
+    });
+    test("other classic-protection errors and all effective-rule errors stay unknown (#270)", async () => {
+        for (const error of [
+            { stdout: JSON.stringify({ message: "Not Found", status: "404" }) },
+            { stdout: JSON.stringify({ message: "Branch not protected", status: "403" }) },
+            {
+                stdout: JSON.stringify({ message: "Branch not protected", status: "403" }),
+                stderr: "gh: Branch not protected (HTTP 404)",
+            },
+            {
+                stdout: JSON.stringify({ message: "Branch not protected", status: "404" }),
+                stderr: "gh: Branch not protected (HTTP 403)",
+            },
+            { stdout: JSON.stringify({ message: "Branch not protected" }) },
+            { stdout: "not JSON", stderr: "gh: Branch not protected (HTTP 404)" },
+            new Error("network failed"),
+        ]) {
+            const api = reader();
+            const result = await readWatchCondition(condition, facts(), async (path) => {
+                if (path.includes("/protection/required_status_checks")) {
+                    throw error;
+                }
+
+                return api(path);
+            });
+
+            assert.equal(result.status, "unknown");
+        }
+
+        const api = reader();
+        const absent = { status: 404, message: "Branch not protected" };
+        const result = await readWatchCondition(condition, facts(), async (path) => {
+            if (path.includes("/protection/") || path.includes("/rules/")) {
+                throw absent;
+            }
+
+            return api(path);
+        });
+
+        assert.equal(result.status, "unknown", "the exception applies only to classic protection");
+        const noRequirements = await readWatchCondition(condition, facts(), async (path) => {
+            if (path.includes("/protection/")) {
+                throw absent;
+            }
+
+            if (path.includes("/rules/")) {
+                return [];
+            }
+
+            return api(path);
+        });
+
+        assert.equal(noRequirements.status, "unknown", "no requirements is not proof of green");
+    });
+    test("running required checks defer assessment; pending statuses also defer (#270)", async () => {
+        for (const status of ["pending", "queued", "in_progress", "waiting"]) {
+            const data = rows();
+
+            data.runs.check_runs[0]!.status = status;
+            data.runs.check_runs[0]!.conclusion = "";
+            const result = await readWatchCondition(condition, facts(), reader(data));
+
+            assert.equal(result.status, "pending", status);
+            assert.equal(result.head, head);
+        }
+
+        const mixed = rows();
+
+        mixed.protection.contexts.push("Other");
+        mixed.protection.checks.push({ context: "Other", app_id: 1 });
+        mixed.runs.total_count += 1;
+        mixed.runs.check_runs[0]!.conclusion = "failure";
+        mixed.runs.check_runs.push({
+            ...mixed.runs.check_runs[0]!,
+            name: "Other",
+            status: "in_progress",
+            conclusion: "",
+        });
+        assert.equal(
+            (await readWatchCondition(condition, facts(), reader(mixed))).status,
+            "pending",
+            "any running requirement defers the final assessment",
+        );
+
+        const api = reader();
+        const result = await readWatchCondition(condition, facts(), async (path) => {
+            if (path.includes("/protection/")) {
+                return { contexts: ["Test"], checks: [] };
+            }
+
+            if (path.includes("/rules/")) {
+                return [];
+            }
+
+            if (path.includes("/check-runs?")) {
+                return { total_count: 0, check_runs: [] };
+            }
+
+            if (path.includes("/status?")) {
+                return {
+                    sha: head,
+                    total_count: 1,
+                    statuses: [{ context: "Test", state: "pending" }],
+                };
+            }
+
+            return api(path);
+        });
+
+        assert.equal(result.status, "pending");
+    });
+    test("running required checks retry across stored sweeps, then record exactly 1 unknown at the limit (#270)", async () => {
+        const data = rows();
+
+        data.runs.check_runs[0]!.status = "in_progress";
+        data.runs.check_runs[0]!.conclusion = "";
+        const decision = await readWatchCondition(condition, facts(), reader(data));
+        let { state } = due();
+        const id = Object.keys(state.threads)[0]!;
+
+        for (let attempt = 1; attempt <= WATCH_CHECK_ATTEMPTS; attempt += 1) {
+            const one = state.threads[id]!;
+            const now = on("2026-11-02") + attempt;
+            const read = { key: one.watch!.key, decision };
+
+            assert.equal(applyWatchDecision(one, read, now, state), true);
+            assert.deepEqual(one.watch?.retry, { attempts: attempt, at: now });
+            assert.equal(one.watch?.result, undefined, "a running check never records failure");
+            assert.equal(one.state, "open");
+
+            if (attempt < WATCH_CHECK_ATTEMPTS) {
+                assert.equal(one.watch?.machine, undefined);
+                assert.equal(
+                    isDue(one, now),
+                    false,
+                    "no human check is due while the machine retries",
+                );
+                assert.equal(odradeReason(one), undefined);
+                assert.deepEqual(
+                    queueNews([one], { items: [], scheduled: [], queued: {}, seq: 0 }, now),
+                    [],
+                );
+            } else {
+                assert.equal(one.watch?.machine?.status, "unknown");
+                assert.match(
+                    odradeReason(one) ?? "",
+                    /watch unclear: Required checks are still running/,
+                );
+            }
+
+            const beforeReplay = JSON.parse(JSON.stringify(state));
+
+            assert.equal(applyWatchDecision(one, read, now, state), false);
+            assert.equal(applyWatchDecision(one, read, now - 1, state), false);
+            assert.deepEqual(state, beforeReplay);
+            // A restarted sweep reads the counter and time from stored state, not module memory.
+            state = JSON.parse(JSON.stringify(state)) as DeskState;
+        }
+
+        const final = state.threads[id]!;
+
+        assert.equal(
+            final.events.filter((event) => event.key === `watch:machine:${final.watch!.key}`)
+                .length,
+            1,
+        );
+        const before = JSON.parse(JSON.stringify(state));
+
+        assert.equal(
+            applyWatchDecision(final, { key: final.watch!.key, decision }, on("2026-11-03"), state),
+            false,
+        );
+        assert.deepEqual(state, before);
+    });
+    test("a retried required check can pass before its retry limit (#270)", async () => {
+        const { one, state } = due();
+        const data = rows();
+
+        data.runs.check_runs[0]!.status = "in_progress";
+        const pending = await readWatchCondition(condition, facts(), reader(data));
+
+        applyWatchDecision(
+            one,
+            { key: one.watch!.key, decision: pending },
+            on("2026-11-02"),
+            state,
+        );
+        const passed = await readWatchCondition(condition, facts(), reader());
+
+        assert.equal(
+            applyWatchDecision(
+                one,
+                { key: one.watch!.key, decision: passed },
+                on("2026-11-02") + 1,
+                state,
+            ),
+            true,
+        );
+        assert.equal(one.state, "closed");
+        assert.equal(one.watch?.result?.pass, true);
+        assert.equal(one.watch?.machine?.status, "pass");
+        assert.equal(odradeReason(one), undefined);
     });
     test("branch rules beyond the default page or at the page limit cannot prove green (B1)", async () => {
         const pageSize = 100;

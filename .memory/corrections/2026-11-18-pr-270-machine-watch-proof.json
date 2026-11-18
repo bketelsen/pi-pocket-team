@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk machine-watch proof",
+  "correction": "Request 100 effective branch rules and treat a full or excessive page as unknown. Treat nonfinal Actions runs as unknown. Accept only the classic-protection 404 Branch not protected as no classic requirements. Retry running required checks across at most 3 distinct sweeps, then record unknown; commit retry progress and exactly 1 final assessment.",
+  "evidence": "https://github.com/bketelsen/pi-pocket-team/pull/270; cross-review at head 6cba373ea94f9faec00411d43e6a41637c4dd543 identified branch-rule pagination and nonfinal Actions runs. The blocking human review https://github.com/bketelsen/pi-pocket-team/pull/270#pullrequestreview-5965056784 at head e0914a5724e35b1bf89dc72cdd9035677cd0b9e1 identified ruleset-only branches returning 404 Branch not protected and running required checks recorded as failures. The fixes start from current head 818c525989f301d3f5b3f0ae97b2b9d1744c0de9.",
+  "promoted_to": "desk.test.ts: machine watch conditions: pagination guards (B1), nonfinal Actions guards (B2), classic-protection 404/error guards (#270), running required checks and restart-safe retry/limit guards (#270)"
+}

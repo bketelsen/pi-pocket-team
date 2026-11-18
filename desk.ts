@@ -311,6 +311,8 @@ export type WatchCondition =
     | { kind: "pr"; ref: string; test: "merged" | "checks-green" }
     | { kind: "run"; repo: string; id: number; test: "succeeded" };
 
+export type WatchConditionRead = WatchDecision | { status: "pending"; text: string; head: string };
+
 export type WatchDecision = {
     status: "pass" | "fail" | "unknown";
     text: string;
@@ -346,6 +348,8 @@ export type Watch = {
     condition?: WatchCondition;
     /** The sweep's one assessment of this watch. Unknown and refused passes need a person. */
     machine?: WatchDecision & { at: number; key: string };
+    /** Nonfinal required-check reads, committed with the sweep. Not a final assessment. */
+    retry?: { attempts: number; at: number };
     /**
      * How the event happened, in words ("PR owner/name#12 merged"), when the event, not the date, made the watch due.
      * Set once, with `dueAt`. Absent when the date made it due, or nothing did yet.
@@ -2699,6 +2703,11 @@ function watchText(watch: Watch): string {
             : [
                   `due ${iso(watch.dueAt)}${watch.onFired === undefined ? "" : ` (${watch.onFired})`}`,
               ]),
+        ...(watch.retry !== undefined && watch.machine === undefined && watch.result === undefined
+            ? [
+                  `waiting for required checks (${String(watch.retry.attempts)}/${String(WATCH_CHECK_ATTEMPTS)})`,
+              ]
+            : []),
         ...(watch.result === undefined
             ? []
             : [
@@ -2725,11 +2734,15 @@ export function asleep(thread: Thread, now: number): boolean {
     return watch !== undefined && !watchReached(watch, now);
 }
 
-/** A watched thread at or after its check time or its recorded event, with no result yet: the desk wakes it. */
+/** A watch ready for a human check: reached, unresolved, and not waiting for a bounded required-check retry. */
 export function isDue(thread: Thread, now: number): boolean {
     const watch = openWatch(thread);
 
-    return watch !== undefined && watchReached(watch, now);
+    return (
+        watch !== undefined &&
+        watchReached(watch, now) &&
+        !(watch.retry !== undefined && watch.machine === undefined)
+    );
 }
 
 /** What the sweep knows when it looks for a watch's event: every thread on the desk, and the GitHub read. */
@@ -2932,6 +2945,9 @@ export function watchConditionText(condition: WatchCondition): string {
 
 /** The page size of the branch rules read: a result of this many rows may be cut, so it is unknown. */
 const WATCH_RULES_PAGE = 100;
+
+/** The largest number of distinct sweep reads that defer a watch for running required checks. */
+export const WATCH_CHECK_ATTEMPTS = 3;
 const watchResultLine = (text: string): string => flatLine(text).slice(0, MAX_LINE);
 const watchUnknown = (text: string): WatchDecision => ({
     status: "unknown",
@@ -2939,16 +2955,45 @@ const watchUnknown = (text: string): WatchDecision => ({
 });
 const watchObject = (value: unknown): Record<string, unknown> => (isObject(value) ? value : {});
 
+/** Only GitHub's specific absence of classic protection is safe to replace with an empty requirement list. */
+function classicChecksAbsent(error: unknown): boolean {
+    const failure = watchObject(error);
+    let body = failure;
+
+    if (typeof failure.stdout === "string") {
+        try {
+            body = watchObject(JSON.parse(failure.stdout));
+        } catch {
+            return false;
+        }
+    }
+
+    const stderrStatus =
+        typeof failure.stderr === "string"
+            ? /\(HTTP (\d{3})\)/.exec(failure.stderr)?.[1]
+            : undefined;
+    const statuses = [body.status, failure.status, stderrStatus].filter(
+        (value) => value !== undefined,
+    );
+
+    return (
+        body.message === "Branch not protected" &&
+        statuses.length > 0 &&
+        statuses.every((value) => value === 404 || value === "404")
+    );
+}
+
 /**
  * Read a due condition, with no model. Required-check proof needs both the classic protection and effective branch
  * rules, complete check/status lists, and the same PR head before and after. An unread source never means green.
- * `api` is a read-only GitHub REST call; tests inject it. A missing protection endpoint is deliberately unknown.
+ * `api` is a read-only GitHub REST call; tests inject it. Only 404 Branch not protected means no classic requirements.
+ * A pending read is not a final assessment: the sweep retries it with a durable, bounded counter.
  */
 export async function readWatchCondition(
     condition: WatchCondition,
     github: GitHubFacts | undefined,
     api: (path: string) => Promise<unknown>,
-): Promise<WatchDecision> {
+): Promise<WatchConditionRead> {
     const label = watchConditionText(condition);
 
     try {
@@ -3041,11 +3086,22 @@ export async function readWatchCondition(
             return watchUnknown(`${label}: PR head mismatch or missing head/base`);
         }
 
-        const protection = watchObject(
-            await api(
-                `${path}/branches/${encodeURIComponent(base)}/protection/required_status_checks`,
-            ),
-        );
+        let protection: Record<string, unknown>;
+
+        try {
+            protection = watchObject(
+                await api(
+                    `${path}/branches/${encodeURIComponent(base)}/protection/required_status_checks`,
+                ),
+            );
+        } catch (error) {
+            if (!classicChecksAbsent(error)) {
+                throw error;
+            }
+
+            protection = { contexts: [], checks: [] };
+        }
+
         const rules = await api(
             `${path}/rules/branches/${encodeURIComponent(base)}?per_page=${String(WATCH_RULES_PAGE)}`,
         );
@@ -3147,6 +3203,7 @@ export async function readWatchCondition(
         }
 
         let failed = false;
+        let pending = false;
 
         for (const check of required) {
             const candidates = [
@@ -3180,14 +3237,15 @@ export async function readWatchCondition(
                 continue;
             }
 
+            if (["pending", "queued", "in_progress", "waiting"].includes(String(state))) {
+                pending = true;
+                continue;
+            }
+
             if (
                 ![
                     "failure",
                     "error",
-                    "pending",
-                    "queued",
-                    "in_progress",
-                    "waiting",
                     "cancelled",
                     "timed_out",
                     "action_required",
@@ -3209,6 +3267,14 @@ export async function readWatchCondition(
             return watchUnknown(`${label}: PR head/base changed during the read`);
         }
 
+        if (pending) {
+            return {
+                status: "pending",
+                head,
+                text: watchResultLine(`${label}: required checks are still running`),
+            };
+        }
+
         return {
             status: failed ? "fail" : "pass",
             head,
@@ -3223,7 +3289,7 @@ export async function readWatchCondition(
 /** Apply only the assessment for this watch, once, in the sweep's commit. Keep all result safeguards. */
 export function applyWatchDecision(
     thread: Thread,
-    read: { key: string; decision: WatchDecision } | undefined,
+    read: { key: string; decision: WatchConditionRead } | undefined,
     now: number,
     state: Readonly<DeskState>,
 ): boolean {
@@ -3233,13 +3299,38 @@ export function applyWatchDecision(
         watch?.condition === undefined ||
         watch.machine !== undefined ||
         read?.key !== watch.key ||
-        !isDue(thread, now)
+        !watchReached(watch, now) ||
+        (watch.retry !== undefined && watch.retry.at >= now)
     ) {
         return false;
     }
 
     const key = `watch:machine:${watch.key}`;
-    let decision = read.decision;
+    let decision: WatchDecision;
+
+    if (read.decision.status === "pending") {
+        const attempts = (watch.retry?.attempts ?? 0) + 1;
+
+        watch.retry = { attempts, at: now };
+
+        if (attempts < WATCH_CHECK_ATTEMPTS) {
+            addEvent(
+                thread,
+                `watch:retry:${watch.key}:${String(attempts)}`,
+                `watch waits for required checks (${String(attempts)}/${String(WATCH_CHECK_ATTEMPTS)})`,
+                now,
+            );
+            thread.run.next = nextActor(thread);
+
+            return true;
+        }
+
+        decision = watchUnknown(
+            `Required checks are still running after ${String(attempts)} sweep reads`,
+        );
+    } else {
+        decision = read.decision;
+    }
 
     if (decision.status !== "unknown") {
         const result = recordResult(
@@ -6951,6 +7042,14 @@ export function nextActor(thread: Thread): NextActor {
     // A due watch is Odrade's to send; a failed one is the agent's to work again.
     if (thread.watch !== undefined) {
         const watch = thread.watch;
+
+        if (
+            watch.result === undefined &&
+            watch.retry !== undefined &&
+            watch.machine === undefined
+        ) {
+            return "agent";
+        }
 
         if (watch.result === undefined && watch.dueAt !== undefined) {
             return "odrade";
@@ -26428,7 +26527,7 @@ export default function createDesk(host: Host, web: Web) {
         /** By folder: its linked worktrees, or null when git cannot list them. */
         worktrees?: Record<string, WorktreeFact[] | null>;
         github?: GitHubFacts;
-        watchDecisions?: Record<string, { key: string; decision: WatchDecision }>;
+        watchDecisions?: Record<string, { key: string; decision: WatchConditionRead }>;
         /** Why the GitHub read failed, in one line; absent when it worked. */
         githubError?: string;
         /** Roster repository names that are not "owner/name": skipped, never queried. */
@@ -29020,6 +29119,7 @@ export default function createDesk(host: Host, web: Web) {
                 watch?.condition === undefined ||
                 watch.machine !== undefined ||
                 watch.result !== undefined ||
+                (watch.retry !== undefined && watch.retry.at >= now) ||
                 (!watchReached(watch, now) &&
                     watchOnFired(watch, {
                         threads: state?.threads ?? {},
