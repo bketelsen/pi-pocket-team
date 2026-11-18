@@ -42,9 +42,16 @@ original thread; a new task never rotates or cancels work in flight, an open ask
 
 The post-policy window starts at the actual installation time of this change and ends at the review on
 **2026-11-25**. Record that installation timestamp and the installed commit as the policy version before collecting
-post-policy results. Count only new linked tasks started under this policy; leave existing tasks on their original
-threads. Compare ordinary implementation tasks with pre-policy ordinary implementation tasks in the frozen records,
-matched by agent, repository, model and task kind. Report each stratum and its sample, not only a pooled result.
+post-policy results. Freeze a separate old-policy control from `2026-11-18T19:30:59.613Z` (the settings-change
+boundary) to installation, before the policy loads. The control and treatment therefore run under the same saved
+`compaction.modelOverrides` settings. If that control has no comparable tasks, the review can only extend.
+
+Count only new linked tasks started under this policy; leave existing tasks on their original threads. For this
+experiment, an ordinary implementation task is a desk thread whose recorded model-router `route.kind` is exactly
+`implement`; exclude plan, review, debug, research, write, operate and other kinds. Match control and treatment by
+agent, repository and session model. Keep only matched cells with at least 5 completed control tasks and 5 completed
+post-policy tasks; a cell with no match is reported and excluded. Report every cell and its sample, and pool all
+included cells for the decision. Do not hand-select task kinds after the result is known.
 
 **Metrics and quality guard.** Read median request context and cache-read cost per call from the session records
 for those comparable tasks, including their worker subagents consistently before and after. Report cache-read cost
@@ -53,21 +60,43 @@ per PR for the affected agents and work repositories against both frozen cohorts
 median 2 / P90 3, and the recent subset baseline is median 1 / P90 3. Compare P90 on the matching cohort.
 The existing audit reads review rounds in `metrics.Q1.prRounds`; session records supply the cost signals. This
 prompt-only change adds no collection, stored kind or field; linked-session outcomes and desk reports already exist.
+Attribute a post-policy PR through its `thread.prs` link only after its newest cross-review has finished; open PRs
+with no finished review stay pending and are excluded from the 2026-11-25 quality numerator. Report pending PRs.
 
 **Confounders.** Split or disclose agent, repository, task kind and size, model/provider, worker and reviewer model,
-thinking level, time of day, cache pricing/hits, task completion bias and concurrent policy changes. MAI settings
-changed to `reserveTokens: 650000` at `2026-11-18T19:30:59.613Z`. Only about 6 minutes of post-settings data exists
-in the baseline measurement, so its effect is not established. Separate calls before and after that boundary; do
-not attribute a compaction-setting effect to this policy. This extension cannot set per-role compaction through
-Pocket's public extension API. This experiment changes neither configuration nor core compaction.
+thinking level, time of day, cache pricing/hits, task completion bias and concurrent policy changes. At
+`2026-11-18T19:30:59.613Z`, `settings.json` changed `compaction.modelOverrides.<model>.reserveTokens` to `650000` for
+`github-copilot/mai-code-2`, `github-copilot/mai-code-2-flash`, `github-copilot/gpt-6-luna`,
+`github-copilot/claude-sonnet-5.5`, `github-copilot/claude-opus-5.5` and `anthropic/claude-opus-5-5`. The old-policy
+control begins after that boundary and ends before this policy installs, so the keep comparison cannot be credited
+to that settings change. A result that lacks this control extends, never keeps.
 
-**Minimum sample and decision.** Review on **2026-11-25** with at least **20 completed linked tasks** and
-**8 reviewed PRs**. Keep only if comparable ordinary implementation tasks show at least **20% lower median request
-context**, and Q1 has no quality regression: a median rise greater than **0 rounds**, or a P90 rise greater than
-**0.5 rounds**, fails the guard. Both the all-PR and recent-subset comparisons must pass. Report cache-read cost per
-call alongside the primary context threshold. If the sample is too small or comparability/baseline data is missing,
-extend and record a new review date; do not keep by default. If the sample is sufficient and the threshold or
-quality guard fails, undo this policy. Record the numbers and the keep/undo/extend decision here.
+The `openai/gpt-6.1-sol` worker trial ends on 2026-11-23 and uses Q1 cross-review rounds. Split its PRs from the
+other worker models in the quality report and compare each with the same worker-model stratum in the frozen
+baseline; never pool those results into a single unmatched Q1 claim. The Murbella diagnostic used
+`anthropic/claude-opus-5-5`; the Teg diagnostic used `openai/gpt-6-astra`, so neither diagnostic is the MAI model
+that prompted this policy or evidence of the setting's effect. This extension cannot set per-role compaction
+through Pocket's public extension API. This experiment changes neither configuration nor core compaction.
+
+**Minimum sample and decision.** Review on **2026-11-25** with at least **20 completed post-policy implementation
+tasks** and **8 finished reviewed PRs**, all in matched agent/repository/model cells that meet the 5-and-5 cell
+minimum. The control must begin after the settings boundary and have the same saved settings. Recompute the frozen Q1
+baseline for exactly the affected agents, repositories and worker-model strata; do not compare them with all-team
+populations. Apply the same no-rise rule to both the 30-day and recent-subset baselines: a median rise greater than
+0 rounds or a nearest-rank P90 rise of 1 or more fails the quality guard. The recent subset is still reported as the
+primary quality sensitivity check because it controls for older work less well matched to the post-policy tasks.
+
+Keep only if the pooled treatment median request context across the included matched `implement` tasks is at least
+**20% lower** than the weighted control median, and every reported matched cell has the same 20% direction with no
+failure in the quality guard. For this calculation, each treatment and control call keeps its recorded context.
+The control call weight in a cell is `treatment calls in that cell / control calls in that cell`; the weighted median
+is the context where the normalized cumulative call weight crosses 0.5, with linearly averaged middle contexts when
+needed. This gives each control cell the treatment cell's share of calls. Report cache-read cost per call beside the
+primary context result. With only 8 PRs, the median moves in 0.5-round steps;
+treat any positive median rise as the stated failure, not noise. If the sample, comparable cells, post-settings
+control, worker-model split or finished-review attribution is missing, extend and record a new review date; do not
+keep by default. If a sufficient sample and the threshold or quality guard fails, undo this policy. Record the
+numbers and the keep/undo/extend decision here.
 
 ## 1. Collect
 

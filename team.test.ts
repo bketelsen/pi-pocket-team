@@ -482,16 +482,20 @@ test("identityText: fresh delegations separate new tasks without rotating existi
     const fresh =
         "Start a fresh team_delegate linked session for every new task, even for the same agent and repository";
     const continuation =
-        "Use desk send only for a question or continuation of the task already bound to that thread.";
+        "Use desk send or team_message only for a question or continuation of the task already bound to that thread.";
     const unrelated =
-        "If a follow-up asks for unrelated work, do not fold it into the old task; tell your supervisor in your report that a fresh delegation is needed.";
+        "If your supervisor asks for unrelated work, do not fold it into the old task; tell the supervisor in your report that a fresh delegation is needed.";
+    const planning = identityText(persona("agent"), false, true);
 
     assert(supervisor.includes(fresh));
     assert(supervisor.includes(continuation));
-    assert(agent.includes("Keep normal same-task follow-ups on this thread."));
+    assert(agent.includes("keep normal same-task follow-ups on that thread."));
     assert(agent.includes(unrelated));
+    assert(agent.includes("A direct request from a person is that person's new request"));
+    assert(planning.includes(unrelated));
+    assert(planning.includes(PLANNING_ASK_EXCEPTION));
 
-    for (const text of [supervisor, agent, identityText(persona("agent"), false, true)]) {
+    for (const text of [supervisor]) {
         assert(text.includes("Do not rotate a task in flight."));
         assert(
             text.includes(
@@ -507,6 +511,8 @@ test("identityText: fresh delegations separate new tasks without rotating existi
         assert(!text.includes(fresh));
         assert(!text.includes(continuation));
         assert(!text.includes(unrelated));
+        assert(!text.includes("Do not rotate a task in flight."));
+        assert(!text.includes("Keep each open ask and lease on the original thread."));
     }
 });
 
