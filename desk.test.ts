@@ -13734,6 +13734,114 @@ describe("the digest's rules", () => {
         assert.deepEqual(box?.scheduled, [1000 + 15 * 60_000, 1000]);
     });
 
+    test("a configured interval never delays urgent news inside an existing window", () => {
+        const now = 1_000_000;
+        const urgent = [
+            made("blocked", "report-blocked"),
+            made("failed-shift", "shift-blocked"),
+            made("red-check", "repair"),
+            made("conflict", "repair"),
+            made("answer", "answer-action"),
+            made("queue:T1:run failed: provider error", "queue"),
+            made("queue:T1:report says blocked", "queue"),
+            made("queue:T1:report asks Brian", "queue"),
+        ];
+        const settings = digestConfig({
+            minutes: 30,
+            now: [],
+            clerk: ["queue", "repair", "report-blocked", "shift-blocked", "answer-action"],
+        });
+
+        for (const item of urgent) {
+            const state = empty();
+            const due = now + settings.minutes * 60_000;
+
+            assert.equal(enqueueDigest(state, 5, made("routine", "report"), now, settings), due);
+            assert.equal(enqueueDigest(state, 5, item, now + 1, settings), now + 1, item.key);
+            assert.deepEqual(
+                takeDigest(state, 5, now + 1).items.map((each) => each.key),
+                ["routine", item.key],
+            );
+            assert.deepEqual(
+                takeDigest(state, 5, due).items,
+                [],
+                "the old empty window carries no second digest",
+            );
+            assert.deepEqual(state.digests?.["5"]?.scheduled, []);
+        }
+    });
+
+    test("digest timing and Clerk routing are independent: due watches batch; urgent queue news does not", () => {
+        const now = 1_000_000;
+        const settings = digestConfig({ minutes: 30 });
+        const interval = settings.minutes * 60_000;
+
+        for (const [reason, delay] of [
+            ["watch is due: check release", interval],
+            ["run failed: provider error", 0],
+            ["report says blocked", 0],
+            ["report asks Brian", 0],
+        ] as const) {
+            const state = empty();
+            const item = made(`queue:T1:${reason}`, "queue");
+            const due = now + delay;
+
+            assert.equal(enqueueDigest(state, 5, item, now, settings), due, reason);
+            const taken = takeDigest(state, 5, due).items;
+
+            assert.deepEqual(taken, [item], "the kind and key stay unchanged");
+            assert.deepEqual(
+                splitDigest(taken, true, settings),
+                { ours: [], theirs: [item] },
+                reason,
+            );
+            assert.deepEqual(splitDigest(taken, false, settings), { ours: [item], theirs: [] });
+            assert.deepEqual(
+                splitDigest(taken, true, digestConfig({ now: ["queue"] })),
+                { ours: [item], theirs: [] },
+                "digest.now still overrides digest.clerk",
+            );
+            assert.deepEqual(
+                splitDigest(taken, true, digestConfig({ clerk: [] })),
+                { ours: [item], theirs: [] },
+                "a kind absent from digest.clerk goes to the supervisor",
+            );
+        }
+
+        // Mandatory urgency controls timing only, not routing, for non-queue kinds too.
+        for (const kind of [
+            "shift-blocked",
+            "answer-action",
+            "repair",
+            "issue-urgent",
+            "report-blocked",
+        ] as const) {
+            const state = empty();
+            const item = made(kind, kind);
+            const configured = digestConfig({ minutes: 30, now: [], clerk: [kind] });
+
+            assert.equal(enqueueDigest(state, 5, item, now, configured), now);
+            assert.deepEqual(splitDigest([item], true, configured), { ours: [], theirs: [item] });
+        }
+    });
+
+    test("interval bounds include 1 and 240; a routine item follows the current setting", () => {
+        const state = empty();
+
+        for (const minutes of [1, 30, 240]) {
+            const now = minutes * 1_000_000;
+            const settings = digestConfig({ minutes });
+            const due = now + minutes * 60_000;
+
+            assert.equal(settings.minutes, minutes);
+            assert.equal(
+                enqueueDigest(state, 5, made(`routine:${minutes}`, "report"), now, settings),
+                due,
+            );
+            assert.equal(takeDigest(state, 5, due).items.length, 1);
+        }
+    });
+
     test("enqueue: 1 item per key, 100 items at most, the oldest gone", () => {
         const state = empty();
         const soon = config(15);
@@ -21563,15 +21671,28 @@ describe("the desk in a Pi Pocket", () => {
                         200,
                         words,
                     );
-                }
 
-                assert.equal(await kindOf(ids[0]!), "answer", "the exact option");
-                assert.equal(await kindOf(ids[1]!), "answer-action", "a near match is work");
-                assert.equal(
-                    await kindOf(ids[2]!),
-                    "answer-action",
-                    "even an acknowledgement is not the acceptance",
-                );
+                    if (index === 0) {
+                        assert.equal(await kindOf(ids[0]!), "answer", "the exact option waits");
+                    } else {
+                        // An actionable answer bypasses even an empty `now` list. Wait for its own message.
+                        await until(
+                            async () =>
+                                (await modelTexts(app, source)).some((text) =>
+                                    text.includes(
+                                        `${ids[index]} answered by ${owner(app).name}: ${words}`,
+                                    ),
+                                ),
+                            "the actionable issue answer's digest",
+                            20_000,
+                        );
+                        assert.equal(
+                            await kindOf(ids[index]!),
+                            undefined,
+                            "the urgent answer left the box",
+                        );
+                    }
+                }
 
                 // The sweep's rule agrees: the near match does not accept, the exact text does.
                 const asks = (await deskState())?.threads[threadId]?.asks ?? [];
@@ -27310,6 +27431,98 @@ describe("the desk in a Pi Pocket", () => {
 
                 assert.deepEqual(after?.items, [], "the box is empty after the digest");
                 assert.equal(typeof after?.sentAt, "number");
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestOff();
+            }
+        });
+
+        test("a configured 30-minute window survives a mid-window restart with 1 digest", async () => {
+            digestOn(30);
+
+            try {
+                const { source, linked, thread } = await delegated("digest-configured-restart");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await stopSweepers();
+                await stopDigests();
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+
+                const before = Date.now();
+
+                await say(app, linked, "report to supervisor test");
+                await until(
+                    async () =>
+                        (await digestTasks(source)).some(
+                            (task) =>
+                                (task.record.state as { status?: string }).status === "sleeping",
+                        ),
+                    "the configured digest to sleep",
+                    20_000,
+                );
+
+                const pending = await boxOf(source);
+                const due = pending?.scheduled[0];
+
+                assert.equal(pending?.items.length, 1);
+                assert.equal(typeof due, "number");
+                assert(due! >= before + 30 * 60_000, "desk.json supplies the 30-minute interval");
+                assert(due! <= Date.now() + 30 * 60_000);
+
+                await quiet([thread.id]);
+                await restartApp(10 * 60_000);
+                digestOn(30);
+                await until(
+                    async () =>
+                        (await digestTasks(source)).some(
+                            (task) =>
+                                (task.record.state as { status?: string }).status === "sleeping",
+                        ),
+                    "the restarted digest to sleep until its original due time",
+                    20_000,
+                );
+                assert.deepEqual((await boxOf(source))?.scheduled, [due]);
+                assert.equal(
+                    (await boxOf(source))?.items.length,
+                    1,
+                    "the report stays in the durable box",
+                );
+                assert.equal(
+                    (await modelTexts(app, source)).filter((text) =>
+                        text.includes("[desk] digest:"),
+                    ).length,
+                    0,
+                );
+
+                await restartApp(31 * 60_000);
+                await until(
+                    async () => (await digestTasks(source)).length === 0,
+                    "the resumed digest to finish",
+                    20_000,
+                );
+                await until(
+                    async () =>
+                        (await modelTexts(app, source)).some((text) =>
+                            text.includes("[desk] digest:"),
+                        ),
+                    "the resumed digest message",
+                    20_000,
+                );
+
+                const messages = (await modelTexts(app, source)).filter((text) =>
+                    text.includes("[desk] digest:"),
+                );
+
+                assert.equal(messages.length, 1);
+                assert.match(messages[0] ?? "", /digest: 1 new/);
+                assert.match(messages[0] ?? "", new RegExp(`\\[desk\\] ${thread.id} `));
+                assert.deepEqual((await boxOf(source))?.items, []);
+                assert.deepEqual((await boxOf(source))?.scheduled, []);
+                assert.equal((await boxOf(source))?.seq, 1);
             } finally {
                 await stopDigests();
                 await quiet([]);
