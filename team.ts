@@ -625,6 +625,8 @@ export async function waitForCi(
             const rules = await command([
                 "api",
                 `repos/${address.repoPath}/rules/branches/${encodeURIComponent(base)}`,
+                "--paginate",
+                "--slurp",
                 ...(address.host === "github.com" ? [] : ["--hostname", address.host]),
             ]);
 
@@ -632,7 +634,14 @@ export async function waitForCi(
                 throw new Error(`Cannot read effective branch rules: ${reason(rules)}`);
             }
 
-            return ciRequiredContexts(json(rules));
+            // Slurp keeps each page as an array, instead of concatenating separate JSON documents.
+            const pages = json(rules);
+
+            if (!Array.isArray(pages)) {
+                throw new Error("gh returned malformed effective branch rule pages");
+            }
+
+            return [...new Set(pages.flatMap(ciRequiredContexts))];
         };
 
         const confirm = async (): Promise<boolean> => {

@@ -57,7 +57,7 @@ const ciRepo = "github.com/example/repo";
 const ciWhere = ["12", "--repo", ciRepo];
 const ciView = ["pr", "view", "--json", "number,url,headRefOid,baseRefName"];
 const ciConfirm = ["pr", "view", ...ciWhere, "--json", "headRefOid,baseRefName"];
-const ciRules = ["api", "repos/example/repo/rules/branches/main"];
+const ciRules = ["api", "repos/example/repo/rules/branches/main", "--paginate", "--slurp"];
 const ciRuns = (head = "head-a") => [
     "run",
     "list",
@@ -82,8 +82,9 @@ const ciPr = (head = "head-a", base = "main") =>
 const ciHead = (head = "head-a", base = "main") => ciJson({ headRefOid: head, baseRefName: base });
 const ciCheck = (bucket: string, name = "Test", link = "") => ({ name, bucket, link });
 
+const ciRulesPages = (...pages: unknown[]) => ciJson(pages);
 const ciRuleNames = (...contexts: string[]) =>
-    ciJson([
+    ciRulesPages([
         {
             type: "required_status_checks",
             parameters: { required_status_checks: contexts.map((context) => ({ context })) },
@@ -225,7 +226,7 @@ test("CI wait: same-head no checks return NO CHECKS after 5 minutes, including t
         { args: ciView, result: ciPr(), elapsed: 200_000 },
         ...Array.from({ length: 6 }, () => [
             { args: ciChecks, result: noRequired },
-            { args: ciRules, result: ciJson([]) },
+            { args: ciRules, result: ciRulesPages([]) },
             { args: ciAllChecks, result: ciJson([]) },
             { args: ciConfirm, result: ciHead() },
         ]).flat(),
@@ -492,7 +493,7 @@ test("CI wait: only stderr's no-required-checks message enables the all-checks f
                 stderr: "no required checks reported on the 'main' branch\n",
             },
         },
-        { args: ciRules, result: ciJson([]) },
+        { args: ciRules, result: ciRulesPages([]) },
         { args: ciAllChecks, result: ciJson([ciCheck("pass")]) },
         { args: ciConfirm, result: ciHead() },
         ...ciPassGates("head-a", false),
@@ -521,17 +522,21 @@ test("CI wait: only stderr's no-required-checks message enables the all-checks f
 });
 
 test("CI wait: aggregator gap requires every effective context and completed head workflows before PASS", async () => {
-    const rules = ciJson([
-        { type: "pull_request", parameters: {} },
-        {
-            type: "required_status_checks",
-            parameters: { required_status_checks: [{ context: "Visible" }] },
-        },
-        {
-            type: "required_status_checks",
-            parameters: { required_status_checks: [{ context: "Test" }, { context: "Test" }] },
-        },
-    ]);
+    const rules = ciRulesPages(
+        [
+            { type: "pull_request", parameters: {} },
+            {
+                type: "required_status_checks",
+                parameters: { required_status_checks: [{ context: "Visible" }] },
+            },
+        ],
+        [
+            {
+                type: "required_status_checks",
+                parameters: { required_status_checks: [{ context: "Test" }, { context: "Test" }] },
+            },
+        ],
+    );
 
     for (const terminal of ["pass", "skipping"]) {
         const passed = ciJson([ciCheck("pass", "Visible"), ciCheck(terminal, "Test")]);
@@ -580,21 +585,62 @@ test("CI wait: no-required output cannot enable all-checks fallback when rules r
     }
 });
 
+test("CI wait: a required context on a later rules page prevents the all-checks fallback", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 2 }, () => [
+            {
+                args: ciChecks,
+                result: {
+                    code: 1,
+                    stdout: "",
+                    stderr: "no required checks reported on the 'main' branch\n",
+                },
+            },
+            {
+                args: ["api", "repos/example/repo/rules/branches/main", "--paginate", "--slurp"],
+                result: ciRulesPages(
+                    [],
+                    [
+                        {
+                            type: "required_status_checks",
+                            parameters: { required_status_checks: [{ context: "Test" }] },
+                        },
+                    ],
+                ),
+            },
+            { args: ciConfirm, result: ciHead() },
+        ]).flat(),
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", { timeout_minutes: 1 }, fixture.deps),
+        /^TIMEOUT:/,
+    );
+    assert.deepEqual(fixture.waits, [30_000, 30_000]);
+    fixture.done();
+});
+
 test("CI wait: unreadable or malformed effective rules are ERROR, never a safe fallback", async () => {
     for (const rules of [
         { code: 1, stdout: "", stderr: "HTTP 403: denied" },
-        { ...ciJson([]), truncated: true },
+        { ...ciRulesPages([]), truncated: true },
         ciJson({}),
-        ciJson([null]),
-        ciJson([{ type: "required_status_checks" }]),
-        ciJson([{ type: "required_status_checks", parameters: { required_status_checks: {} } }]),
-        ciJson([
+        ciRulesPages([null]),
+        ciRulesPages([{ type: "pull_request" }], {}),
+        ciRulesPages([{ type: "required_status_checks" }]),
+        ciRulesPages([
+            { type: "required_status_checks", parameters: { required_status_checks: {} } },
+        ]),
+        ciRulesPages([
             {
                 type: "required_status_checks",
                 parameters: { required_status_checks: [{ context: "" }] },
             },
         ]),
-        ciJson([{ type: "required_status_checks", parameters: { required_status_checks: [{}] } }]),
+        ciRulesPages([
+            { type: "required_status_checks", parameters: { required_status_checks: [{}] } },
+        ]),
         { code: 0, stdout: "{", stderr: "" },
     ]) {
         for (const noRequired of [false, true]) {
@@ -708,22 +754,59 @@ test("CI wait: 1000 completed workflow rows are ERROR because a full cap may hid
     }
 });
 
-test("CI wait: effective rule paths exclude the host and encode the resolved base branch", async () => {
+test("CI wait: effective rule reads paginate and preserve the encoded base and host", async () => {
     const base = "release/1.0";
-    const fixture = ciFixture([
-        { args: ciView, result: ciPr("head-a", base) },
-        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
-        { args: ciConfirm, result: ciHead("head-a", base) },
-        {
-            args: ["api", "repos/example/repo/rules/branches/release%2F1.0"],
-            result: ciRuleNames("Test"),
-        },
-        { args: ciRuns(), result: ciJson([]) },
-        { args: ciConfirm, result: ciHead("head-a", base) },
-    ]);
 
-    assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
-    fixture.done();
+    for (const host of ["github.com", "github.example.com"]) {
+        const repo = `${host}/example/repo`;
+        const where = ["12", "--repo", repo];
+        const confirm = ["pr", "view", ...where, "--json", "headRefOid,baseRefName"];
+        const fixture = ciFixture([
+            {
+                args: ciView,
+                result: ciJson({
+                    number: 12,
+                    url: `https://${repo}/pull/12`,
+                    headRefOid: "head-a",
+                    baseRefName: base,
+                }),
+            },
+            {
+                args: ["pr", "checks", ...where, "--required", "--json", "name,bucket,link"],
+                result: ciJson([ciCheck("pass")]),
+            },
+            { args: confirm, result: ciHead("head-a", base) },
+            {
+                args: [
+                    "api",
+                    "repos/example/repo/rules/branches/release%2F1.0",
+                    "--paginate",
+                    "--slurp",
+                    ...(host === "github.com" ? [] : ["--hostname", host]),
+                ],
+                result: ciRuleNames("Test"),
+            },
+            {
+                args: [
+                    "run",
+                    "list",
+                    "--repo",
+                    repo,
+                    "--commit",
+                    "head-a",
+                    "--limit",
+                    "1000",
+                    "--json",
+                    "status,conclusion",
+                ],
+                result: ciJson([]),
+            },
+            { args: confirm, result: ciHead("head-a", base) },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+        fixture.done();
+    }
 });
 
 test("CI wait: a head change after rule and workflow gates cannot return a stale PASS", async () => {
