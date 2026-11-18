@@ -116,6 +116,18 @@ Install the files, then turn on **Desk** in **Menu → Extensions**. Team must b
 
 `PI_POCKET_DESK_CONFIG` names the config file, default `~/.config/pi-pocket-team/desk.json`, and every part reads it each time, so a change needs no restart. Its keys include `authors`, `ownAuthors`, `cap`, `export`, `exportCommit`, `digest` (`minutes` 15 by default; `now`, the kinds that go at once, by default `shift-blocked`, `answer-action`, `repair`, `issue-urgent`, `report-blocked`, `plan-approved`, `plan-verify`, `plan-revise` and `escalation-urgent`; `clerk`, the kinds that go to the Clerk, by default `report`, `shift`, `closed`, `queue` and `plan-decided`), `queue`, `journal`, `plans`, `archive`, `board` (the goal board's limits: `atOnce` 8, `rounds` 250, `reserve` 2 and `keep` 14 days by default; a value out of its bounds falls back to its default with 1 warning) and `meter` (the subscription meter: `providers` `["anthropic"]`, `pollMinutes` 5, `digestAt` 75 and `holdAt` null by default; off without the key; a bad value falls back to its default with 1 warning).
 
+Set the routine digest interval in `desk.json`, for example:
+
+```json
+{ "digest": { "minutes": 30 } }
+```
+
+The default remains 15 minutes. `minutes` accepts whole numbers from 0 to 240; 0 turns the digest off. Missing or invalid values use 15. Changes need no restart. A waiting window keeps its due time; later news uses the current setting and can join an earlier scheduled digest.
+
+Urgent news never waits for this interval: blocked reports, blocked or failed shifts, failed runs, PR repairs that wait on the supervisor, actionable Brian-answers, urgent issues and urgent Clerk escalations. Urgent queue reasons are `run failed: …`, `report says blocked` and `report asks Brian`. Due watches are routine queue news and batch unless `now` lists `queue`. `now` can make other kinds immediate. An urgent digest takes routine news already waiting, and a later empty window sends nothing.
+
+Timing and routing are independent. With a Clerk, kinds in `clerk` go to the Clerk unless `now` also lists them. Other kinds go to the supervisor; only escalation kinds always stay there. With the default lists, due watches batch for the Clerk and urgent queue news reaches the Clerk immediately. Without a Clerk, all news goes to the supervisor. The durable window and delivery checkpoint survive a restart without changing their keys. Details: [Digest interval and urgent news](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/desk.md#digest-interval-and-urgent-news).
+
 These Pocket documents hold the desk: `x.desk.threads` (the app-wide desk, with the goal board and `mergeReceipts`, the merge receipts of the last 48 hours), `x.desk.board-receipts` (the goal board's call receipts, 30 days), `x.desk.reports` (one thread session's full reports), `x.desk.nudges` (the delivery ids the desk took, the waiting nudges, and for each nudged sync its delivery times and its commit time) and `x.desk.observed` (the changes the sweeps saw, for the hooks' coverage alarm). They are stored data: never rename a kind or change what a field means. The page and its routes are owner-only.
 
 ## Read more
