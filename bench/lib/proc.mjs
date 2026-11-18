@@ -54,12 +54,34 @@ function start(bin, args, logFd, pipeStdout) {
  * Run a command with a timeout; its output goes to `logFile`. Returns `{ code, signal, timedOut, error }`.
  */
 export function runLogged({ bin, args, logFile, timeoutMs, killGraceMs = 10_000 }) {
-    const logFd = openSync(logFile, "a", 0o600);
+    return runChild({
+        bin,
+        args,
+        logFd: openSync(logFile, "a", 0o600),
+        timeoutMs,
+        killGraceMs,
+    });
+}
+
+/** Run a timed child; capture stdout only when `captureLimit` is set. The caller opens the log fd. */
+export function runChild({ bin, args, logFd, timeoutMs, killGraceMs, cwd, captureLimit }) {
+    const capture = captureLimit !== undefined;
 
     return new Promise((resolve) => {
-        const child = start(bin, args, logFd, false);
+        const child = spawn(bin, args, {
+            cwd,
+            detached: true,
+            stdio: ["ignore", capture ? "pipe" : logFd, logFd],
+        });
+        const chunks = [];
+        let size = 0;
         let timedOut = false;
         let graceTimer = null;
+
+        if (child.pid) {
+            running.add(child.pid);
+        }
+
         const timer = setTimeout(() => {
             timedOut = true;
             killGroup(child.pid, "SIGTERM");
@@ -67,7 +89,14 @@ export function runLogged({ bin, args, logFile, timeoutMs, killGraceMs = 10_000 
         }, timeoutMs);
         let settled = false;
 
-        const finish = (result) => {
+        child.stdout?.on("data", (chunk) => {
+            if (size < captureLimit) {
+                chunks.push(chunk);
+                size += chunk.length;
+            }
+        });
+
+        const finish = (code, signal, error) => {
             if (settled) {
                 return;
             }
@@ -76,12 +105,26 @@ export function runLogged({ bin, args, logFile, timeoutMs, killGraceMs = 10_000 
             clearTimeout(timer);
             clearTimeout(graceTimer);
             running.delete(child.pid);
-            closeSync(logFd);
-            resolve({ timedOut, ...result });
+
+            if (typeof logFd === "number") {
+                closeSync(logFd);
+            }
+
+            resolve(
+                capture
+                    ? {
+                          code,
+                          signal,
+                          timedOut,
+                          stdout: Buffer.concat(chunks).toString("utf8"),
+                          error,
+                      }
+                    : { timedOut, code, signal, error },
+            );
         };
 
-        child.on("error", (error) => finish({ code: null, signal: null, error: error.message }));
-        child.on("close", (code, signal) => finish({ code, signal, error: null }));
+        child.on("error", (error) => finish(null, null, error.message));
+        child.on("close", (code, signal) => finish(code, signal, null));
     });
 }
 

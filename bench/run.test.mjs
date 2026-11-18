@@ -16,7 +16,8 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { allowanceSpent, checkoutOf, prepare, runAttempt } from "./lib/runner.mjs";
 import { acquireSlots } from "./lib/slots.mjs";
-import { limitReached } from "./lib/proc.mjs";
+import { limitReached, runLogged } from "./lib/proc.mjs";
+import { runCaptured } from "./lib/exec.mjs";
 import { rm } from "node:fs/promises";
 import {
     BENCH,
@@ -99,6 +100,74 @@ async function withLease(fn) {
 
 /** The spend file of the fixture. */
 const spend = () => JSON.parse(readFileSync(join(fixture.data, "spend.json"), "utf8"));
+
+for (const code of [0, 7]) {
+    test(`runLogged returns exit ${code} and appends stdout and stderr to the log`, async () => {
+        const logFile = join(fixture.root, `logged-${code}.log`);
+
+        writeFileSync(logFile, "existing\n");
+
+        const result = await runLogged({
+            bin: process.execPath,
+            args: [
+                "-e",
+                `const fs = require("node:fs"); fs.writeSync(1, "stdout\\n"); fs.writeSync(2, "stderr\\n"); process.exitCode = ${code};`,
+            ],
+            logFile,
+            timeoutMs: 60_000,
+        });
+
+        assert.deepEqual(result, { code, signal: null, timedOut: false, error: null });
+        assert.equal(readFileSync(logFile, "utf8"), "existing\nstdout\nstderr\n");
+    });
+
+    test(`runCaptured returns exit ${code}, captures stdout and appends only stderr to the log`, async () => {
+        const logFile = join(fixture.root, `captured-${code}.log`);
+
+        writeFileSync(logFile, "existing\n");
+
+        const result = await runCaptured({
+            bin: process.execPath,
+            args: [
+                "-e",
+                `const fs = require("node:fs"); fs.writeSync(1, "stdout\\n"); fs.writeSync(2, "stderr\\n"); process.exitCode = ${code};`,
+            ],
+            logFile,
+            timeoutMs: 60_000,
+        });
+
+        assert.deepEqual(result, {
+            code,
+            signal: null,
+            timedOut: false,
+            stdout: "stdout\n",
+            error: null,
+        });
+        assert.equal(readFileSync(logFile, "utf8"), "existing\nstderr\n");
+    });
+}
+
+test("runCaptured accepts cwd, inherits it when omitted, and can run without a log", async () => {
+    for (const cwd of [undefined, fixture.repo]) {
+        const result = await runCaptured({
+            bin: process.execPath,
+            args: [
+                "-e",
+                'process.stdout.write(process.cwd()); process.stderr.write("discarded\\n");',
+            ],
+            timeoutMs: 60_000,
+            ...(cwd ? { cwd } : {}),
+        });
+
+        assert.deepEqual(result, {
+            code: 0,
+            signal: null,
+            timedOut: false,
+            stdout: cwd ?? process.cwd(),
+            error: null,
+        });
+    }
+});
 
 test("a dry run of each pilot task exits 0 with no data dir and no bwrap", async () => {
     const data = join(fixture.root, "no-data");

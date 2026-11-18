@@ -1,10 +1,9 @@
 // Commands of the harvester and the scorer: 1 command in the bwrap sandbox with no credential (setup, check,
 // hidden tests), with a timeout that ends its whole process group, its stdout captured and its stderr in a log.
-import { spawn } from "node:child_process";
-import { closeSync, lstatSync, openSync } from "node:fs";
+import { lstatSync, openSync } from "node:fs";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { killGroup, running } from "./proc.mjs";
+import { runChild } from "./proc.mjs";
 import { DEFAULTS, bwrapArgs, identityFiles } from "./sandbox.mjs";
 
 /** The most stdout kept from 1 command (a test reporter's output fits well under it). */
@@ -19,62 +18,14 @@ export const COMMAND_MS = 10 * 60_000;
  * Returns `{ code, signal, timedOut, stdout, error }`.
  */
 export function runCaptured({ bin, args, logFile, timeoutMs, killGraceMs = 10_000, cwd }) {
-    const logFd = logFile ? openSync(logFile, "a", 0o600) : "ignore";
-
-    return new Promise((done) => {
-        const child = spawn(bin, args, {
-            cwd,
-            detached: true,
-            stdio: ["ignore", "pipe", logFd],
-        });
-        const chunks = [];
-        let size = 0;
-        let timedOut = false;
-        let graceTimer = null;
-        let settled = false;
-
-        if (child.pid) {
-            running.add(child.pid);
-        }
-
-        const timer = setTimeout(() => {
-            timedOut = true;
-            killGroup(child.pid, "SIGTERM");
-            graceTimer = setTimeout(() => killGroup(child.pid, "SIGKILL"), killGraceMs);
-        }, timeoutMs);
-
-        child.stdout?.on("data", (chunk) => {
-            if (size < STDOUT_CAP) {
-                chunks.push(chunk);
-                size += chunk.length;
-            }
-        });
-
-        const finish = (code, signal, error) => {
-            if (settled) {
-                return;
-            }
-
-            settled = true;
-            clearTimeout(timer);
-            clearTimeout(graceTimer);
-            running.delete(child.pid);
-
-            if (typeof logFd === "number") {
-                closeSync(logFd);
-            }
-
-            done({
-                code,
-                signal,
-                timedOut,
-                stdout: Buffer.concat(chunks).toString("utf8"),
-                error,
-            });
-        };
-
-        child.on("error", (error) => finish(null, null, error.message));
-        child.on("close", (code, signal) => finish(code, signal, null));
+    return runChild({
+        bin,
+        args,
+        logFd: logFile ? openSync(logFile, "a", 0o600) : "ignore",
+        timeoutMs,
+        killGraceMs,
+        cwd,
+        captureLimit: STDOUT_CAP,
     });
 }
 
