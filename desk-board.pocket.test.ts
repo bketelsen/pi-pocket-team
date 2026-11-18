@@ -222,6 +222,7 @@ before(async () => {
     mkdirSync(dropIns, { recursive: true });
 
     for (const file of [
+        "_tool-time.ts",
         "team.ts",
         "desk.ts",
         "night-shift.ts",

@@ -10,6 +10,7 @@
         "types": ["node"]
     },
     "files": [
+        "_tool-time.ts",
         "team.ts",
         "homewiki.ts",
         "night-shift.ts",

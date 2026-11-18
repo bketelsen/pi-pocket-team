@@ -108,6 +108,7 @@ mkdirSync(extensions, { recursive: true });
 
 for (const file of [
     "desk.ts",
+    "_tool-time.ts",
     "_desk-usage.ts",
     "_desk-dashboard.ts",
     "_desk-metrics.ts",

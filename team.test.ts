@@ -63,10 +63,12 @@ test("linkedSend keeps follow-up delivery arguments", async () => {
 
     const result = await linkedSend(host, source, request, key);
 
+    assert.match(call?.request.message ?? "", /^Current time: [^\n]+\ncontinue$/);
+    assert.equal(request.message, "continue", "the caller's request is unchanged");
     assert.equal(result, undefined);
     assert.deepEqual(call, {
         source,
-        request: { ...request, steer: false },
+        request: { ...request, message: call?.request.message, steer: false },
         key,
     });
 });
@@ -101,6 +103,7 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
     const dropIns = join(root, "data", "extensions");
 
     mkdirSync(dropIns, { recursive: true });
+    cpSync(join(import.meta.dirname, "_tool-time.ts"), join(dropIns, "_tool-time.ts"));
     cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
     cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
     let requestContext = "";
@@ -592,6 +595,7 @@ test("2 delegations to 1 repository work in 2 worktrees, and the task says where
     const dropIns = join(root, "data", "extensions");
 
     mkdirSync(dropIns, { recursive: true });
+    cpSync(join(import.meta.dirname, "_tool-time.ts"), join(dropIns, "_tool-time.ts"));
     cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
     cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
     const app = await openApp(model);
