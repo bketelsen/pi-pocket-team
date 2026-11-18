@@ -1897,6 +1897,16 @@ describe("Clerk routine closure suppression", () => {
         assert.match(text, /review result: Ready/);
         assert.match(text, /probably done/);
         assert.doesNotMatch(text, /closed: done/);
+
+        const report = reports[1]!;
+        const besideClose = splitDigest([report, closed], true, config, stateOf(safe()));
+
+        assert.deepEqual(besideClose, { theirs: [report], ours: [] });
+        assert.deepEqual(digestShown(besideClose.theirs), [report]);
+        assert.deepEqual(digestText(besideClose.theirs).split("\n"), [
+            "[desk] digest: 1 new. Read each with desk read <id> before you act.",
+            report.line,
+        ]);
     });
 
     test("no Clerk and supervisor routing keep the existing closure news", () => {
