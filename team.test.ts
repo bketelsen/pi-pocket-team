@@ -23,7 +23,10 @@ import { after, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import type { Host } from "./_pocket.d.ts";
+import createTeam, * as teamModule from "./team.ts";
 import {
+    type CiCommandResult,
+    type CiRunner,
     delegationWorktree,
     FRONT_DOOR_DESK_OFF,
     Identity,
@@ -35,6 +38,437 @@ import {
     teamMessageProblems,
     linkedSend,
 } from "./team.ts";
+
+/** A reverted Team module must fail an assertion about the blocking CI wait, not fail module loading. */
+async function waitForCi(...args: Parameters<typeof teamModule.waitForCi>): Promise<string> {
+    assert.equal(
+        typeof teamModule.waitForCi,
+        "function",
+        "Team must provide the blocking CI wait through waitForCi.",
+    );
+
+    return await teamModule.waitForCi(...args);
+}
+
+const ciUrl = "https://github.com/example/repo/pull/12";
+const ciRepo = "github.com/example/repo";
+const ciWhere = ["12", "--repo", ciRepo];
+const ciView = ["pr", "view", "--json", "number,url,headRefOid"];
+const ciConfirm = ["pr", "view", ...ciWhere, "--json", "headRefOid"];
+const ciChecks = ["pr", "checks", ...ciWhere, "--required", "--json", "name,bucket,link"];
+const ciAllChecks = ["pr", "checks", ...ciWhere, "--json", "name,bucket,link"];
+const ciJson = (value: unknown, code = 0): CiCommandResult => ({
+    code,
+    stdout: JSON.stringify(value),
+    stderr: "",
+});
+const ciPr = (head = "head-a") => ciJson({ number: 12, url: ciUrl, headRefOid: head });
+const ciHead = (head = "head-a") => ciJson({ headRefOid: head });
+const ciCheck = (bucket: string, name = "Test", link = "") => ({ name, bucket, link });
+
+/** Exact command scripts and an injected monotonic clock: no GitHub calls and no timer sleeps. */
+function ciFixture(
+    steps: { args: string[]; result: CiCommandResult; elapsed?: number; tail?: boolean }[],
+) {
+    let time = 0;
+    let calls = 0;
+    const waits: number[] = [];
+    const observed: { args: string[]; cwd: string; timeoutMs: number; tail?: boolean }[] = [];
+
+    const run: CiRunner = async (args, options) => {
+        const step = steps[calls++];
+
+        observed.push({ args, ...options });
+        assert(step, `Unexpected gh call: ${JSON.stringify(args)}`);
+        time += step.elapsed ?? 0;
+
+        return step.result;
+    };
+
+    return {
+        deps: {
+            run,
+            now: () => time,
+            wait: async (ms: number) => {
+                waits.push(ms);
+                time += ms;
+            },
+        },
+        waits,
+        done: () => {
+            // Check outside waitForCi: its ERROR result must not hide a failed fixture assertion.
+            assert.equal(calls, steps.length, "Every scripted command ran exactly once");
+            assert.deepEqual(
+                observed.map((call) => call.args),
+                steps.map((step) => step.args),
+            );
+
+            for (const [index, call] of observed.entries()) {
+                assert.equal(call.cwd, "/session/current-folder");
+                assert.equal(call.tail, steps[index]!.tail ?? false);
+                assert(call.timeoutMs > 0 && call.timeoutMs <= 30_000);
+            }
+        },
+    };
+}
+
+test("CI wait: no checks and pending checks wait; pass/skipping need same-head confirmation", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson([]) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciChecks, result: ciJson([ciCheck("pass"), ciCheck("skipping", "Optional")]) },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+    const result = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+    assert.match(
+        result,
+        /^PASS: github.com\/example\/repo#12 \(head-a\); all required checks passed or skipped\.$/,
+    );
+    assert.deepEqual(fixture.waits, [10_000, 10_000]);
+    fixture.done();
+});
+
+test("CI wait: no rows, no checks yet, and unknown buckets time out, never pass", async () => {
+    for (const result of [
+        ciJson([]),
+        { code: 0, stdout: "", stderr: "" },
+        { code: 1, stdout: "", stderr: "no checks reported on the 'feature' branch\n" },
+        ciJson([ciCheck("pending")], 8),
+        ciJson([ciCheck("unknown")]),
+    ]) {
+        const observations = Array.from({ length: 6 }, () => [
+            { args: ciChecks, result },
+            { args: ciConfirm, result: ciHead() },
+        ]).flat();
+        const fixture = ciFixture([{ args: ciView, result: ciPr() }, ...observations]);
+        const text = await waitForCi(
+            "/session/current-folder",
+            { timeout_minutes: 1 },
+            fixture.deps,
+        );
+
+        assert.match(text, /^TIMEOUT:/);
+        assert.doesNotMatch(text, /PASS/);
+        assert.equal(
+            fixture.waits.reduce((sum, ms) => sum + ms, 0),
+            60_000,
+        );
+        fixture.done();
+    }
+});
+
+test("CI wait: a cancelled check fails at once, even when another check is pending", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        {
+            args: ciChecks,
+            result: ciJson([ciCheck("pending"), ciCheck("cancel", "Cancelled test")], 1),
+        },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+    const result = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+    assert.match(result, /^FAIL:/);
+    assert.match(result, /Cancelled test \(cancel\)/);
+    assert.match(result, /Log unavailable: not an Actions run\/job link/);
+    assert.deepEqual(fixture.waits, []);
+    fixture.done();
+});
+
+test("CI wait: failing jobs include only 3 bounded log tails, with an 8000-character total", async () => {
+    const failed = Array.from({ length: 4 }, (_, index) =>
+        ciCheck(
+            "fail",
+            `job-${String(index + 1)}`,
+            `https://github.com/example/repo/actions/runs/99/${index === 1 ? "job" : "jobs"}/${String(index + 1)}`,
+        ),
+    );
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson(failed, 1) },
+        { args: ciConfirm, result: ciHead() },
+        ...failed.slice(0, 3).map((_check, index) => ({
+            args: ["run", "view", "99", "--repo", ciRepo, "--job", String(index + 1), "--log"],
+            result: {
+                code: 0,
+                stdout: `OMITTED-${String(index)}${"x".repeat(10_000)}TAIL-${String(index)}`,
+                stderr: "",
+            },
+            tail: true,
+        })),
+    ]);
+    const result = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+    assert.match(result, /^FAIL:/);
+    assert(result.length <= 8000);
+
+    for (let index = 0; index < 3; index++) {
+        assert(result.includes(`TAIL-${String(index)}`));
+        const section = result
+            .split(`- job-${String(index + 1)} (fail)\n`)[1]!
+            .split("\n- job-")[0]!;
+
+        assert(section.length <= 3000);
+    }
+
+    assert.doesNotMatch(result, /OMITTED|job-4/);
+    assert.deepEqual(fixture.waits, []);
+    fixture.done();
+});
+
+test("CI wait: external, run-only and unrelated job links never become Actions job ids", async () => {
+    for (const link of [
+        "https://ci.example/jobs/1",
+        "https://github.com/example/repo/actions/runs/99",
+        "https://github.com/other/repo/actions/runs/99/jobs/1",
+        "https://ci.example/example/repo/actions/runs/99/jobs/1",
+        "not a URL",
+    ]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("fail", "Test", link)], 1) },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", {}, fixture.deps),
+            /^FAIL:.*\n- Test \(fail\)\nLog unavailable:/,
+        );
+        fixture.done();
+    }
+});
+
+test("CI wait: no PR is explicit and an auth error is not no PR", async () => {
+    for (const [stderr, prefix] of [
+        ["no pull requests found for branch feature", "NO PR:"],
+        ["GraphQL: Could not resolve to a PullRequest", "NO PR:"],
+        ["HTTP 401: Bad credentials", "ERROR:"],
+    ]) {
+        const fixture = ciFixture([
+            { args: ciView, result: { code: 1, stdout: "", stderr: stderr! } },
+        ]);
+        const text = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+        assert(text.startsWith(prefix!));
+        assert.doesNotMatch(text, /PASS/);
+        fixture.done();
+    }
+});
+
+test("CI wait: only stderr's no-required-checks message enables the all-checks fallback", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        {
+            args: ciChecks,
+            result: {
+                code: 1,
+                stdout: "",
+                stderr: "no required checks reported on the 'main' branch\n",
+            },
+        },
+        { args: ciAllChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^PASS:.*all checks \(none required\)/,
+    );
+    fixture.done();
+
+    const failed = ciFixture([
+        { args: ciView, result: ciPr() },
+        {
+            args: ciChecks,
+            result: ciJson(
+                [ciCheck("fail", "no required checks reported on the 'main' branch")],
+                1,
+            ),
+        },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, failed.deps), /^FAIL:/);
+    failed.done();
+});
+
+test("CI wait: a new head discards green and failed observations and starts checking again", async () => {
+    for (const bucket of ["pass", "fail"]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck(bucket)], bucket === "fail" ? 1 : 0) },
+            { args: ciConfirm, result: ciHead("head-b") },
+            { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+            { args: ciConfirm, result: ciHead("head-b") },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead("head-b") },
+        ]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", {}, fixture.deps),
+            /^PASS:.*\(head-b\)/,
+        );
+        assert.deepEqual(fixture.waits, [10_000]);
+        fixture.done();
+    }
+});
+
+test("CI wait: numeric, URL and repository selectors resolve first, then use the canonical base repository", async () => {
+    for (const [pr, selector] of [
+        [12, ["12"]],
+        ["12", ["12"]],
+        [ciUrl, ["12", "--repo", ciRepo]],
+        ["example/repo#12", ["12", "--repo", "example/repo"]],
+    ] as const) {
+        const fixture = ciFixture([
+            {
+                args: ["pr", "view", ...selector, "--json", "number,url,headRefOid"],
+                result: ciPr(),
+            },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", { pr }, fixture.deps), /^PASS:/);
+        fixture.done();
+    }
+});
+
+test("CI wait: timeout includes command time and never returns a late pass", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead(), elapsed: 60_000 },
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", { timeout_minutes: 1 }, fixture.deps),
+        /^TIMEOUT:/,
+    );
+    fixture.done();
+});
+
+test("CI wait: bounded/malformed output and command errors cannot pass or fall back", async () => {
+    for (const result of [
+        { ...ciJson([ciCheck("pass")]), truncated: true },
+        ciJson({ bucket: "pass" }),
+        ciJson([{ bucket: "pass" }]),
+        { code: 0, stdout: "{", stderr: "" },
+        { code: 1, stdout: "", stderr: "HTTP 403: denied" },
+        { code: null, stdout: "", stderr: "gh command timed out" },
+    ]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^ERROR:/);
+        fixture.done();
+    }
+});
+
+test("CI wait: bad inputs do not start a child process, and timeout accepts 1 through 60 only", async () => {
+    for (const pr of [
+        0,
+        -1,
+        1.5,
+        "--help",
+        "12; echo bad",
+        "",
+        "https://github.com/example/repo/issues/12",
+    ]) {
+        const fixture = ciFixture([]);
+
+        assert.match(await waitForCi("/session/current-folder", { pr }, fixture.deps), /^ERROR:/);
+        fixture.done();
+    }
+
+    for (const timeout_minutes of [0, 61, 1.5, NaN]) {
+        const fixture = ciFixture([]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", { timeout_minutes }, fixture.deps),
+            /^ERROR: timeout_minutes/,
+        );
+        fixture.done();
+    }
+
+    for (const timeout_minutes of [1, 60]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", { timeout_minutes }, fixture.deps),
+            /^PASS:/,
+        );
+        fixture.done();
+    }
+});
+
+test("team_wait_for_ci is an ordinary, read-only, replay-safe tool and is always available to subagents", async () => {
+    const symbol = Symbol.for("pi-pocket-team.team");
+    const holder = globalThis as unknown as Record<symbol, unknown>;
+    const previous = holder[symbol];
+
+    try {
+        const extension = createTeam(
+            { text: { defang: (text: string) => text }, linkedSessions: {} } as never,
+            {
+                conversationRoute() {},
+                route() {},
+                client() {},
+                command() {},
+                send() {},
+                onDispose() {},
+            } as never,
+        ) as unknown as {
+            tools: {
+                name: string;
+                subagents?: string;
+                deferred?: boolean;
+                replay?: string;
+                annotations?: { readOnlyHint?: boolean };
+                execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+            }[];
+        };
+        const tool = extension.tools.find((each) => each.name === "team_wait_for_ci");
+
+        assert(tool);
+        assert.equal(tool.subagents, "always");
+        assert.equal(tool.annotations?.readOnlyHint, true);
+        assert.equal(tool.replay, "safe");
+        assert.notEqual(tool.deferred, true);
+        // The tool reads the caller's folder through api.agent, without requiring a named identity.
+        let reads = 0;
+        const result = await tool.execute(
+            {},
+            {
+                agent: async () => {
+                    reads++;
+
+                    return {};
+                },
+            },
+            context,
+        );
+
+        assert.equal(reads, 1);
+        assert.match(JSON.stringify(result), /This session has no current folder/);
+    } finally {
+        if (previous === undefined) {
+            delete holder[symbol];
+        } else {
+            holder[symbol] = previous;
+        }
+    }
+});
 
 test("linkedSend keeps follow-up delivery arguments", async () => {
     const source = 42 as import("@earendil-works/pi-durable").ConversationId;

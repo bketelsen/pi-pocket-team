@@ -2,7 +2,7 @@
  * Brian's named agents: select a session identity, delegate to named teammates, and keep lessons for each agent.
  * Reads souls and model preferences from ~/.config/pi-pocket-team/agents; no stomp history, notebooks, or credentials.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, readFile, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -25,7 +25,7 @@ import {
     type JsonObject,
     type Tx,
 } from "@earendil-works/pi-durable";
-import type { Host, Web } from "./_pocket.d.ts";
+import type { Host, ToolOptions, Web } from "./_pocket.d.ts";
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
 export async function linkedSend(
@@ -227,6 +227,366 @@ const runGit = promisify(execFile);
 /** One git command, with a timeout: a git that hangs must not hold a delegation. */
 const git = (folder: string, args: string[], timeout = 10_000) =>
     runGit("git", ["-C", folder, ...args], { timeout, encoding: "utf8" });
+
+/** The bounded result of a read-only gh command. A truncated JSON result must never be used. */
+export type CiCommandResult = {
+    code: number | null;
+    stdout: string;
+    stderr: string;
+    truncated?: boolean;
+};
+
+export type CiRunner = (
+    args: string[],
+    options: { cwd: string; timeoutMs: number; tail?: boolean },
+) => Promise<CiCommandResult>;
+
+/** Run gh without a shell. Keep bounded JSON or the end of a job log, and terminate hung commands. */
+export const runCiGh: CiRunner = (args, { cwd, timeoutMs, tail = false }) =>
+    new Promise((resolve, reject) => {
+        const child = spawn("gh", args, {
+            cwd,
+            shell: false,
+            stdio: ["ignore", "pipe", "pipe"],
+            env: { ...process.env, GH_PROMPT_DISABLED: "1", GH_PAGER: "cat", NO_COLOR: "1" },
+        });
+        const limit = tail ? 3000 : 256_000;
+        let stdout = "";
+        let stderr = "";
+        let truncated = false;
+        let timedOut = false;
+        const timer = setTimeout(() => {
+            timedOut = true;
+            child.kill("SIGKILL");
+        }, timeoutMs);
+
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (text: string) => {
+            if (tail) {
+                stdout = (stdout + text).slice(-limit);
+            } else {
+                truncated ||= stdout.length + text.length > limit;
+                stdout = (stdout + text).slice(0, limit);
+            }
+        });
+        child.stderr.on("data", (text: string) => {
+            stderr = (stderr + text).slice(-3000);
+        });
+        child.on("error", (error) => {
+            clearTimeout(timer);
+            reject(error);
+        });
+        child.on("close", (code) => {
+            clearTimeout(timer);
+            resolve({
+                code,
+                stdout,
+                stderr: timedOut ? "gh command timed out" : stderr,
+                truncated,
+            });
+        });
+    });
+
+export type CiWaitDependencies = {
+    run: CiRunner;
+    now: () => number;
+    wait: (ms: number) => Promise<void>;
+};
+
+/** A canonical PR address identifies the base repository, not a contributor's head repository. */
+function ciPrAddress(value: string): { repo: string; number: string; url: string } {
+    if (value.length > 2048) {
+        throw new Error("The PR URL is longer than 2048 characters.");
+    }
+
+    const url = new URL(value);
+    const match = /^\/([^/]+)\/([^/]+)\/pull\/([1-9][0-9]*)\/?$/.exec(url.pathname);
+
+    if (
+        url.protocol !== "https:" ||
+        url.username !== "" ||
+        url.password !== "" ||
+        url.port !== "" ||
+        match === null ||
+        !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(
+            `${match[1]}/${match[2]}`,
+        ) ||
+        !Number.isSafeInteger(Number(match[3]))
+    ) {
+        throw new Error("Use a PR number, owner/name#12, or an HTTPS pull request URL.");
+    }
+
+    return {
+        repo: `${url.host}/${match[1]}/${match[2]}`,
+        number: match[3]!,
+        url: `${url.origin}/${match[1]}/${match[2]}/pull/${match[3]}`,
+    };
+}
+
+/** Validate the selector before gh sees it: no flags, branch expressions or shell syntax. */
+function ciPrSelector(pr: number | string | undefined): string[] {
+    if (pr === undefined) {
+        return [];
+    }
+
+    const value = String(pr).trim();
+
+    if (/^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value))) {
+        return [value];
+    }
+
+    const ref = /^([A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)$/.exec(
+        value,
+    );
+
+    if (ref !== null && Number.isSafeInteger(Number(ref[2]))) {
+        return [ref[2]!, "--repo", ref[1]!];
+    }
+
+    const address = ciPrAddress(value);
+
+    return [address.number, "--repo", address.repo];
+}
+
+type CiCheck = { name: string; bucket: string; link: string };
+const ciLine = (text: string, max = 200): string => text.replace(/\s+/g, " ").trim().slice(0, max);
+
+/**
+ * Wait in this call, using required checks unless gh explicitly reports that none are required. Empty and unknown
+ * buckets never pass. The deadline covers resolution, polling and logs; a new head discards the old observation,
+ * without extending that deadline. Dependencies keep tests free of network calls and real-time waits.
+ */
+export async function waitForCi(
+    cwd: string,
+    args: { pr?: number | string; timeout_minutes?: number },
+    dependencies: CiWaitDependencies = {
+        run: runCiGh,
+        now: () => performance.now(),
+        wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    },
+): Promise<string> {
+    const minutes = args.timeout_minutes ?? 30;
+
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+        return "ERROR: timeout_minutes must be a whole number from 1 to 60.";
+    }
+
+    const { run, now, wait } = dependencies;
+    const deadline = now() + minutes * 60_000;
+    let label = "CI";
+    const timeout = () => `TIMEOUT: ${label}; CI did not finish within ${String(minutes)} minutes.`;
+
+    const command = async (argv: string[], tail = false) => {
+        const remaining = deadline - now();
+
+        if (remaining <= 0) {
+            throw new Error("CI wait deadline reached");
+        }
+
+        const result = await run(argv, { cwd, timeoutMs: Math.min(30_000, remaining), tail });
+
+        if (now() >= deadline) {
+            throw new Error("CI wait deadline reached");
+        }
+
+        return result;
+    };
+
+    const json = (result: CiCommandResult): unknown => {
+        if (result.truncated === true) {
+            throw new Error("gh output exceeded the bounded JSON limit");
+        }
+
+        return JSON.parse(result.stdout);
+    };
+
+    const reason = (result: CiCommandResult) => ciLine(result.stderr || "gh could not read CI");
+
+    try {
+        const resolved = await command([
+            "pr",
+            "view",
+            ...ciPrSelector(args.pr),
+            "--json",
+            "number,url,headRefOid",
+        ]);
+
+        if (resolved.code !== 0) {
+            return /no pull requests? found|could not resolve to a pull\s?request/i.test(
+                resolved.stderr,
+            )
+                ? "NO PR: No pull request was found for this branch or selector."
+                : `ERROR: Cannot resolve the PR: ${reason(resolved)}`;
+        }
+
+        const pr = json(resolved) as { number?: unknown; url?: unknown; headRefOid?: unknown };
+
+        if (
+            typeof pr.url !== "string" ||
+            typeof pr.headRefOid !== "string" ||
+            pr.headRefOid === ""
+        ) {
+            throw new Error("gh returned no PR address or head SHA");
+        }
+
+        const address = ciPrAddress(pr.url);
+
+        if (pr.number !== Number(address.number)) {
+            throw new Error("gh returned inconsistent PR identity");
+        }
+
+        label = `${address.repo}#${address.number}`;
+        const where = [address.number, "--repo", address.repo];
+        let head = pr.headRefOid;
+
+        while (now() < deadline) {
+            let all = false;
+            let result = await command([
+                "pr",
+                "checks",
+                ...where,
+                "--required",
+                "--json",
+                "name,bucket,link",
+            ]);
+
+            if (
+                result.code === 1 &&
+                result.stderr
+                    .split("\n")
+                    .some((line) =>
+                        /^no required checks reported on the .* branch$/.test(line.trim()),
+                    )
+            ) {
+                all = true;
+                result = await command(["pr", "checks", ...where, "--json", "name,bucket,link"]);
+            }
+
+            const noChecks =
+                result.code === 1 &&
+                /^no checks reported on the .* branch\s*$/.test(result.stderr.trim());
+
+            if (!noChecks && ![0, 1, 8].includes(result.code ?? -1)) {
+                throw new Error(reason(result));
+            }
+
+            if (result.code === 1 && !noChecks && result.stdout.trim() === "") {
+                throw new Error(reason(result));
+            }
+
+            const rows = noChecks || result.stdout.trim() === "" ? [] : json(result);
+
+            if (
+                !Array.isArray(rows) ||
+                !rows.every((row: unknown) => {
+                    const check = row as CiCheck | null;
+
+                    return (
+                        check !== null &&
+                        typeof check === "object" &&
+                        typeof check.name === "string" &&
+                        typeof check.bucket === "string" &&
+                        typeof check.link === "string"
+                    );
+                })
+            ) {
+                throw new Error("gh returned malformed check rows");
+            }
+
+            // Read after the check observation, including failures: an old head's result is never this head's result.
+            const confirmation = await command(["pr", "view", ...where, "--json", "headRefOid"]);
+
+            if (confirmation.code !== 0) {
+                throw new Error(reason(confirmation));
+            }
+
+            const current = (json(confirmation) as { headRefOid?: unknown }).headRefOid;
+
+            if (typeof current !== "string" || current === "") {
+                throw new Error("gh returned no head SHA for confirmation");
+            }
+
+            if (current !== head) {
+                head = current;
+                continue;
+            }
+
+            const failed = (rows as CiCheck[]).filter(
+                (row) => row.bucket === "fail" || row.bucket === "cancel",
+            );
+
+            if (failed.length > 0) {
+                let text = `FAIL: ${label} (${head.slice(0, 12)}); ${String(failed.length)} failed/cancelled checks.`;
+
+                for (const check of failed.slice(0, 3)) {
+                    text += `\n- ${ciLine(check.name)} (${check.bucket})`;
+                    let log = "Log unavailable: not an Actions run/job link.";
+
+                    try {
+                        const link = check.link === "" ? undefined : new URL(check.link);
+                        const ids =
+                            /^\/([^/]+)\/([^/]+)\/actions\/runs\/([0-9]+)\/jobs?\/([0-9]+)\/?$/.exec(
+                                link?.pathname ?? "",
+                            );
+
+                        if (
+                            link?.protocol === "https:" &&
+                            ids !== null &&
+                            `${link.host}/${ids[1]}/${ids[2]}`.toLowerCase() ===
+                                address.repo.toLowerCase()
+                        ) {
+                            const logs = await command(
+                                [
+                                    "run",
+                                    "view",
+                                    ids[3]!,
+                                    "--repo",
+                                    address.repo,
+                                    "--job",
+                                    ids[4]!,
+                                    "--log",
+                                ],
+                                true,
+                            );
+
+                            log =
+                                logs.code === 0
+                                    ? logs.stdout.slice(-3000) ||
+                                      "Log unavailable: job has no log yet."
+                                    : `Log unavailable: ${reason(logs)}`;
+                        }
+                    } catch {
+                        log = "Log unavailable: the link is invalid or the log request failed.";
+                    }
+
+                    // Reserve room for the next check's name. Keep the end, not the start, of every job log.
+                    const budget = Math.min(3000, Math.max(0, 8000 - text.length - 500));
+
+                    text += `\n${budget === 0 ? "" : log.slice(-budget)}`;
+                }
+
+                return text.slice(0, 8000);
+            }
+
+            if (
+                result.code === 0 &&
+                rows.length > 0 &&
+                rows.every((row: CiCheck) => row.bucket === "pass" || row.bucket === "skipping")
+            ) {
+                return `PASS: ${label} (${head.slice(0, 12)}); all ${all ? "checks (none required)" : "required checks"} passed or skipped.`;
+            }
+
+            await wait(Math.min(10_000, Math.max(0, deadline - now())));
+        }
+
+        return timeout();
+    } catch (error) {
+        return now() >= deadline
+            ? timeout()
+            : `ERROR: ${label}; ${ciLine(String((error as Error).message ?? error))}`;
+    }
+}
 
 /** The first non-empty line of git's error, on one line, at most 200 characters. */
 function gitReason(error: unknown): string {
@@ -5170,6 +5530,41 @@ export default function createTeam(host: Host, web: Web) {
         { annotations: { readOnlyHint: true } },
     );
 
+    const waitForCiTool = Object.assign(
+        defineTool({
+            name: "team_wait_for_ci",
+            description:
+                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, or NO PR. Uses required checks, or all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
+            parameters: Type.Object({
+                pr: Type.Optional(
+                    Type.Union([
+                        Type.Integer({ minimum: 1 }),
+                        Type.String({
+                            minLength: 1,
+                            maxLength: 2048,
+                            description: "PR number, HTTPS URL, or owner/name#12.",
+                        }),
+                    ]),
+                ),
+                timeout_minutes: Type.Optional(
+                    Type.Integer({ minimum: 1, maximum: 60, default: 30 }),
+                ),
+            }),
+            replay: "safe",
+            execute: async (args, api, context) => {
+                const cwd = (await api.agent(context)).cwd;
+
+                return reply(
+                    cwd === undefined
+                        ? "ERROR: This session has no current folder."
+                        : await waitForCi(cwd, args),
+                );
+            },
+        }),
+        { annotations: { readOnlyHint: true } },
+        { subagents: "always" } satisfies ToolOptions,
+    );
+
     /**
      * A home session must not change a repository: the repository's AGENTS.md, skills and memory never load there, so
      * the change would go out without its rules. `edit` and `write` are blocked into any roster repository, or a
@@ -5323,7 +5718,7 @@ export default function createTeam(host: Host, web: Web) {
 
     return defineExtension({
         name: "named-team",
-        tools: [delegateTool, work, message, list, teamMemory],
+        tools: [delegateTool, work, message, list, teamMemory, waitForCiTool],
         hooks: [homeGuard, mcpGuard, privateGuard],
         sections: [
             section("named_team", async (input, context) => {

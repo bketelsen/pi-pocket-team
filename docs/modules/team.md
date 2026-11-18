@@ -105,6 +105,39 @@ The tool takes an optional `shift` object, `{ objective?, stop_when, start?, unt
 }
 ```
 
+## Wait for CI
+
+`team_wait_for_ci` waits for a PR's CI and returns the result in the same tool call. It is in Team's tools list for ordinary sessions, with no named identity required. The `subagents: "always"` marker also supplies it to subagents with a tool list when Team is enabled there. It blocks only that tool call, not the server or other sessions. It is read-only and safe to replay.
+
+The tool runs `gh` without a shell, in the calling session's current folder. It resolves the PR and its repository before polling checks.
+
+| Input             | Meaning                                                                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pr`              | Optional PR number (number or string), HTTPS pull request URL, or `owner/name#12` in a repository the tool can read. Default: the current branch's PR. |
+| `timeout_minutes` | Optional whole number from 1 to 60. Default: 30. The original deadline covers resolution, polling and log requests.                                    |
+
+For example:
+
+```json
+{ "pr": "example/repo#12", "timeout_minutes": 20 }
+```
+
+**Which checks count.** Each observation starts with `gh pr checks --required`. It falls back to all checks only when that command exits 1 and a line of **stderr** matches `no required checks reported on the .* branch`, for example `no required checks reported on the 'main' branch`. A failing check, a pending check or another command error does not enable the fallback.
+
+**When it finishes.** No checks yet, no rows, pending checks and unknown buckets keep waiting. A `fail` or `cancel` bucket returns `FAIL` without waiting for the other checks. The tool confirms the head after each check observation: a changed head discards the observation and starts checking again within the original deadline. It returns `PASS` only for a non-empty set of terminal `pass` or `skipping` checks, with a successful checks command and a same-head confirmation. In fallback mode, that rule applies to all checks instead of required checks.
+
+The result starts with one of:
+
+- `PASS`: the checks passed or skipped on the confirmed head.
+- `FAIL`: at least 1 check failed or was cancelled. The result includes at most 3 such checks and at most 3000 tail characters per job log, with an 8000-character total result limit. Actions run/job ids come only from `/actions/runs/<run>/job/<job>` or `/actions/runs/<run>/jobs/<job>` links in the same repository. Other links, or logs it cannot read, get a log-unavailable note.
+- `TIMEOUT`: the original deadline expired without a completed result. This never means pass.
+- `NO PR`: no pull request was found for the branch or selector.
+- `ERROR`: the input, folder, PR resolution or check read could not be used. This never means pass.
+
+**Not `watch_pr`.** Pocket's `watch_pr` starts an asynchronous event watch. It returns after starting, then sends later messages for failures, conflicts or reviewer activity; it returns no CI success result. `team_wait_for_ci` returns the CI result here and sends no later watch messages.
+
+The [implementation](../../team.ts) and [deterministic tests](../../team.test.ts) define the behavior. See also the [user summary](../../site/content/modules/team.md#wait-for-ci).
+
 ## Agent homes
 
 An agent can have a home: 1 folder of its own, such as `~/agents/duncan`, with an AGENTS.md, `notes/`, `plans/` and `reports/`, apart from every repository. The profile names it with `home:`. A home is a local git repository with no remote, and it never gets a worktree.
