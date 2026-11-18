@@ -2930,6 +2930,8 @@ export function watchConditionText(condition: WatchCondition): string {
         : `run:${condition.repo}#${String(condition.id)} succeeded`;
 }
 
+/** The page size of the branch rules read: a result of this many rows may be cut, so it is unknown. */
+const WATCH_RULES_PAGE = 100;
 const watchResultLine = (text: string): string => flatLine(text).slice(0, MAX_LINE);
 const watchUnknown = (text: string): WatchDecision => ({
     status: "unknown",
@@ -3044,7 +3046,9 @@ export async function readWatchCondition(
                 `${path}/branches/${encodeURIComponent(base)}/protection/required_status_checks`,
             ),
         );
-        const rules = await api(`${path}/rules/branches/${encodeURIComponent(base)}`);
+        const rules = await api(
+            `${path}/rules/branches/${encodeURIComponent(base)}?per_page=${String(WATCH_RULES_PAGE)}`,
+        );
 
         if (
             !Array.isArray(protection.contexts) ||
@@ -3052,6 +3056,11 @@ export async function readWatchCondition(
             !Array.isArray(rules)
         ) {
             return watchUnknown(`${label}: required checks are not known`);
+        }
+
+        // One page only: a full page may hide a required check on the next page, so it never proves green.
+        if (rules.length >= WATCH_RULES_PAGE) {
+            return watchUnknown(`${label}: branch rules may be cut at ${String(WATCH_RULES_PAGE)}`);
         }
 
         const required: { name: string; app: number | null }[] = [];

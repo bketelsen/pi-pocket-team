@@ -6628,6 +6628,59 @@ describe("machine watch conditions", () => {
         data.runs.check_runs[0]!.conclusion = "failure";
         assert.equal((await readWatchCondition(condition, facts(), reader(data))).status, "fail");
     });
+    test("branch rules beyond the default page or at the page limit cannot prove green (B1)", async () => {
+        const pageSize = 100;
+
+        for (const hiddenAt of [31, pageSize, pageSize + 1]) {
+            const rules = [
+                ...Array.from({ length: hiddenAt - 1 }, () => ({ type: "pull_request" })),
+                {
+                    type: "required_status_checks",
+                    parameters: {
+                        required_status_checks: [{ context: "Hidden", integration_id: 1 }],
+                    },
+                },
+            ];
+            const api = reader();
+            let requested = "";
+            const result = await readWatchCondition(condition, facts(), async (path) => {
+                if (!path.includes("/rules/")) {
+                    return api(path);
+                }
+
+                requested = path;
+                const limit = Number(new URLSearchParams(path.split("?")[1]).get("per_page") ?? 30);
+
+                return rules.slice(0, limit);
+            });
+
+            assert.equal(
+                requested,
+                `repos/frostyard/test/rules/branches/main?per_page=${String(pageSize)}`,
+            );
+            assert.equal(result.status, "unknown", `required rule at row ${String(hiddenAt)}`);
+            assert.match(
+                result.text,
+                hiddenAt < pageSize
+                    ? /missing or ambiguous required check Hidden/
+                    : /branch rules may be cut/,
+            );
+        }
+    });
+    test("a branch-rules page below the limit can prove green; a full or excessive page cannot (B1)", async () => {
+        const pageSize = 100;
+
+        for (const count of [pageSize - 1, pageSize, pageSize + 1]) {
+            const api = reader();
+            const result = await readWatchCondition(condition, facts(), async (path) =>
+                path.includes("/rules/")
+                    ? Array.from({ length: count }, () => ({ type: "pull_request" }))
+                    : api(path),
+            );
+
+            assert.equal(result.status, count < pageSize ? "pass" : "unknown", String(count));
+        }
+    });
     test("an incomplete read, unknown requirements, missing check and ambiguous check stay unknown", async () => {
         assert.equal((await readWatchCondition(condition, undefined, reader())).status, "unknown");
         assert.equal(
@@ -6739,6 +6792,35 @@ describe("machine watch conditions", () => {
             (await readWatchCondition(run, undefined, async () => ({ id: 124 }))).status,
             "unknown",
         );
+    });
+    test("queued, pending and in_progress Actions runs stay unclear, not failed (B2)", async () => {
+        const run: WatchCondition = {
+            kind: "run",
+            repo: "frostyard/test",
+            id: 123,
+            test: "succeeded",
+        };
+
+        for (const status of ["queued", "pending", "in_progress"]) {
+            const decision = await readWatchCondition(run, undefined, async () => ({
+                id: run.id,
+                repository: { full_name: run.repo },
+                status,
+                conclusion: null,
+            }));
+            const { one, state } = due();
+
+            one.watch!.condition = run;
+            assert.equal(decision.status, "unknown", status);
+            assert.equal(
+                applyWatchDecision(one, { key: one.watch!.key, decision }, on("2026-11-02"), state),
+                true,
+            );
+            assert.equal(one.state, "open");
+            assert.equal(one.watch?.result, undefined);
+            assert.equal(one.watch?.machine?.status, "unknown");
+            assert.match(odradeReason(one) ?? "", /watch unclear:/);
+        }
     });
     test("a sweep pass records once, closes, and leaves no Clerk queue work across a stored restart", () => {
         const { one, state } = due();

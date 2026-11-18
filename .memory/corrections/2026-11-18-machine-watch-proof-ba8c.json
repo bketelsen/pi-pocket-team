@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk machine-watch proof",
+  "correction": "Request 100 effective branch rules and treat a full or excessive page as unknown. Treat nonfinal Actions runs as unknown, not failed. Guard both behaviors with regression tests.",
+  "evidence": "bketelsen/pi-pocket-team#270 cross-review at head 6cba373ea94f9faec00411d43e6a41637c4dd543: accepted blockers B1 and B2. B1 identifies required checks hidden by branch-rule pagination. B2 requires queued, pending and in_progress Actions runs to remain unclear.",
+  "promoted_to": "desk.test.ts: machine watch conditions: branch rules beyond the default page or at the page limit cannot prove green (B1); a branch-rules page below the limit can prove green; a full or excessive page cannot (B1); queued, pending and in_progress Actions runs stay unclear, not failed (B2)"
+}
