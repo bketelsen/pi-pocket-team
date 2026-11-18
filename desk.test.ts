@@ -188,6 +188,12 @@ import {
     setWatch,
     wakeWatch,
     parseWatchOn,
+    parseWatchCondition,
+    GITHUB_INT_MAX,
+    WATCH_CHECK_ATTEMPTS,
+    readWatchCondition,
+    applyWatchDecision,
+    type WatchCondition,
     prWatchPins,
     MAX_PR_WATCHES,
     watchOnText,
@@ -6606,6 +6612,652 @@ describe("the watch's rules", () => {
             files[`${sleeping.id}.md`] ?? "",
             /- Watch: 2026-12-01 · the blob sweep · set by odrade/,
         );
+    });
+});
+
+describe("machine watch conditions", () => {
+    const head = "a".repeat(40);
+    const condition: WatchCondition = { kind: "pr", ref: "frostyard/test#9", test: "checks-green" };
+    const facts = () => ({
+        ...githubOf([]),
+        prs: { "frostyard/test#9": prFact({ ref: "frostyard/test#9", number: 9, head }) },
+    });
+    const rows = () => ({
+        pull: { head: { sha: head }, base: { ref: "main" } },
+        protection: { contexts: ["Test"], checks: [{ context: "Test", app_id: 1 }] },
+        rules: [
+            {
+                type: "required_status_checks",
+                parameters: { required_status_checks: [{ context: "Test", integration_id: 1 }] },
+            },
+        ],
+        runs: {
+            total_count: 1,
+            check_runs: [
+                {
+                    name: "Test",
+                    app: { id: 1 },
+                    head_sha: head,
+                    status: "completed",
+                    conclusion: "success",
+                },
+            ],
+        },
+        statuses: { sha: head, total_count: 0, statuses: [] },
+    });
+
+    const reader =
+        (data = rows()) =>
+        async (path: string): Promise<unknown> => {
+            if (path.includes("/pulls/")) {
+                return data.pull;
+            }
+
+            if (path.includes("/protection/")) {
+                return data.protection;
+            }
+
+            if (path.includes("/rules/")) {
+                return data.rules;
+            }
+
+            if (path.includes("/check-runs?")) {
+                return data.runs;
+            }
+
+            if (path.includes("/status?")) {
+                return data.statuses;
+            }
+
+            throw new Error(`Unexpected read: ${path}`);
+        };
+
+    const due = () => {
+        const one = watched();
+
+        one.watch!.condition = condition;
+        one.watch!.dueAt = on("2026-11-02");
+        const state = { ...empty(), threads: { [one.id]: one } };
+
+        return { one, state };
+    };
+
+    test("the exact grammar accepts only the 3 conditions and validates the bounds", () => {
+        for (const text of [
+            "pr:frostyard/test#9 merged",
+            "pr:frostyard/test#9 checks-green",
+            "run:frostyard/test#123 succeeded",
+        ]) {
+            assert(!("error" in parseWatchCondition(text)));
+        }
+
+        for (const text of [
+            "",
+            "PR:frostyard/test#9 merged",
+            "pr:frostyard/test#9 reviewed",
+            "pr:frostyard/test#9 checks green",
+            "pr:frostyard/test#0 merged",
+            `pr:frostyard/test#${String(GITHUB_INT_MAX + 1)} merged`,
+            "run:frostyard/test#0 succeeded",
+            `run:frostyard/test#${String(Number.MAX_SAFE_INTEGER + 1)} succeeded`,
+            "the PR merged",
+        ]) {
+            assert("error" in parseWatchCondition(text), text);
+        }
+    });
+    test("a date-only condition pins its PR when due; bad condition input changes no watch", () => {
+        const { one, state } = due();
+
+        assert.equal(one.watch?.on, undefined);
+        assert.deepEqual(prWatchPins([one]), [condition.ref]);
+        const stored = JSON.parse(JSON.stringify(one));
+        const refused = setWatch(
+            one,
+            {
+                checkOn: "2099-01-01",
+                check: "check",
+                by: "odrade",
+                key: "bad-condition",
+                at: on("2026-10-22"),
+                condition: "merge it",
+            },
+            state,
+        );
+
+        assert("error" in refused);
+        assert.deepEqual(one, stored);
+        assert.throws(
+            () =>
+                openThread(state, {
+                    key: "bad-delegate-condition",
+                    supervisor: 1,
+                    agents: ["duncan"],
+                    title: "check",
+                    at: on("2026-10-22"),
+                    watch: {
+                        checkOn: "2099-01-01",
+                        check: "check",
+                        by: "odrade",
+                        condition: "merge it",
+                    },
+                }),
+            /watch condition/,
+        );
+    });
+
+    test("required checks pass only with complete requirements and check facts at the current head", async () => {
+        const result = await readWatchCondition(condition, facts(), reader());
+
+        assert.equal(result.status, "pass");
+        assert.equal(result.head, head);
+        assert.match(result.text, new RegExp(head));
+        const data = rows();
+
+        data.runs.check_runs[0]!.conclusion = "failure";
+        assert.equal((await readWatchCondition(condition, facts(), reader(data))).status, "fail");
+    });
+    test("404 Branch not protected means no classic requirements; effective rules can prove green (#270)", async () => {
+        for (const error of [
+            { stdout: JSON.stringify({ message: "Branch not protected", status: "404" }) },
+            {
+                stdout: JSON.stringify({ message: "Branch not protected" }),
+                stderr: "gh: Branch not protected (HTTP 404)",
+            },
+            { status: 404, message: "Branch not protected" },
+        ]) {
+            const api = reader();
+            const result = await readWatchCondition(condition, facts(), async (path) => {
+                if (path.includes("/protection/required_status_checks")) {
+                    throw error;
+                }
+
+                return api(path);
+            });
+
+            assert.equal(result.status, "pass");
+            assert.equal(result.head, head);
+        }
+    });
+    test("other classic-protection errors and all effective-rule errors stay unknown (#270)", async () => {
+        for (const error of [
+            { stdout: JSON.stringify({ message: "Not Found", status: "404" }) },
+            { stdout: JSON.stringify({ message: "Branch not protected", status: "403" }) },
+            {
+                stdout: JSON.stringify({ message: "Branch not protected", status: "403" }),
+                stderr: "gh: Branch not protected (HTTP 404)",
+            },
+            {
+                stdout: JSON.stringify({ message: "Branch not protected", status: "404" }),
+                stderr: "gh: Branch not protected (HTTP 403)",
+            },
+            { stdout: JSON.stringify({ message: "Branch not protected" }) },
+            { stdout: "not JSON", stderr: "gh: Branch not protected (HTTP 404)" },
+            new Error("network failed"),
+        ]) {
+            const api = reader();
+            const result = await readWatchCondition(condition, facts(), async (path) => {
+                if (path.includes("/protection/required_status_checks")) {
+                    throw error;
+                }
+
+                return api(path);
+            });
+
+            assert.equal(result.status, "unknown");
+        }
+
+        const api = reader();
+        const absent = { status: 404, message: "Branch not protected" };
+        const result = await readWatchCondition(condition, facts(), async (path) => {
+            if (path.includes("/protection/") || path.includes("/rules/")) {
+                throw absent;
+            }
+
+            return api(path);
+        });
+
+        assert.equal(result.status, "unknown", "the exception applies only to classic protection");
+        const noRequirements = await readWatchCondition(condition, facts(), async (path) => {
+            if (path.includes("/protection/")) {
+                throw absent;
+            }
+
+            if (path.includes("/rules/")) {
+                return [];
+            }
+
+            return api(path);
+        });
+
+        assert.equal(noRequirements.status, "unknown", "no requirements is not proof of green");
+    });
+    test("running required checks defer assessment; pending statuses also defer (#270)", async () => {
+        for (const status of ["pending", "queued", "in_progress", "waiting"]) {
+            const data = rows();
+
+            data.runs.check_runs[0]!.status = status;
+            data.runs.check_runs[0]!.conclusion = "";
+            const result = await readWatchCondition(condition, facts(), reader(data));
+
+            assert.equal(result.status, "pending", status);
+            assert.equal(result.head, head);
+        }
+
+        const mixed = rows();
+
+        mixed.protection.contexts.push("Other");
+        mixed.protection.checks.push({ context: "Other", app_id: 1 });
+        mixed.runs.total_count += 1;
+        mixed.runs.check_runs[0]!.conclusion = "failure";
+        mixed.runs.check_runs.push({
+            ...mixed.runs.check_runs[0]!,
+            name: "Other",
+            status: "in_progress",
+            conclusion: "",
+        });
+        assert.equal(
+            (await readWatchCondition(condition, facts(), reader(mixed))).status,
+            "pending",
+            "any running requirement defers the final assessment",
+        );
+
+        const api = reader();
+        const result = await readWatchCondition(condition, facts(), async (path) => {
+            if (path.includes("/protection/")) {
+                return { contexts: ["Test"], checks: [] };
+            }
+
+            if (path.includes("/rules/")) {
+                return [];
+            }
+
+            if (path.includes("/check-runs?")) {
+                return { total_count: 0, check_runs: [] };
+            }
+
+            if (path.includes("/status?")) {
+                return {
+                    sha: head,
+                    total_count: 1,
+                    statuses: [{ context: "Test", state: "pending" }],
+                };
+            }
+
+            return api(path);
+        });
+
+        assert.equal(result.status, "pending");
+    });
+    test("running required checks retry across stored sweeps, then record exactly 1 unknown at the limit (#270)", async () => {
+        const data = rows();
+
+        data.runs.check_runs[0]!.status = "in_progress";
+        data.runs.check_runs[0]!.conclusion = "";
+        const decision = await readWatchCondition(condition, facts(), reader(data));
+        let { state } = due();
+        const id = Object.keys(state.threads)[0]!;
+
+        for (let attempt = 1; attempt <= WATCH_CHECK_ATTEMPTS; attempt += 1) {
+            const one = state.threads[id]!;
+            const now = on("2026-11-02") + attempt;
+            const read = { key: one.watch!.key, decision };
+
+            assert.equal(applyWatchDecision(one, read, now, state), true);
+            assert.deepEqual(one.watch?.retry, { attempts: attempt, at: now });
+            assert.equal(one.watch?.result, undefined, "a running check never records failure");
+            assert.equal(one.state, "open");
+
+            if (attempt < WATCH_CHECK_ATTEMPTS) {
+                assert.equal(one.watch?.machine, undefined);
+                assert.equal(
+                    isDue(one, now),
+                    false,
+                    "no human check is due while the machine retries",
+                );
+                assert.equal(odradeReason(one), undefined);
+                assert.deepEqual(
+                    queueNews([one], { items: [], scheduled: [], queued: {}, seq: 0 }, now),
+                    [],
+                );
+            } else {
+                assert.equal(one.watch?.machine?.status, "unknown");
+                assert.match(
+                    odradeReason(one) ?? "",
+                    /watch unclear: Required checks are still running/,
+                );
+            }
+
+            const beforeReplay = JSON.parse(JSON.stringify(state));
+
+            assert.equal(applyWatchDecision(one, read, now, state), false);
+            assert.equal(applyWatchDecision(one, read, now - 1, state), false);
+            assert.deepEqual(state, beforeReplay);
+            // A restarted sweep reads the counter and time from stored state, not module memory.
+            state = JSON.parse(JSON.stringify(state)) as DeskState;
+        }
+
+        const final = state.threads[id]!;
+
+        assert.equal(
+            final.events.filter((event) => event.key === `watch:machine:${final.watch!.key}`)
+                .length,
+            1,
+        );
+        const before = JSON.parse(JSON.stringify(state));
+
+        assert.equal(
+            applyWatchDecision(final, { key: final.watch!.key, decision }, on("2026-11-03"), state),
+            false,
+        );
+        assert.deepEqual(state, before);
+    });
+    test("a retried required check can pass before its retry limit (#270)", async () => {
+        const { one, state } = due();
+        const data = rows();
+
+        data.runs.check_runs[0]!.status = "in_progress";
+        const pending = await readWatchCondition(condition, facts(), reader(data));
+
+        applyWatchDecision(
+            one,
+            { key: one.watch!.key, decision: pending },
+            on("2026-11-02"),
+            state,
+        );
+        const passed = await readWatchCondition(condition, facts(), reader());
+
+        assert.equal(
+            applyWatchDecision(
+                one,
+                { key: one.watch!.key, decision: passed },
+                on("2026-11-02") + 1,
+                state,
+            ),
+            true,
+        );
+        assert.equal(one.state, "closed");
+        assert.equal(one.watch?.result?.pass, true);
+        assert.equal(one.watch?.machine?.status, "pass");
+        assert.equal(odradeReason(one), undefined);
+    });
+    test("branch rules beyond the default page or at the page limit cannot prove green (B1)", async () => {
+        const pageSize = 100;
+
+        for (const hiddenAt of [31, pageSize, pageSize + 1]) {
+            const rules = [
+                ...Array.from({ length: hiddenAt - 1 }, () => ({ type: "pull_request" })),
+                {
+                    type: "required_status_checks",
+                    parameters: {
+                        required_status_checks: [{ context: "Hidden", integration_id: 1 }],
+                    },
+                },
+            ];
+            const api = reader();
+            let requested = "";
+            const result = await readWatchCondition(condition, facts(), async (path) => {
+                if (!path.includes("/rules/")) {
+                    return api(path);
+                }
+
+                requested = path;
+                const limit = Number(new URLSearchParams(path.split("?")[1]).get("per_page") ?? 30);
+
+                return rules.slice(0, limit);
+            });
+
+            assert.equal(
+                requested,
+                `repos/frostyard/test/rules/branches/main?per_page=${String(pageSize)}`,
+            );
+            assert.equal(result.status, "unknown", `required rule at row ${String(hiddenAt)}`);
+            assert.match(
+                result.text,
+                hiddenAt < pageSize
+                    ? /missing or ambiguous required check Hidden/
+                    : /branch rules may be cut/,
+            );
+        }
+    });
+    test("a branch-rules page below the limit can prove green; a full or excessive page cannot (B1)", async () => {
+        const pageSize = 100;
+
+        for (const count of [pageSize - 1, pageSize, pageSize + 1]) {
+            const api = reader();
+            const result = await readWatchCondition(condition, facts(), async (path) =>
+                path.includes("/rules/")
+                    ? Array.from({ length: count }, () => ({ type: "pull_request" }))
+                    : api(path),
+            );
+
+            assert.equal(result.status, count < pageSize ? "pass" : "unknown", String(count));
+        }
+    });
+    test("an incomplete read, unknown requirements, missing check and ambiguous check stay unknown", async () => {
+        assert.equal((await readWatchCondition(condition, undefined, reader())).status, "unknown");
+        assert.equal(
+            (await readWatchCondition(condition, { ...facts(), incomplete: ["cut"] }, reader()))
+                .status,
+            "unknown",
+        );
+        assert.equal(
+            (
+                await readWatchCondition(condition, facts(), async () => {
+                    throw new Error("private body");
+                })
+            ).status,
+            "unknown",
+        );
+
+        for (const change of [
+            (data: ReturnType<typeof rows>) => {
+                data.protection.contexts = [];
+                data.protection.checks = [];
+                data.rules = [];
+            },
+            (data: ReturnType<typeof rows>) => {
+                data.runs.total_count = 2;
+            },
+            (data: ReturnType<typeof rows>) => {
+                data.runs.check_runs = [];
+                data.runs.total_count = 0;
+            },
+            (data: ReturnType<typeof rows>) => {
+                data.runs.check_runs.push({ ...data.runs.check_runs[0]! });
+                data.runs.total_count = 2;
+            },
+            (data: ReturnType<typeof rows>) => {
+                data.runs.check_runs[0]!.conclusion = "mystery";
+            },
+        ]) {
+            const data = rows();
+
+            change(data);
+            assert.equal(
+                (await readWatchCondition(condition, facts(), reader(data))).status,
+                "unknown",
+            );
+        }
+    });
+    test("a PR, check or final-head mismatch stays unknown", async () => {
+        const data = rows();
+
+        data.pull.head.sha = "b".repeat(40);
+        assert.equal(
+            (await readWatchCondition(condition, facts(), reader(data))).status,
+            "unknown",
+        );
+        const other = rows();
+
+        other.runs.check_runs[0]!.head_sha = "b".repeat(40);
+        assert.equal(
+            (await readWatchCondition(condition, facts(), reader(other))).status,
+            "unknown",
+        );
+        let pulls = 0;
+        const api = reader();
+        const result = await readWatchCondition(condition, facts(), async (path) => {
+            if (path.includes("/pulls/") && ++pulls === 2) {
+                return data.pull;
+            }
+
+            return api(path);
+        });
+
+        assert.equal(result.status, "unknown");
+    });
+    test("merged PR and Actions run conditions prove pass, fail or unknown", async () => {
+        for (const state of ["OPEN", "CLOSED", "MERGED"] as const) {
+            const github = facts();
+
+            github.prs["frostyard/test#9"]!.state = state;
+            assert.equal(
+                (await readWatchCondition({ ...condition, test: "merged" }, github, reader()))
+                    .status,
+                state === "MERGED" ? "pass" : "fail",
+            );
+        }
+
+        const run: WatchCondition = {
+            kind: "run",
+            repo: "frostyard/test",
+            id: 123,
+            test: "succeeded",
+        };
+
+        for (const [conclusion, status] of [
+            ["success", "pass"],
+            ["failure", "fail"],
+            ["mystery", "unknown"],
+        ]) {
+            const result = await readWatchCondition(run, undefined, async () => ({
+                id: 123,
+                repository: { full_name: "frostyard/test" },
+                status: "completed",
+                conclusion,
+            }));
+
+            assert.equal(result.status, status);
+        }
+
+        assert.equal(
+            (await readWatchCondition(run, undefined, async () => ({ id: 124 }))).status,
+            "unknown",
+        );
+    });
+    test("queued, pending and in_progress Actions runs stay unclear, not failed (B2)", async () => {
+        const run: WatchCondition = {
+            kind: "run",
+            repo: "frostyard/test",
+            id: 123,
+            test: "succeeded",
+        };
+
+        for (const status of ["queued", "pending", "in_progress"]) {
+            const decision = await readWatchCondition(run, undefined, async () => ({
+                id: run.id,
+                repository: { full_name: run.repo },
+                status,
+                conclusion: null,
+            }));
+            const { one, state } = due();
+
+            one.watch!.condition = run;
+            assert.equal(decision.status, "unknown", status);
+            assert.equal(
+                applyWatchDecision(one, { key: one.watch!.key, decision }, on("2026-11-02"), state),
+                true,
+            );
+            assert.equal(one.state, "open");
+            assert.equal(one.watch?.result, undefined);
+            assert.equal(one.watch?.machine?.status, "unknown");
+            assert.match(odradeReason(one) ?? "", /watch unclear:/);
+        }
+    });
+    test("a sweep pass records once, closes, and leaves no Clerk queue work across a stored restart", () => {
+        const { one, state } = due();
+        const read = { key: one.watch!.key, decision: { status: "pass" as const, text: "proved" } };
+
+        assert.equal(applyWatchDecision(one, read, on("2026-11-02"), state), true);
+        assert.equal(one.state, "closed");
+        assert.equal(one.watch?.result?.pass, true);
+        assert.equal(odradeReason(one), undefined);
+        const stored = JSON.parse(JSON.stringify(state)) as DeskState;
+
+        assert.equal(
+            applyWatchDecision(stored.threads[one.id]!, read, on("2026-11-03"), stored),
+            false,
+        );
+        assert.deepEqual(stored, state);
+    });
+    test("a machine fail or unknown routes to the Clerk queue, once; a replaced watch rejects an old read", () => {
+        for (const status of ["fail", "unknown"] as const) {
+            const { one, state } = due();
+            const read = { key: one.watch!.key, decision: { status, text: "needs a look" } };
+
+            assert.equal(
+                applyWatchDecision(one, { ...read, key: "old-watch" }, on("2026-11-02"), state),
+                false,
+            );
+            assert.equal(applyWatchDecision(one, read, on("2026-11-02"), state), true);
+            assert.equal(one.state, "open");
+            assert.equal(one.watch?.result?.pass, status === "fail" ? false : undefined);
+            assert.match(odradeReason(one) ?? "", /watch (failed|unclear): needs a look/);
+            const box = { items: [], scheduled: [], queued: {}, seq: 0 };
+            const news = queueNews([one], box, on("2026-11-02"));
+
+            assert.equal(news.length, 1);
+            assert.equal(splitDigest(news, true, digestConfig({}), state).theirs.length, 1);
+            assert.equal(applyWatchDecision(one, read, on("2026-11-03"), state), false);
+            assert.deepEqual(queueNews([one], box, on("2026-11-03")), []);
+        }
+    });
+    test("a machine pass with an open ask or an open plan-task PR remains refused", () => {
+        for (const guard of ["ask", "pr"]) {
+            const { one, state } = due();
+
+            if (guard === "ask") {
+                one.asks = [{ id: "T1a", text: "Decide", at: 1, by: "duncan" } as never];
+            } else {
+                one.planTask = { plan: "T99", task: "t1" };
+                one.prs = {
+                    "frostyard/test#9": { ref: "frostyard/test#9", state: "OPEN" } as never,
+                };
+            }
+
+            applyWatchDecision(
+                one,
+                { key: one.watch!.key, decision: { status: "pass", text: "proved" } },
+                on("2026-11-02"),
+                state,
+            );
+            assert.equal(one.state, "open");
+            assert.equal(one.watch?.result, undefined);
+            assert.equal(one.watch?.machine?.status, "unknown");
+            assert.match(one.watch?.machine?.text ?? "", /Pass refused/);
+        }
+    });
+    test("an existing merged on event is still wake-only without an explicit condition", () => {
+        const { one, state } = due();
+
+        delete one.watch!.condition;
+        delete one.watch!.dueAt;
+        one.watch!.on = { kind: "pr", ref: "frostyard/test#9", event: "merged" };
+        const github = facts();
+
+        github.prs["frostyard/test#9"]!.state = "MERGED";
+        assert.equal(wakeWatch(one, on("2026-10-22"), { threads: state.threads, github }), true);
+        assert.equal(
+            applyWatchDecision(
+                one,
+                { key: one.watch!.key, decision: { status: "pass", text: "proved" } },
+                on("2026-10-22"),
+                state,
+            ),
+            false,
+        );
+        assert.equal(one.state, "open");
+        assert.equal(one.watch?.result, undefined);
     });
 });
 
@@ -14343,7 +14995,11 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
             agent: "duncan",
             repository: "frostyard/test",
             task: TASK,
-            watch: { check_on: "2w", check: "the blob sweep" },
+            watch: {
+                check_on: "2w",
+                check: "the blob sweep",
+                condition: "run:frostyard/test#123 succeeded",
+            },
         });
     }
 
@@ -23443,6 +24099,7 @@ describe("the desk in a Pi Pocket", () => {
                                     thread: id,
                                     check_on: "7d",
                                     text: "the blob sweep",
+                                    condition: "pr:frostyard/test#9 checks-green",
                                 },
                                 api,
                                 context,
@@ -23458,6 +24115,11 @@ describe("the desk in a Pi Pocket", () => {
                     `the check date is ${stored?.checkOn}, and the day is ${dates.join(" or ")}`,
                 );
                 assert.match(first, /Watching/);
+                assert.deepEqual(stored?.condition, {
+                    kind: "pr",
+                    ref: "frostyard/test#9",
+                    test: "checks-green",
+                });
 
                 // The same call again, as a restart replays it: another span would move the date, and it does not.
                 const again = JSON.stringify(
@@ -23770,6 +24432,12 @@ describe("the desk in a Pi Pocket", () => {
                 `the check date is ${thread.watch?.checkOn}, and the day is ${dates.join(" or ")}`,
             );
             assert.equal(thread.watch?.check, "the blob sweep");
+            assert.deepEqual(thread.watch?.condition, {
+                kind: "run",
+                repo: "frostyard/test",
+                id: 123,
+                test: "succeeded",
+            });
             assert.equal(thread.watch?.setBy, "odrade");
             assert.equal(thread.watch?.key.startsWith("x.team.delegate:"), true);
             assert.equal(asleep(thread, Date.now()), true);
@@ -27027,6 +27695,94 @@ describe("the desk in a Pi Pocket", () => {
 
             assert.equal((await fired()).length, 1);
             assert.equal(again?.watch?.dueAt, due?.watch?.dueAt);
+
+            // A terminal non-merge records a machine fail in the real sweep, once across a restart.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const target = state.threads[thread.id]!;
+                const result = setWatch(
+                    target,
+                    {
+                        checkOn: "2099-03-04",
+                        check: "the merge landed",
+                        by: "odrade",
+                        key: "explicit-machine-fail",
+                        at: Date.now(),
+                        on: "pr:frostyard/test#9 merged",
+                        condition: "pr:frostyard/test#9 merged",
+                    },
+                    state,
+                );
+
+                assert(!("error" in result));
+                delete state.digests;
+            }, context);
+            merged.data.p0.pullRequest.state = "CLOSED";
+            await restartPinned(SWEEP_SLEEP_MS * 3 + 180_000);
+            await until(
+                async () =>
+                    (await deskState())?.threads[thread.id]?.watch?.machine?.status === "fail",
+                "the machine fail",
+                20_000,
+            );
+            const failed = (await deskState())?.threads[thread.id];
+
+            assert.equal(failed?.state, "open");
+            assert.equal(failed?.watch?.result?.pass, false);
+            assert.match(odradeReason(failed!) ?? "", /watch failed/);
+            await restartPinned(SWEEP_SLEEP_MS * 4 + 240_000);
+            await sweptAfter(thread, failed?.run.sweptAt);
+            assert.deepEqual((await deskState())?.threads[thread.id]?.watch, failed?.watch);
+            merged.data.p0.pullRequest.state = "MERGED";
+
+            // Add an explicit condition. The same merged pin now proves a pass without a model check.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const target = state.threads[thread.id]!;
+                const result = setWatch(
+                    target,
+                    {
+                        checkOn: "2099-03-04",
+                        check: "the merge landed",
+                        by: "odrade",
+                        key: "explicit-machine-merge",
+                        at: Date.now(),
+                        on: "pr:frostyard/test#9 merged",
+                        condition: "pr:frostyard/test#9 merged",
+                    },
+                    state,
+                );
+
+                assert(!("error" in result));
+                delete state.digests;
+            }, context);
+            await restartPinned(SWEEP_SLEEP_MS * 5 + 300_000);
+            await until(
+                async () =>
+                    (await deskState())?.threads[thread.id]?.watch?.machine?.status === "pass",
+                "the machine pass",
+                20_000,
+            );
+            const passed = (await deskState())?.threads[thread.id];
+
+            assert.equal(passed?.state, "closed");
+            assert.equal(passed?.watch?.result?.by, "desk");
+            assert.equal(passed?.watch?.result?.pass, true);
+            assert.equal(
+                ((await deskState())?.digests?.[String(Number(source))]?.items ?? []).filter(
+                    (item) => item.thread === thread.id,
+                ).length,
+                0,
+                "the pass enqueues no Clerk news",
+            );
+            const recorded = passed?.watch;
+
+            await restartPinned(SWEEP_SLEEP_MS * 6 + 360_000);
+            assert.deepEqual(
+                (await deskState())?.threads[thread.id]?.watch,
+                recorded,
+                "a restart does not record the pass twice",
+            );
         } finally {
             await quiet([]);
             await restartApp(0);

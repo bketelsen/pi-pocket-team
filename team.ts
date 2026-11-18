@@ -2653,7 +2653,13 @@ export default function createTeam(host: Host, web: Web) {
                 cwd?: string;
                 title: string;
                 at: number;
-                watch?: { checkOn: string; check: string; by: string; on?: string };
+                watch?: {
+                    checkOn: string;
+                    check: string;
+                    by: string;
+                    on?: string;
+                    condition?: string;
+                };
                 /**
                  * A start from the desk's goal board: the open refuses with `deskFull` at the cap minus `reserve`, and
                  * never uses an OK. An older desk ignores it.
@@ -3887,7 +3893,7 @@ export default function createTeam(host: Host, web: Web) {
         repository?: string;
         shift?: NightShiftArg;
         plan?: { start?: true; id?: string; task?: string; issue?: string };
-        watch?: { check_on: string; check: string; on?: string };
+        watch?: { check_on: string; check: string; on?: string; condition?: string };
     };
 
     /** What a delegation did: the tool's text, and the thread, session and address it made or found again. */
@@ -4232,6 +4238,9 @@ export default function createTeam(host: Host, web: Web) {
                                             check: watch.check,
                                             by: deps.supervisorId ?? supervisor,
                                             ...(watch.on === undefined ? {} : { on: watch.on }),
+                                            ...(watch.condition === undefined
+                                                ? {}
+                                                : { condition: watch.condition }),
                                         },
                                     }),
                           }),
@@ -4546,6 +4555,12 @@ export default function createTeam(host: Host, web: Web) {
                         Type.String({
                             description:
                                 "An event that makes the check due before its date: closed:T14, pr:owner/name#12 merged, pr:owner/name#12 reviewed, or pr:owner/name#12 labelled:<label>",
+                        }),
+                    ),
+                    condition: Type.Optional(
+                        Type.String({
+                            description:
+                                "Explicit machine condition: exactly pr:owner/name#12 merged, pr:owner/name#12 checks-green, or run:owner/name#123 succeeded. The due sweep records pass/fail without a model. Unknown or ambiguous proof needs the Clerk; on alone only wakes.",
                         }),
                     ),
                 }),
