@@ -55,8 +55,21 @@ async function waitForCi(...args: Parameters<typeof teamModule.waitForCi>): Prom
 const ciUrl = "https://github.com/example/repo/pull/12";
 const ciRepo = "github.com/example/repo";
 const ciWhere = ["12", "--repo", ciRepo];
-const ciView = ["pr", "view", "--json", "number,url,headRefOid"];
-const ciConfirm = ["pr", "view", ...ciWhere, "--json", "headRefOid"];
+const ciView = ["pr", "view", "--json", "number,url,headRefOid,baseRefName"];
+const ciConfirm = ["pr", "view", ...ciWhere, "--json", "headRefOid,baseRefName"];
+const ciRules = ["api", "repos/example/repo/rules/branches/main"];
+const ciRuns = (head = "head-a") => [
+    "run",
+    "list",
+    "--repo",
+    ciRepo,
+    "--commit",
+    head,
+    "--limit",
+    "1000",
+    "--json",
+    "status,conclusion",
+];
 const ciChecks = ["pr", "checks", ...ciWhere, "--required", "--json", "name,bucket,link"];
 const ciAllChecks = ["pr", "checks", ...ciWhere, "--json", "name,bucket,link"];
 const ciJson = (value: unknown, code = 0): CiCommandResult => ({
@@ -64,9 +77,23 @@ const ciJson = (value: unknown, code = 0): CiCommandResult => ({
     stdout: JSON.stringify(value),
     stderr: "",
 });
-const ciPr = (head = "head-a") => ciJson({ number: 12, url: ciUrl, headRefOid: head });
-const ciHead = (head = "head-a") => ciJson({ headRefOid: head });
+const ciPr = (head = "head-a", base = "main") =>
+    ciJson({ number: 12, url: ciUrl, headRefOid: head, baseRefName: base });
+const ciHead = (head = "head-a", base = "main") => ciJson({ headRefOid: head, baseRefName: base });
 const ciCheck = (bucket: string, name = "Test", link = "") => ({ name, bucket, link });
+
+const ciRuleNames = (...contexts: string[]) =>
+    ciJson([
+        {
+            type: "required_status_checks",
+            parameters: { required_status_checks: contexts.map((context) => ({ context })) },
+        },
+    ]);
+const ciPassGates = (head = "head-a", readRules = true) => [
+    ...(readRules ? [{ args: ciRules, result: ciRuleNames("Test") }] : []),
+    { args: ciRuns(head), result: ciJson([{ status: "completed", conclusion: "success" }]) },
+    { args: ciConfirm, result: ciHead(head) },
+];
 
 /** Exact command scripts and an injected monotonic clock: no GitHub calls and no timer sleeps. */
 function ciFixture(
@@ -132,6 +159,7 @@ test("CI wait: no checks and pending checks wait; pass/skipping need same-head c
         { args: ciConfirm, result: ciHead() },
         { args: ciChecks, result: ciJson([ciCheck("pass"), ciCheck("skipping", "Optional")]) },
         { args: ciConfirm, result: ciHead() },
+        ...ciPassGates(),
     ]);
     const result = await waitForCi("/session/current-folder", {}, fixture.deps);
 
@@ -178,6 +206,7 @@ test("CI wait: polling backs off exactly 30s, 60s, then 90s and stays at 90s", a
         ]).flat(),
         { args: ciChecks, result: ciJson([ciCheck("pass")]) },
         { args: ciConfirm, result: ciHead() },
+        ...ciPassGates(),
     ]);
 
     assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
@@ -196,6 +225,7 @@ test("CI wait: same-head no checks return NO CHECKS after 5 minutes, including t
         { args: ciView, result: ciPr(), elapsed: 200_000 },
         ...Array.from({ length: 6 }, () => [
             { args: ciChecks, result: noRequired },
+            { args: ciRules, result: ciJson([]) },
             { args: ciAllChecks, result: ciJson([]) },
             { args: ciConfirm, result: ciHead() },
         ]).flat(),
@@ -218,6 +248,7 @@ test("CI wait: checks that pass before 5 minutes still pass after empty observat
         ]).flat(),
         { args: ciChecks, result: ciJson([ciCheck("pass")]) },
         { args: ciConfirm, result: ciHead() },
+        ...ciPassGates(),
     ]);
 
     assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
@@ -461,8 +492,10 @@ test("CI wait: only stderr's no-required-checks message enables the all-checks f
                 stderr: "no required checks reported on the 'main' branch\n",
             },
         },
+        { args: ciRules, result: ciJson([]) },
         { args: ciAllChecks, result: ciJson([ciCheck("pass")]) },
         { args: ciConfirm, result: ciHead() },
+        ...ciPassGates("head-a", false),
     ]);
 
     assert.match(
@@ -487,6 +520,232 @@ test("CI wait: only stderr's no-required-checks message enables the all-checks f
     failed.done();
 });
 
+test("CI wait: aggregator gap requires every effective context and completed head workflows before PASS", async () => {
+    const rules = ciJson([
+        { type: "pull_request", parameters: {} },
+        {
+            type: "required_status_checks",
+            parameters: { required_status_checks: [{ context: "Visible" }] },
+        },
+        {
+            type: "required_status_checks",
+            parameters: { required_status_checks: [{ context: "Test" }, { context: "Test" }] },
+        },
+    ]);
+
+    for (const terminal of ["pass", "skipping"]) {
+        const passed = ciJson([ciCheck("pass", "Visible"), ciCheck(terminal, "Test")]);
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass", "Visible")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: rules },
+            { args: ciChecks, result: passed },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: rules },
+            { args: ciRuns(), result: ciJson([{ status: "in_progress", conclusion: "" }]) },
+            { args: ciChecks, result: passed },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: rules },
+            { args: ciRuns(), result: ciJson([{ status: "completed", conclusion: "success" }]) },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+        assert.deepEqual(fixture.waits, [30_000, 60_000]);
+        fixture.done();
+    }
+});
+
+test("CI wait: no-required output cannot enable all-checks fallback when rules require Test", async () => {
+    for (const empty of [
+        { code: 1, stdout: "", stderr: "no required checks reported on the 'main' branch\n" },
+        ciJson([]),
+    ]) {
+        const reportsNoRequired = empty.code === 1;
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            ...Array.from({ length: 6 }, () => [
+                { args: ciChecks, result: empty },
+                ...(reportsNoRequired ? [{ args: ciRules, result: ciRuleNames("Test") }] : []),
+                { args: ciConfirm, result: ciHead() },
+            ]).flat(),
+        ]);
+
+        const text = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+        assert.match(text, /^NO CHECKS:/);
+        assert.doesNotMatch(text, /PASS/);
+        fixture.done();
+    }
+});
+
+test("CI wait: unreadable or malformed effective rules are ERROR, never a safe fallback", async () => {
+    for (const rules of [
+        { code: 1, stdout: "", stderr: "HTTP 403: denied" },
+        { ...ciJson([]), truncated: true },
+        ciJson({}),
+        ciJson([null]),
+        ciJson([{ type: "required_status_checks" }]),
+        ciJson([{ type: "required_status_checks", parameters: { required_status_checks: {} } }]),
+        ciJson([
+            {
+                type: "required_status_checks",
+                parameters: { required_status_checks: [{ context: "" }] },
+            },
+        ]),
+        ciJson([{ type: "required_status_checks", parameters: { required_status_checks: [{}] } }]),
+        { code: 0, stdout: "{", stderr: "" },
+    ]) {
+        for (const noRequired of [false, true]) {
+            const fixture = ciFixture([
+                { args: ciView, result: ciPr() },
+                {
+                    args: ciChecks,
+                    result: noRequired
+                        ? {
+                              code: 1,
+                              stdout: "",
+                              stderr: "no required checks reported on the 'main' branch\n",
+                          }
+                        : ciJson([ciCheck("pass")]),
+                },
+                ...(noRequired ? [] : [{ args: ciConfirm, result: ciHead() }]),
+                { args: ciRules, result: rules },
+            ]);
+
+            assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^ERROR:/);
+            fixture.done();
+        }
+    }
+});
+
+test("CI wait: head workflow active statuses are case-insensitive and completed conclusions belong to checks", async () => {
+    for (const status of ["QUEUED", "Pending", "waiting", "Requested", "IN_PROGRESS"]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: ciRuleNames("Test") },
+            {
+                args: ciRuns(),
+                result: ciJson([
+                    { status: "completed", conclusion: "success" },
+                    { status, conclusion: null },
+                ]),
+            },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: ciRuleNames("Test") },
+            {
+                args: ciRuns(),
+                result: ciJson([
+                    { status: "COMPLETED", conclusion: "failure" },
+                    { status: "completed", conclusion: "cancelled" },
+                ]),
+            },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+        assert.deepEqual(fixture.waits, [30_000]);
+        fixture.done();
+    }
+});
+
+test("CI wait: failed or malformed head workflow reads are ERROR, not PASS", async () => {
+    for (const runs of [
+        { code: 1, stdout: "", stderr: "HTTP 502" },
+        { ...ciJson([]), truncated: true },
+        ciJson({}),
+        ciJson([null]),
+        ciJson([{ conclusion: "success" }]),
+        ciJson([{ status: "completed" }]),
+        ciJson([{ status: "unknown", conclusion: "" }]),
+        { code: 0, stdout: "{", stderr: "" },
+    ]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: ciRuleNames("Test") },
+            { args: ciRuns(), result: runs },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^ERROR:/);
+        fixture.done();
+    }
+});
+
+test("CI wait: 1000 completed workflow rows are ERROR because a full cap may hide active runs", async () => {
+    for (const { count, status } of [
+        { count: 999, status: "completed" },
+        { count: 1000, status: "completed" },
+        { count: 1000, status: "pending" },
+    ]) {
+        const full = count === 1000;
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: ciRuleNames("Test") },
+            {
+                args: ciRuns(),
+                result: ciJson(
+                    Array.from({ length: count }, () => ({
+                        status,
+                        conclusion: status === "completed" ? "success" : "",
+                    })),
+                ),
+            },
+            ...(full ? [] : [{ args: ciConfirm, result: ciHead() }]),
+        ]);
+        const text = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+        assert.match(text, full ? /^ERROR:.*1000-run cap.*truncated/ : /^PASS:/);
+        assert.deepEqual(fixture.waits, []);
+        fixture.done();
+    }
+});
+
+test("CI wait: effective rule paths exclude the host and encode the resolved base branch", async () => {
+    const base = "release/1.0";
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr("head-a", base) },
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead("head-a", base) },
+        {
+            args: ["api", "repos/example/repo/rules/branches/release%2F1.0"],
+            result: ciRuleNames("Test"),
+        },
+        { args: ciRuns(), result: ciJson([]) },
+        { args: ciConfirm, result: ciHead("head-a", base) },
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+    fixture.done();
+});
+
+test("CI wait: a head change after rule and workflow gates cannot return a stale PASS", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciRules, result: ciRuleNames("Test") },
+        { args: ciRuns(), result: ciJson([]) },
+        { args: ciConfirm, result: ciHead("head-b") },
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead("head-b") },
+        ...ciPassGates("head-b"),
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^PASS:.*\(head-b\)/,
+    );
+    fixture.done();
+});
+
 test("CI wait: a new head discards green and failed observations and starts checking again", async () => {
     for (const bucket of ["pass", "fail"]) {
         const fixture = ciFixture([
@@ -497,6 +756,7 @@ test("CI wait: a new head discards green and failed observations and starts chec
             { args: ciConfirm, result: ciHead("head-b") },
             { args: ciChecks, result: ciJson([ciCheck("pass")]) },
             { args: ciConfirm, result: ciHead("head-b") },
+            ...ciPassGates("head-b"),
         ]);
 
         assert.match(
@@ -517,11 +777,12 @@ test("CI wait: numeric, URL and repository selectors resolve first, then use the
     ] as const) {
         const fixture = ciFixture([
             {
-                args: ["pr", "view", ...selector, "--json", "number,url,headRefOid"],
+                args: ["pr", "view", ...selector, "--json", "number,url,headRefOid,baseRefName"],
                 result: ciPr(),
             },
             { args: ciChecks, result: ciJson([ciCheck("pass")]) },
             { args: ciConfirm, result: ciHead() },
+            ...ciPassGates(),
         ]);
 
         assert.match(await waitForCi("/session/current-folder", { pr }, fixture.deps), /^PASS:/);
@@ -593,6 +854,7 @@ test("CI wait: bad inputs do not start a child process, and timeout accepts 1 th
             { args: ciView, result: ciPr() },
             { args: ciChecks, result: ciJson([ciCheck("pass")]) },
             { args: ciConfirm, result: ciHead() },
+            ...ciPassGates(),
         ]);
 
         assert.match(

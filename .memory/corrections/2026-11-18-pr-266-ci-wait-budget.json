@@ -1,7 +1,7 @@
 {
   "date": "2026-11-18",
   "scope": "team_wait_for_ci",
-  "correction": "A fixed 10-second polling interval exhausted the shared gh budget. Wait 30 seconds, then 60 seconds, then 90 seconds and keep 90-second waits thereafter, bounded by the original timeout.",
-  "evidence": "bketelsen/pi-pocket-team#266; owner review at head 7ec8326d9f9336d6e781eac758645dc140aa3921; blocking poll-rate finding.",
-  "promoted_to": "team.test.ts: CI wait: polling backs off exactly 30s, 60s, then 90s and stays at 90s"
+  "correction": "A fixed 10-second polling interval would exhaust the shared gh budget; it never ran live. Wait 30 seconds, then 60 seconds, then 90 seconds thereafter within the original timeout. gh pr checks can omit required aggregators that do not exist yet. Before PASS, require every effective branch-rule context to exist and pass or skip, no active workflow for the head, and a final matching head/base. Failed or malformed rules and workflow reads are ERROR, never permission to pass or fall back.",
+  "evidence": "bketelsen/pi-pocket-team#266; owner review at head 7ec8326d9f9336d6e781eac758645dc140aa3921 found the blocking poll-rate risk; owner re-review at head 9d894fd358733d13caf85fbd32d0c6eef3f8cbde found the blocking false-PASS aggregator gap and corrected the never-live budget wording.",
+  "promoted_to": "team.test.ts: CI wait: polling backs off exactly 30s, 60s, then 90s and stays at 90s; CI wait: aggregator gap requires every effective context and completed head workflows before PASS"
 }

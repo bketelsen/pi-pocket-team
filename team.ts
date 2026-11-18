@@ -365,7 +365,13 @@ const ciWaitDefaults: CiWaitDependencies = {
 };
 
 /** A canonical PR address identifies the base repository, not a contributor's head repository. */
-function ciPrAddress(value: string): { repo: string; number: string; url: string } {
+function ciPrAddress(value: string): {
+    repo: string;
+    host: string;
+    repoPath: string;
+    number: string;
+    url: string;
+} {
     if (value.length > 2048) {
         throw new Error("The PR URL is longer than 2048 characters.");
     }
@@ -389,6 +395,8 @@ function ciPrAddress(value: string): { repo: string; number: string; url: string
 
     return {
         repo: `${url.host}/${match[1]}/${match[2]}`,
+        host: url.host,
+        repoPath: `${match[1]}/${match[2]}`,
         number: match[3]!,
         url: `${url.origin}/${match[1]}/${match[2]}/pull/${match[3]}`,
     };
@@ -419,12 +427,92 @@ function ciPrSelector(pr: number | string | undefined): string[] {
     return [address.number, "--repo", address.repo];
 }
 
+/** Effective rules can repeat a required context across rulesets. Missing or malformed rules never mean none. */
+function ciRequiredContexts(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+        throw new Error("gh returned malformed effective branch rules");
+    }
+
+    const contexts = new Set<string>();
+
+    for (const rule of value) {
+        if (rule === null || typeof rule !== "object" || typeof rule.type !== "string") {
+            throw new Error("gh returned a malformed branch rule");
+        }
+
+        if (rule.type !== "required_status_checks") {
+            continue;
+        }
+
+        const checks: unknown = rule.parameters?.required_status_checks;
+
+        if (!Array.isArray(checks)) {
+            throw new Error("gh returned malformed required status check rules");
+        }
+
+        for (const check of checks) {
+            if (
+                check === null ||
+                typeof check !== "object" ||
+                typeof check.context !== "string" ||
+                check.context.trim() === ""
+            ) {
+                throw new Error("gh returned a malformed required status check context");
+            }
+
+            contexts.add(check.context);
+        }
+    }
+
+    return [...contexts];
+}
+
+const ciWorkflowRunLimit = 1000;
+
+/** A run read closes the gap before an aggregator check exists, not a second source of failure verdicts. */
+function ciWorkflowsPending(value: unknown): boolean {
+    if (!Array.isArray(value)) {
+        throw new Error("gh returned malformed workflow runs");
+    }
+
+    if (value.length >= ciWorkflowRunLimit) {
+        throw new Error(
+            `gh workflow run list reached the ${String(ciWorkflowRunLimit)}-run cap and may be truncated`,
+        );
+    }
+
+    const active = new Set(["queued", "pending", "waiting", "requested", "in_progress"]);
+    let pending = false;
+
+    for (const run of value) {
+        if (
+            run === null ||
+            typeof run !== "object" ||
+            typeof run.status !== "string" ||
+            (typeof run.conclusion !== "string" && run.conclusion !== null)
+        ) {
+            throw new Error("gh returned a malformed workflow run");
+        }
+
+        const status = run.status.toLowerCase();
+
+        if (active.has(status)) {
+            pending = true;
+        } else if (status !== "completed") {
+            throw new Error("gh returned an unknown workflow status");
+        }
+    }
+
+    return pending;
+}
+
 type CiCheck = { name: string; bucket: string; link: string };
 const ciLine = (text: string, max = 200): string => text.replace(/\s+/g, " ").trim().slice(0, max);
 
 /**
- * Wait in this call, using required checks unless gh explicitly reports that none are required. Empty and unknown
- * buckets never pass. The deadline covers resolution, polling and logs; a new head discards the old observation,
+ * Wait in this call. Effective branch rules name checks that gh pr checks can omit before an aggregator exists.
+ * A pass needs every required context, no active head workflow and a final same-head/base confirmation. Empty and
+ * unknown buckets never pass. The deadline covers resolution, polling and logs; a new head discards the observation,
  * without extending that deadline. Empty checks on one head return NO CHECKS after 5 minutes. Polling backs off
  * 30s, 60s, then 90s thereafter to protect the shared GitHub budget. Dependencies inject time and cancellation.
  */
@@ -484,7 +572,7 @@ export async function waitForCi(
             "view",
             ...ciPrSelector(args.pr),
             "--json",
-            "number,url,headRefOid",
+            "number,url,headRefOid,baseRefName",
         ]);
 
         if (resolved.code !== 0) {
@@ -495,14 +583,21 @@ export async function waitForCi(
                 : `ERROR: Cannot resolve the PR: ${reason(resolved)}`;
         }
 
-        const pr = json(resolved) as { number?: unknown; url?: unknown; headRefOid?: unknown };
+        const pr = json(resolved) as {
+            number?: unknown;
+            url?: unknown;
+            headRefOid?: unknown;
+            baseRefName?: unknown;
+        };
 
         if (
             typeof pr.url !== "string" ||
             typeof pr.headRefOid !== "string" ||
-            pr.headRefOid === ""
+            pr.headRefOid === "" ||
+            typeof pr.baseRefName !== "string" ||
+            pr.baseRefName === ""
         ) {
-            throw new Error("gh returned no PR address or head SHA");
+            throw new Error("gh returned no PR address, head SHA or base branch");
         }
 
         const address = ciPrAddress(pr.url);
@@ -514,6 +609,56 @@ export async function waitForCi(
         label = `${address.repo}#${address.number}`;
         const where = [address.number, "--repo", address.repo];
         let head = pr.headRefOid;
+        let base = pr.baseRefName;
+
+        const readRules = async () => {
+            const rules = await command([
+                "api",
+                `repos/${address.repoPath}/rules/branches/${encodeURIComponent(base)}`,
+                ...(address.host === "github.com" ? [] : ["--hostname", address.host]),
+            ]);
+
+            if (rules.code !== 0) {
+                throw new Error(`Cannot read effective branch rules: ${reason(rules)}`);
+            }
+
+            return ciRequiredContexts(json(rules));
+        };
+
+        const confirm = async (): Promise<boolean> => {
+            const confirmation = await command([
+                "pr",
+                "view",
+                ...where,
+                "--json",
+                "headRefOid,baseRefName",
+            ]);
+
+            if (confirmation.code !== 0) {
+                throw new Error(reason(confirmation));
+            }
+
+            const current = json(confirmation) as { headRefOid?: unknown; baseRefName?: unknown };
+
+            if (
+                typeof current.headRefOid !== "string" ||
+                current.headRefOid === "" ||
+                typeof current.baseRefName !== "string" ||
+                current.baseRefName === ""
+            ) {
+                throw new Error("gh returned no head SHA or base branch for confirmation");
+            }
+
+            if (current.headRefOid !== head || current.baseRefName !== base) {
+                head = current.headRefOid;
+                base = current.baseRefName;
+
+                return false;
+            }
+
+            return true;
+        };
+
         let noChecksSince: number | undefined;
         let pause = 30_000;
 
@@ -528,21 +673,35 @@ export async function waitForCi(
                 "name,bucket,link",
             ]);
 
-            if (
+            const noRequired =
                 result.code === 1 &&
                 result.stderr
                     .split("\n")
                     .some((line) =>
                         /^no required checks reported on the .* branch$/.test(line.trim()),
-                    )
-            ) {
-                all = true;
-                result = await command(["pr", "checks", ...where, "--json", "name,bucket,link"]);
+                    );
+            let required: string[] | undefined;
+
+            if (noRequired) {
+                required = await readRules();
+
+                // gh's message describes existing check runs, not the rules: a missing aggregator is still required.
+                if (required.length === 0) {
+                    all = true;
+                    result = await command([
+                        "pr",
+                        "checks",
+                        ...where,
+                        "--json",
+                        "name,bucket,link",
+                    ]);
+                }
             }
 
             const noChecks =
-                result.code === 1 &&
-                /^no checks reported on the .* branch\s*$/.test(result.stderr.trim());
+                (noRequired && !all) ||
+                (result.code === 1 &&
+                    /^no checks reported on the .* branch\s*$/.test(result.stderr.trim()));
 
             if (!noChecks && ![0, 1, 8].includes(result.code ?? -1)) {
                 throw new Error(reason(result));
@@ -574,20 +733,7 @@ export async function waitForCi(
             const observedAt = now();
 
             // Read after the check observation, including failures: an old head's result is never this head's result.
-            const confirmation = await command(["pr", "view", ...where, "--json", "headRefOid"]);
-
-            if (confirmation.code !== 0) {
-                throw new Error(reason(confirmation));
-            }
-
-            const current = (json(confirmation) as { headRefOid?: unknown }).headRefOid;
-
-            if (typeof current !== "string" || current === "") {
-                throw new Error("gh returned no head SHA for confirmation");
-            }
-
-            if (current !== head) {
-                head = current;
+            if (!(await confirm())) {
                 noChecksSince = undefined;
                 continue;
             }
@@ -668,7 +814,43 @@ export async function waitForCi(
                 rows.length > 0 &&
                 rows.every((row: CiCheck) => row.bucket === "pass" || row.bucket === "skipping")
             ) {
-                return `PASS: ${label} (${head.slice(0, 12)}); all ${all ? "checks (none required)" : "required checks"} passed or skipped.`;
+                required ??= await readRules();
+                const present = required.every((context) =>
+                    rows.some(
+                        (row: CiCheck) =>
+                            row.name === context &&
+                            (row.bucket === "pass" || row.bucket === "skipping"),
+                    ),
+                );
+
+                if (present) {
+                    const runs = await command([
+                        "run",
+                        "list",
+                        "--repo",
+                        address.repo,
+                        "--commit",
+                        head,
+                        "--limit",
+                        String(ciWorkflowRunLimit),
+                        "--json",
+                        "status,conclusion",
+                    ]);
+
+                    if (runs.code !== 0) {
+                        throw new Error(`Cannot read head workflow runs: ${reason(runs)}`);
+                    }
+
+                    if (!ciWorkflowsPending(json(runs))) {
+                        // Rules and workflow reads can take time. Recheck the head and base after both gates.
+                        if (!(await confirm())) {
+                            noChecksSince = undefined;
+                            continue;
+                        }
+
+                        return `PASS: ${label} (${head.slice(0, 12)}); all ${all ? "checks (none required)" : "required checks"} passed or skipped.`;
+                    }
+                }
             }
 
             await wait(Math.min(pause, Math.max(0, deadline - now())), signal);
@@ -5645,7 +5827,7 @@ export default function createTeam(host: Host, web: Web) {
         defineTool({
             name: "team_wait_for_ci",
             description:
-                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, NO PR, NO CHECKS after 5 minutes on one head, ERROR, or INTERRUPTED on module disposal. Uses required checks, or all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
+                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, NO PR, NO CHECKS after 5 minutes on one head, ERROR, or INTERRUPTED on module disposal. Verifies effective required check names and waits for head workflows to finish; uses all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
             parameters: Type.Object({
                 pr: Type.Optional(
                     Type.Union([
