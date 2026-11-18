@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk read",
+  "correction": "Keep operational lines and make brief report ids fetchable.",
+  "evidence": "bketelsen/pi-pocket-team#261, bketelsen review of a92f412212b44616ea1779df3a6b34f95df72bdf",
+  "promoted_to": "desk.test.ts"
+}
