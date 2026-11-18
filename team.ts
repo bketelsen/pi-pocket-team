@@ -236,15 +236,54 @@ export type CiCommandResult = {
     truncated?: boolean;
 };
 
-export type CiRunner = (
-    args: string[],
-    options: { cwd: string; timeoutMs: number; tail?: boolean },
-) => Promise<CiCommandResult>;
+type CiRunOptions = { cwd: string; timeoutMs: number; tail?: boolean; signal?: AbortSignal };
+export type CiRunner = (args: string[], options: CiRunOptions) => Promise<CiCommandResult>;
 
-/** Run gh without a shell. Keep bounded JSON or the end of a job log, and terminate hung commands. */
-export const runCiGh: CiRunner = (args, { cwd, timeoutMs, tail = false }) =>
-    new Promise((resolve, reject) => {
-        const child = spawn("gh", args, {
+/** Schedule a cancellable timer; tests supply one that does not use real time. */
+type CiTimer = (callback: () => void, ms: number) => () => void;
+
+const ciTimer: CiTimer = (callback, ms) => {
+    const timer = setTimeout(callback, ms);
+
+    return () => clearTimeout(timer);
+};
+
+/** An abortable polling wait. Disposal must not leave its timer running. */
+export function waitForCiPoll(
+    ms: number,
+    signal?: AbortSignal,
+    timer: CiTimer = ciTimer,
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        signal?.throwIfAborted();
+        const cancel = timer(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+        }, ms);
+
+        const abort = () => {
+            cancel();
+            signal?.removeEventListener("abort", abort);
+            reject(signal?.reason ?? new Error("CI wait aborted"));
+        };
+
+        signal?.addEventListener("abort", abort, { once: true });
+
+        if (signal?.aborted === true) {
+            abort();
+        }
+    });
+}
+
+/** Run gh without a shell. Bound its output and kill it on timeout or module disposal. */
+export function runCiGh(
+    args: string[],
+    { cwd, timeoutMs, tail = false, signal }: CiRunOptions,
+    runtime: { spawn: typeof spawn; timer: CiTimer } = { spawn, timer: ciTimer },
+): Promise<CiCommandResult> {
+    return new Promise((resolve, reject) => {
+        signal?.throwIfAborted();
+        const child = runtime.spawn("gh", args, {
             cwd,
             shell: false,
             stdio: ["ignore", "pipe", "pipe"],
@@ -255,10 +294,21 @@ export const runCiGh: CiRunner = (args, { cwd, timeoutMs, tail = false }) =>
         let stderr = "";
         let truncated = false;
         let timedOut = false;
-        const timer = setTimeout(() => {
+        const cancel = runtime.timer(() => {
             timedOut = true;
             child.kill("SIGKILL");
         }, timeoutMs);
+
+        const cleanup = () => {
+            cancel();
+            signal?.removeEventListener("abort", abort);
+        };
+
+        const abort = () => {
+            child.kill("SIGKILL");
+            cleanup();
+            reject(signal?.reason ?? new Error("CI command aborted"));
+        };
 
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
@@ -274,11 +324,18 @@ export const runCiGh: CiRunner = (args, { cwd, timeoutMs, tail = false }) =>
             stderr = (stderr + text).slice(-3000);
         });
         child.on("error", (error) => {
-            clearTimeout(timer);
+            cleanup();
             reject(error);
         });
         child.on("close", (code) => {
-            clearTimeout(timer);
+            cleanup();
+
+            if (signal?.aborted === true) {
+                reject(signal.reason ?? new Error("CI command aborted"));
+
+                return;
+            }
+
             resolve({
                 code,
                 stdout,
@@ -286,12 +343,25 @@ export const runCiGh: CiRunner = (args, { cwd, timeoutMs, tail = false }) =>
                 truncated,
             });
         });
+        signal?.addEventListener("abort", abort, { once: true });
+
+        if (signal?.aborted === true) {
+            abort();
+        }
     });
+}
 
 export type CiWaitDependencies = {
     run: CiRunner;
     now: () => number;
-    wait: (ms: number) => Promise<void>;
+    wait: (ms: number, signal?: AbortSignal) => Promise<void>;
+    signal?: AbortSignal;
+};
+
+const ciWaitDefaults: CiWaitDependencies = {
+    run: runCiGh,
+    now: () => performance.now(),
+    wait: waitForCiPoll,
 };
 
 /** A canonical PR address identifies the base repository, not a contributor's head repository. */
@@ -355,16 +425,13 @@ const ciLine = (text: string, max = 200): string => text.replace(/\s+/g, " ").tr
 /**
  * Wait in this call, using required checks unless gh explicitly reports that none are required. Empty and unknown
  * buckets never pass. The deadline covers resolution, polling and logs; a new head discards the old observation,
- * without extending that deadline. Dependencies keep tests free of network calls and real-time waits.
+ * without extending that deadline. Empty checks on one head return NO CHECKS after 5 minutes. Polling backs off
+ * 30s, 60s, then 90s thereafter to protect the shared GitHub budget. Dependencies inject time and cancellation.
  */
 export async function waitForCi(
     cwd: string,
     args: { pr?: number | string; timeout_minutes?: number },
-    dependencies: CiWaitDependencies = {
-        run: runCiGh,
-        now: () => performance.now(),
-        wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    },
+    dependencies: CiWaitDependencies = ciWaitDefaults,
 ): Promise<string> {
     const minutes = args.timeout_minutes ?? 30;
 
@@ -372,19 +439,27 @@ export async function waitForCi(
         return "ERROR: timeout_minutes must be a whole number from 1 to 60.";
     }
 
-    const { run, now, wait } = dependencies;
+    const { run, now, wait, signal } = dependencies;
     const deadline = now() + minutes * 60_000;
     let label = "CI";
     const timeout = () => `TIMEOUT: ${label}; CI did not finish within ${String(minutes)} minutes.`;
 
     const command = async (argv: string[], tail = false) => {
+        signal?.throwIfAborted();
         const remaining = deadline - now();
 
         if (remaining <= 0) {
             throw new Error("CI wait deadline reached");
         }
 
-        const result = await run(argv, { cwd, timeoutMs: Math.min(30_000, remaining), tail });
+        const result = await run(argv, {
+            cwd,
+            timeoutMs: Math.min(30_000, remaining),
+            tail,
+            signal,
+        });
+
+        signal?.throwIfAborted();
 
         if (now() >= deadline) {
             throw new Error("CI wait deadline reached");
@@ -439,6 +514,8 @@ export async function waitForCi(
         label = `${address.repo}#${address.number}`;
         const where = [address.number, "--repo", address.repo];
         let head = pr.headRefOid;
+        let noChecksSince: number | undefined;
+        let pause = 30_000;
 
         while (now() < deadline) {
             let all = false;
@@ -494,6 +571,8 @@ export async function waitForCi(
                 throw new Error("gh returned malformed check rows");
             }
 
+            const observedAt = now();
+
             // Read after the check observation, including failures: an old head's result is never this head's result.
             const confirmation = await command(["pr", "view", ...where, "--json", "headRefOid"]);
 
@@ -509,7 +588,18 @@ export async function waitForCi(
 
             if (current !== head) {
                 head = current;
+                noChecksSince = undefined;
                 continue;
+            }
+
+            if (rows.length === 0) {
+                noChecksSince ??= observedAt;
+
+                if (observedAt - noChecksSince >= 5 * 60_000) {
+                    return `NO CHECKS: ${label} (${head.slice(0, 12)}); no checks reported for at least 5 minutes on this head.`;
+                }
+            } else {
+                noChecksSince = undefined;
             }
 
             const failed = (rows as CiCheck[]).filter(
@@ -556,7 +646,11 @@ export async function waitForCi(
                                       "Log unavailable: job has no log yet."
                                     : `Log unavailable: ${reason(logs)}`;
                         }
-                    } catch {
+                    } catch (error) {
+                        if (signal?.aborted === true) {
+                            throw error;
+                        }
+
                         log = "Log unavailable: the link is invalid or the log request failed.";
                     }
 
@@ -577,11 +671,17 @@ export async function waitForCi(
                 return `PASS: ${label} (${head.slice(0, 12)}); all ${all ? "checks (none required)" : "required checks"} passed or skipped.`;
             }
 
-            await wait(Math.min(10_000, Math.max(0, deadline - now())));
+            await wait(Math.min(pause, Math.max(0, deadline - now())), signal);
+            signal?.throwIfAborted();
+            pause = Math.min(pause * 2, 90_000);
         }
 
         return timeout();
     } catch (error) {
+        if (signal?.aborted === true) {
+            return `INTERRUPTED: ${label}; CI wait was aborted.`;
+        }
+
         return now() >= deadline
             ? timeout()
             : `ERROR: ${label}; ${ciLine(String((error as Error).message ?? error))}`;
@@ -5530,11 +5630,22 @@ export default function createTeam(host: Host, web: Web) {
         { annotations: { readOnlyHint: true } },
     );
 
+    // Tool context has no abort signal. Disposal owns every active call in this module instance.
+    const ciCalls = new Set<AbortController>();
+
+    web.onDispose(() => {
+        for (const controller of ciCalls) {
+            controller.abort();
+        }
+
+        ciCalls.clear();
+    });
+
     const waitForCiTool = Object.assign(
         defineTool({
             name: "team_wait_for_ci",
             description:
-                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, or NO PR. Uses required checks, or all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
+                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, NO PR, NO CHECKS after 5 minutes on one head, ERROR, or INTERRUPTED on module disposal. Uses required checks, or all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
             parameters: Type.Object({
                 pr: Type.Optional(
                     Type.Union([
@@ -5552,13 +5663,24 @@ export default function createTeam(host: Host, web: Web) {
             }),
             replay: "safe",
             execute: async (args, api, context) => {
-                const cwd = (await api.agent(context)).cwd;
+                const controller = new AbortController();
 
-                return reply(
-                    cwd === undefined
-                        ? "ERROR: This session has no current folder."
-                        : await waitForCi(cwd, args),
-                );
+                ciCalls.add(controller);
+
+                try {
+                    const cwd = (await api.agent(context)).cwd;
+
+                    return reply(
+                        cwd === undefined
+                            ? "ERROR: This session has no current folder."
+                            : await waitForCi(cwd, args, {
+                                  ...ciWaitDefaults,
+                                  signal: controller.signal,
+                              }),
+                    );
+                } finally {
+                    ciCalls.delete(controller);
+                }
             },
         }),
         { annotations: { readOnlyHint: true } },

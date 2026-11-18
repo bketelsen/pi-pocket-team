@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "team_wait_for_ci",
+  "correction": "A fixed 10-second polling interval exhausted the shared gh budget. Wait 30 seconds, then 60 seconds, then 90 seconds and keep 90-second waits thereafter, bounded by the original timeout.",
+  "evidence": "bketelsen/pi-pocket-team#266; owner review at head 7ec8326d9f9336d6e781eac758645dc140aa3921; blocking poll-rate finding.",
+  "promoted_to": "team.test.ts: CI wait: polling backs off exactly 30s, 60s, then 90s and stays at 90s"
+}

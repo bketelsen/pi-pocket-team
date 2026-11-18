@@ -16,6 +16,8 @@ import {
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -69,11 +71,18 @@ const ciCheck = (bucket: string, name = "Test", link = "") => ({ name, bucket, l
 /** Exact command scripts and an injected monotonic clock: no GitHub calls and no timer sleeps. */
 function ciFixture(
     steps: { args: string[]; result: CiCommandResult; elapsed?: number; tail?: boolean }[],
+    signal?: AbortSignal,
 ) {
     let time = 0;
     let calls = 0;
     const waits: number[] = [];
-    const observed: { args: string[]; cwd: string; timeoutMs: number; tail?: boolean }[] = [];
+    const observed: {
+        args: string[];
+        cwd: string;
+        timeoutMs: number;
+        tail?: boolean;
+        signal?: AbortSignal;
+    }[] = [];
 
     const run: CiRunner = async (args, options) => {
         const step = steps[calls++];
@@ -88,6 +97,7 @@ function ciFixture(
     return {
         deps: {
             run,
+            signal,
             now: () => time,
             wait: async (ms: number) => {
                 waits.push(ms);
@@ -106,6 +116,7 @@ function ciFixture(
             for (const [index, call] of observed.entries()) {
                 assert.equal(call.cwd, "/session/current-folder");
                 assert.equal(call.tail, steps[index]!.tail ?? false);
+                assert.equal(call.signal, signal);
                 assert(call.timeoutMs > 0 && call.timeoutMs <= 30_000);
             }
         },
@@ -128,7 +139,7 @@ test("CI wait: no checks and pending checks wait; pass/skipping need same-head c
         result,
         /^PASS: github.com\/example\/repo#12 \(head-a\); all required checks passed or skipped\.$/,
     );
-    assert.deepEqual(fixture.waits, [10_000, 10_000]);
+    assert.deepEqual(fixture.waits, [30_000, 60_000]);
     fixture.done();
 });
 
@@ -140,7 +151,7 @@ test("CI wait: no rows, no checks yet, and unknown buckets time out, never pass"
         ciJson([ciCheck("pending")], 8),
         ciJson([ciCheck("unknown")]),
     ]) {
-        const observations = Array.from({ length: 6 }, () => [
+        const observations = Array.from({ length: 2 }, () => [
             { args: ciChecks, result },
             { args: ciConfirm, result: ciHead() },
         ]).flat();
@@ -153,12 +164,192 @@ test("CI wait: no rows, no checks yet, and unknown buckets time out, never pass"
 
         assert.match(text, /^TIMEOUT:/);
         assert.doesNotMatch(text, /PASS/);
-        assert.equal(
-            fixture.waits.reduce((sum, ms) => sum + ms, 0),
-            60_000,
-        );
+        assert.deepEqual(fixture.waits, [30_000, 30_000]);
         fixture.done();
     }
+});
+
+test("CI wait: polling backs off exactly 30s, 60s, then 90s and stays at 90s", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 6 }, () => [
+            { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+            { args: ciConfirm, result: ciHead() },
+        ]).flat(),
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+    assert.deepEqual(fixture.waits, [30_000, 60_000, 90_000, 90_000, 90_000, 90_000]);
+    fixture.done();
+});
+
+test("CI wait: same-head no checks return NO CHECKS after 5 minutes, including the all-checks fallback", async () => {
+    const noRequired = {
+        code: 1,
+        stdout: "",
+        stderr: "no required checks reported on the 'main' branch\n",
+    };
+    const fixture = ciFixture([
+        // PR resolution time is not time spent observing an empty check set.
+        { args: ciView, result: ciPr(), elapsed: 200_000 },
+        ...Array.from({ length: 6 }, () => [
+            { args: ciChecks, result: noRequired },
+            { args: ciAllChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead() },
+        ]).flat(),
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^NO CHECKS:.*\(head-a\)/,
+    );
+    assert.deepEqual(fixture.waits, [30_000, 60_000, 90_000, 90_000, 90_000]);
+    fixture.done();
+});
+
+test("CI wait: checks that pass before 5 minutes still pass after empty observations", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 4 }, () => [
+            { args: ciChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead() },
+        ]).flat(),
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+    assert.deepEqual(fixture.waits, [30_000, 60_000, 90_000, 90_000]);
+    fixture.done();
+});
+
+test("CI wait: a head change resets the first no-checks observation timestamp", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 5 }, (_, index) => [
+            { args: ciChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead(index === 4 ? "head-b" : "head-a") },
+        ]).flat(),
+        ...Array.from({ length: 5 }, () => [
+            { args: ciChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead("head-b") },
+        ]).flat(),
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^NO CHECKS:.*\(head-b\)/,
+    );
+    assert.deepEqual(
+        fixture.waits,
+        [30_000, 60_000, 90_000, 90_000, 90_000, 90_000, 90_000, 90_000],
+    );
+    fixture.done();
+});
+
+test("CI wait: abort ends an active polling wait without a real timer or a PASS result", async () => {
+    assert.equal(typeof teamModule.waitForCiPoll, "function");
+    const controller = new AbortController();
+    const waiting = Promise.withResolvers<void>();
+    let cancellations = 0;
+    const fixture = ciFixture(
+        [
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+            { args: ciConfirm, result: ciHead() },
+        ],
+        controller.signal,
+    );
+    const result = waitForCi(
+        "/session/current-folder",
+        {},
+        {
+            ...fixture.deps,
+            wait: (ms, signal) =>
+                teamModule.waitForCiPoll(ms, signal, (_callback, interval) => {
+                    assert.equal(signal, controller.signal);
+                    assert.equal(interval, 30_000);
+                    waiting.resolve();
+
+                    return () => {
+                        cancellations++;
+                    };
+                }),
+        },
+    );
+
+    await waiting.promise;
+    controller.abort();
+    assert.match(await result, /^INTERRUPTED:/);
+    assert.equal(cancellations, 1);
+    fixture.done();
+});
+
+test("CI wait: abort kills and ends an active gh child without timers or network", async () => {
+    assert.equal(typeof teamModule.runCiGh, "function");
+    const controller = new AbortController();
+    const kills: unknown[] = [];
+    let cancellations = 0;
+    let starts = 0;
+    const child = Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        kill: (signal: unknown) => {
+            kills.push(signal);
+
+            return true;
+        },
+    });
+    const runtime = {
+        spawn: ((command: string, args: string[], options: { shell: boolean; cwd: string }) => {
+            starts++;
+            assert.equal(command, "gh");
+            assert.deepEqual(args, ciChecks);
+            assert.equal(options.shell, false);
+            assert.equal(options.cwd, "/session/current-folder");
+
+            return child;
+        }) as unknown as typeof import("node:child_process").spawn,
+        timer: (_callback: () => void, ms: number) => {
+            assert.equal(ms, 30_000);
+
+            return () => {
+                cancellations++;
+            };
+        },
+    };
+    const result = teamModule.runCiGh(
+        ciChecks,
+        {
+            cwd: "/session/current-folder",
+            timeoutMs: 30_000,
+            signal: controller.signal,
+        },
+        runtime,
+    );
+    const ended = assert.rejects(result, { name: "AbortError" });
+
+    controller.abort();
+    await ended;
+    assert.deepEqual(kills, ["SIGKILL"]);
+    assert.equal(cancellations, 1);
+    assert.equal(starts, 1);
+    // A previously aborted call must not start a replacement child.
+    await assert.rejects(
+        teamModule.runCiGh(
+            ciChecks,
+            {
+                cwd: "/session/current-folder",
+                timeoutMs: 30_000,
+                signal: controller.signal,
+            },
+            runtime,
+        ),
+        { name: "AbortError" },
+    );
+    assert.equal(starts, 1);
 });
 
 test("CI wait: a cancelled check fails at once, even when another check is pending", async () => {
@@ -312,7 +503,7 @@ test("CI wait: a new head discards green and failed observations and starts chec
             await waitForCi("/session/current-folder", {}, fixture.deps),
             /^PASS:.*\(head-b\)/,
         );
-        assert.deepEqual(fixture.waits, [10_000]);
+        assert.deepEqual(fixture.waits, [30_000]);
         fixture.done();
     }
 });
@@ -416,6 +607,7 @@ test("team_wait_for_ci is an ordinary, read-only, replay-safe tool and is always
     const symbol = Symbol.for("pi-pocket-team.team");
     const holder = globalThis as unknown as Record<symbol, unknown>;
     const previous = holder[symbol];
+    const disposers: (() => void)[] = [];
 
     try {
         const extension = createTeam(
@@ -426,7 +618,9 @@ test("team_wait_for_ci is an ordinary, read-only, replay-safe tool and is always
                 client() {},
                 command() {},
                 send() {},
-                onDispose() {},
+                onDispose(dispose: () => void) {
+                    disposers.push(dispose);
+                },
             } as never,
         ) as unknown as {
             tools: {
@@ -461,6 +655,24 @@ test("team_wait_for_ci is an ordinary, read-only, replay-safe tool and is always
 
         assert.equal(reads, 1);
         assert.match(JSON.stringify(result), /This session has no current folder/);
+
+        // Hold both calls before their first gh command, then dispose the module. Neither may reach the network.
+        const folder = Promise.withResolvers<{ cwd: string }>();
+        const active = [
+            tool.execute({}, { agent: () => folder.promise }, context),
+            tool.execute({}, { agent: () => folder.promise }, context),
+        ];
+
+        for (const dispose of disposers) {
+            dispose();
+        }
+
+        folder.resolve({ cwd: "/session/current-folder" });
+
+        for (const interrupted of await Promise.all(active)) {
+            assert.match(JSON.stringify(interrupted), /INTERRUPTED:/);
+            assert.doesNotMatch(JSON.stringify(interrupted), /PASS/);
+        }
     } finally {
         if (previous === undefined) {
             delete holder[symbol];

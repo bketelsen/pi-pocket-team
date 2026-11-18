@@ -52,9 +52,11 @@ The Desk's goal board starts its shift rows through Team too, with `startShift`:
 
 `team_wait_for_ci` returns a PR's CI result in the same call, without later watch messages. It is available in ordinary sessions and always supplied to subagents with a tool list when Team is enabled there. Only that tool call waits; other sessions keep running.
 
-It runs in the current session folder. Optional inputs are `pr` (a number, HTTPS PR URL or `owner/name#12`; default: the current branch's PR) and `timeout_minutes` (1–60 whole minutes, default 30). It uses required checks, falling back to all checks only on `gh`'s explicit no-required-checks stderr message. Empty or pending checks never pass; failed or cancelled checks return `FAIL`. A head change restarts observations within the original deadline.
+It runs in the current session folder. Optional inputs are `pr` (a number, HTTPS PR URL or `owner/name#12`; default: the current branch's PR) and `timeout_minutes` (1–60 whole minutes, default 30). It uses required checks, falling back to all checks only on `gh`'s explicit no-required-checks stderr message. Polling waits are 30 seconds, 60 seconds, then 90 seconds thereafter, shortened by the remaining timeout. Empty or pending checks never pass; failed or cancelled checks return `FAIL`. After 5 minutes of empty observations on the same confirmed head, the next poll returns `NO CHECKS`, unless the original timeout expires first. Checks appearing or a head change reset that timer; a head change restarts observations without resetting the backoff or deadline.
 
-Results start with `PASS`, `FAIL`, `TIMEOUT`, `NO PR` or `ERROR`. Failure details include at most 3 checks, 3000 tail characters per job log and 8000 characters total. Unlike this blocking, read-only tool, Pocket's `watch_pr` starts an asynchronous event watch and gives no CI success result. See the [full CI wait reference](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#wait-for-ci).
+Results start with `PASS`, `FAIL`, `TIMEOUT`, `NO PR`, `NO CHECKS`, `ERROR` or `INTERRUPTED`. Failure details include at most 3 checks, 3000 tail characters per job log and 8000 characters total. Disposing or reloading Team aborts active calls with `INTERRUPTED`, ends polling waits and kills active `gh` children. The tool API exposes no stop signal, so a person stopping a session cannot directly cancel an already running tool call.
+
+Unlike this blocking, read-only tool, Pocket's `watch_pr` starts an asynchronous event watch and gives no CI success result. See the [full CI wait reference](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#wait-for-ci).
 
 ## MCP servers
 

@@ -124,7 +124,9 @@ For example:
 
 **Which checks count.** Each observation starts with `gh pr checks --required`. It falls back to all checks only when that command exits 1 and a line of **stderr** matches `no required checks reported on the .* branch`, for example `no required checks reported on the 'main' branch`. A failing check, a pending check or another command error does not enable the fallback.
 
-**When it finishes.** No checks yet, no rows, pending checks and unknown buckets keep waiting. A `fail` or `cancel` bucket returns `FAIL` without waiting for the other checks. The tool confirms the head after each check observation: a changed head discards the observation and starts checking again within the original deadline. It returns `PASS` only for a non-empty set of terminal `pass` or `skipping` checks, with a successful checks command and a same-head confirmation. In fallback mode, that rule applies to all checks instead of required checks.
+**Polling and completion.** The waits back off exactly: 30 seconds, 60 seconds, then 90 seconds thereafter, shortened only by the remaining timeout. This protects the shared GitHub budget. Pending checks and unknown buckets keep waiting. No checks yet or no rows also wait, but return `NO CHECKS` once an empty observation is at least 5 minutes after the first empty observation on the same confirmed head. Checks appearing reset that timer. A changed head discards the observation, resets the no-checks timer and starts checking again within the original deadline; it does not reset the polling backoff.
+
+A `fail` or `cancel` bucket returns `FAIL` without waiting for the other checks. The tool confirms the head after each check observation. It returns `PASS` only for a non-empty set of terminal `pass` or `skipping` checks, with a successful checks command and a same-head confirmation. In fallback mode, that rule applies to all checks instead of required checks.
 
 The result starts with one of:
 
@@ -132,7 +134,11 @@ The result starts with one of:
 - `FAIL`: at least 1 check failed or was cancelled. The result includes at most 3 such checks and at most 3000 tail characters per job log, with an 8000-character total result limit. Actions run/job ids come only from `/actions/runs/<run>/job/<job>` or `/actions/runs/<run>/jobs/<job>` links in the same repository. Other links, or logs it cannot read, get a log-unavailable note.
 - `TIMEOUT`: the original deadline expired without a completed result. This never means pass.
 - `NO PR`: no pull request was found for the branch or selector.
+- `NO CHECKS`: the same confirmed head still has no checks after at least 5 minutes of empty observations. The next poll detects this threshold; the original timeout still takes precedence if it expires first. This never means pass.
 - `ERROR`: the input, folder, PR resolution or check read could not be used. This never means pass.
+- `INTERRUPTED`: Team module disposal aborted the call. This never means pass.
+
+**Cancellation limit.** The tool API exposes no stop signal. Each call has a module-lifetime abort controller: disposing or reloading Team aborts active calls, ends their polling waits and kills their active `gh` children. A person stopping a session cannot directly cancel an already running tool call. The tool removes its controller when the call ends.
 
 **Not `watch_pr`.** Pocket's `watch_pr` starts an asynchronous event watch. It returns after starting, then sends later messages for failures, conflicts or reviewer activity; it returns no CI success result. `team_wait_for_ci` returns the CI result here and sends no later watch messages.
 
