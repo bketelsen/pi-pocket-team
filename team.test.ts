@@ -468,6 +468,48 @@ function repository(folder: string): void {
     }
 }
 
+test("identityText: fresh delegations separate new tasks without rotating existing work", () => {
+    const persona = (role: "agent" | "supervisor" | "clerk") => ({
+        id: "duncan",
+        name: "Duncan Idaho",
+        role,
+        model: "",
+        instructions: "# Duncan Idaho\nOwn the code.",
+        repositories: {},
+    });
+    const supervisor = identityText(persona("supervisor"));
+    const agent = identityText(persona("agent"));
+    const fresh =
+        "Start a fresh team_delegate linked session for every new task, even for the same agent and repository";
+    const continuation =
+        "Use desk send only for a question or continuation of the task already bound to that thread.";
+    const unrelated =
+        "If a follow-up asks for unrelated work, do not fold it into the old task; tell your supervisor in your report that a fresh delegation is needed.";
+
+    assert(supervisor.includes(fresh));
+    assert(supervisor.includes(continuation));
+    assert(agent.includes("Keep normal same-task follow-ups on this thread."));
+    assert(agent.includes(unrelated));
+
+    for (const text of [supervisor, agent, identityText(persona("agent"), false, true)]) {
+        assert(text.includes("Do not rotate a task in flight."));
+        assert(
+            text.includes(
+                "A fresh task never cancels an old task's work, open ask, lease or restart state.",
+            ),
+        );
+        assert(text.includes("Keep each open ask and lease on the original thread."));
+        assert(text.includes("Pocket's durable thread/session and replay state survive restart."));
+    }
+
+    // Private agents and the Clerk keep their separate roles, with no task-delegation policy.
+    for (const text of [identityText(persona("agent"), true), identityText(persona("clerk"))]) {
+        assert(!text.includes(fresh));
+        assert(!text.includes(continuation));
+        assert(!text.includes(unrelated));
+    }
+});
+
 test("identityText: only a planning session gets the exception to the rule on the built-in ask tool", () => {
     const persona = (role: "agent" | "supervisor" | "clerk") => ({
         id: "duncan",
