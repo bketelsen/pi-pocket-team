@@ -23,7 +23,7 @@ For a report over many days, `node audit/github-hooks.mjs --since <go-live time>
 - Only the events `pull_request`, `pull_request_review`, `check_suite`, `status`, `issues`, `ping`, `installation` and `installation_repositories`, and only repositories of `frostyard` and `bketelsen`.
 - A delivery id or a body it saw in the last 72 hours is a duplicate: `200`. It adds a log entry and a count, but no fact and no nudge.
 
-The answers: `202` accepted; `200` for a duplicate, an action it ignores, or `ping`; `401` bad signature; `400` bad id, event or JSON; `404`, `411`, `413`, `415` for the request's shape; `408` for slow headers (5 seconds) or a slow body (10 seconds); `422` another owner; `503` when the secret is missing, no receiver runs, or a limit is full; `500` when a commit fails.
+The answers: `202` accepted; `200` for a duplicate, an action it ignores, or `ping`; `401` bad signature; `400` bad id, event or JSON; `404`, `411`, `413`, `415` for the request's shape; `408` for slow headers (5 seconds) or a slow body (10 seconds from the start of the read; bytes that already arrived are read before a `408`); `422` another owner; `503` when the secret is missing, no receiver runs, or a limit is full; `500` when a commit fails.
 
 ## Reloads and turning it off
 

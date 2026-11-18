@@ -617,6 +617,10 @@ export type DeliveryEntry = {
     /** The HTTP status; 0 when the socket was closed with no answer. */
     status: number;
     peer?: string;
+    /** A `timeout` refusal: the body bytes read when the deadline ended. */
+    bytes?: number;
+    /** A `timeout` refusal: the body length that `Content-Length` declared. */
+    expected?: number;
     fact?: HookFact;
 };
 
@@ -1674,6 +1678,8 @@ export type ListenerDeps = {
     limits?: Partial<ListenerLimits>;
     /** The timers of the bind, its retries and the socket grace time at `close`: a test injects its own. */
     timers?: { set: (run: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
+    /** The timer of the body deadline in `readBody`: a test injects its own. */
+    deadlines?: { set: (run: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
 };
 
 export type ListenerStatus = {
@@ -1735,6 +1741,10 @@ export function createHookListener(deps: ListenerDeps) {
         set: (run: () => void, ms: number) => setTimeout(run, ms),
         clear: (handle: unknown) => clearTimeout(handle as NodeJS.Timeout),
     };
+    const deadlines = deps.deadlines ?? {
+        set: (run: () => void, ms: number) => setTimeout(run, ms),
+        clear: (handle: unknown) => clearTimeout(handle as NodeJS.Timeout),
+    };
     let firstTry = 0;
     let closed = false;
     let inProgress = 0;
@@ -1749,11 +1759,16 @@ export function createHookListener(deps: ListenerDeps) {
         outcome: DeliveryOutcome,
         code: number,
         known?: { delivery?: string; event?: string },
+        detail?: { bytes: number; expected: number },
     ) => {
+        const suffix =
+            detail === undefined ? "" : ` bytes=${detail.bytes} expected=${detail.expected}`;
+
         deps.log(
-            known?.delivery === undefined
+            (known?.delivery === undefined
                 ? `github-hooks: ${stamp()} refused peer=${peer} reason=${outcome} status=${String(code)}`
-                : `github-hooks: ${stamp()} delivery=${known.delivery} event=${known.event ?? "-"} action=- repo=- outcome=${outcome} status=${String(code)}`,
+                : `github-hooks: ${stamp()} delivery=${known.delivery} event=${known.event ?? "-"} action=- repo=- outcome=${outcome} status=${String(code)}`) +
+                suffix,
         );
         deps.onEvent({
             type: "refusal",
@@ -1764,6 +1779,7 @@ export function createHookListener(deps: ListenerDeps) {
                 outcome,
                 status: code,
                 peer,
+                ...detail,
             },
         });
 
@@ -1790,44 +1806,55 @@ export function createHookListener(deps: ListenerDeps) {
 
     /** Read the body to a buffer, at most the cap + 1 byte, within the deadline. */
     const readBody = (req: IncomingMessage) =>
-        new Promise<{ body?: Buffer; error?: "too-large" | "timeout" | "aborted" }>((resolve) => {
-            const chunks: Buffer[] = [];
-            let size = 0;
-            let done = false;
+        new Promise<{ body?: Buffer; error?: "too-large" | "timeout" | "aborted"; bytes?: number }>(
+            (resolve) => {
+                const chunks: Buffer[] = [];
+                let size = 0;
+                let done = false;
+                let immediate: NodeJS.Immediate | undefined;
 
-            const finish = (value: {
-                body?: Buffer;
-                error?: "too-large" | "timeout" | "aborted";
-            }) => {
-                if (done) {
-                    return;
-                }
+                const finish = (value: {
+                    body?: Buffer;
+                    error?: "too-large" | "timeout" | "aborted";
+                    bytes?: number;
+                }) => {
+                    if (done) {
+                        return;
+                    }
 
-                done = true;
-                clearTimeout(deadline);
-                req.removeAllListeners("data");
-                resolve(value);
-            };
+                    done = true;
+                    deadlines.clear(deadline);
 
-            const deadline = setTimeout(() => finish({ error: "timeout" }), limits.bodyTimeoutMs);
+                    if (immediate !== undefined) {
+                        clearImmediate(immediate);
+                    }
 
-            req.on("data", (chunk: Buffer) => {
-                size += chunk.length;
+                    req.removeAllListeners("data");
+                    resolve(value);
+                };
 
-                if (size > limits.maxBody) {
-                    req.pause();
-                    finish({ error: "too-large" });
+                const deadline = deadlines.set(() => {
+                    immediate ??= setImmediate(() => finish({ error: "timeout", bytes: size }));
+                }, limits.bodyTimeoutMs);
 
-                    return;
-                }
+                req.on("data", (chunk: Buffer) => {
+                    size += chunk.length;
 
-                chunks.push(chunk);
-            });
-            req.on("end", () => finish({ body: Buffer.concat(chunks, size) }));
-            req.on("aborted", () => finish({ error: "aborted" }));
-            req.on("error", () => finish({ error: "aborted" }));
-            req.on("close", () => finish({ error: "aborted" }));
-        });
+                    if (size > limits.maxBody) {
+                        req.pause();
+                        finish({ error: "too-large" });
+
+                        return;
+                    }
+
+                    chunks.push(chunk);
+                });
+                req.on("end", () => finish({ body: Buffer.concat(chunks, size) }));
+                req.on("aborted", () => finish({ error: "aborted" }));
+                req.on("error", () => finish({ error: "aborted" }));
+                req.on("close", () => finish({ error: "aborted" }));
+            },
+        );
 
     const handle = async (req: IncomingMessage, res: ServerResponse, peer: string) => {
         const socket = req.socket;
@@ -1899,7 +1926,10 @@ export function createHookListener(deps: ListenerDeps) {
             }
 
             if (read.error === "timeout") {
-                refuse(res, socket, peer, "timeout", 408);
+                refuse(res, socket, peer, "timeout", 408, undefined, {
+                    bytes: read.bytes ?? 0,
+                    expected: length,
+                });
 
                 return;
             }

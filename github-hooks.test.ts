@@ -6,7 +6,8 @@
 // - HMAC: valid, wrong secret, missing header, `sha1=`, wrong length, upper-case hex, a bad-signature non-JSON body is
 //   401, both rotation secrets work: "HMAC" below.
 // - Size: 1 MiB passes, 1 MiB + 1 byte is 413 before a body byte, a large Content-Length is 413, no Content-Length is
-//   411, slow headers and a slow body are 408: "Size".
+//   411, slow headers and a slow body are 408; a body that arrived during an event-loop stall is read before the
+//   deadline ends it, and a `timeout` refusal records the bytes read and the expected length (issue #219): "Size".
 // - Admission: 17 sockets, 9 requests, 9 MiB of bodies in flight: "Admission".
 // - Life cycle: a held port gives `bind-failed`, a dispose during a retry cancels it, `close` ends an idle socket at
 //   once and an active one after the grace time: "Life cycle"; 20 reloads and 1 reload with an idle socket: P.
@@ -189,6 +190,7 @@ async function listen(
         receiver?: ReceiverHandle | null;
         port?: number;
         timers?: ListenerDeps["timers"];
+        deadlines?: ListenerDeps["deadlines"];
     } = {},
 ) {
     const jobs: DeliveryJob[] = [];
@@ -220,6 +222,7 @@ async function listen(
         onEvent: (event) => events.push(event),
         ...(options.limits === undefined ? {} : { limits: options.limits }),
         ...(options.timers === undefined ? {} : { timers: options.timers }),
+        ...(options.deadlines === undefined ? {} : { deadlines: options.deadlines }),
     });
 
     listener.start();
@@ -335,6 +338,27 @@ describe("HMAC", () => {
     });
 });
 
+/** A body deadline that the test holds and fires itself: no wall time decides when it ends. */
+function heldDeadlines() {
+    const held: (() => void)[] = [];
+    const deadlines: NonNullable<ListenerDeps["deadlines"]> = {
+        set: (run) => {
+            held.push(run);
+
+            return run;
+        },
+        clear: (handle) => {
+            const i = held.indexOf(handle as () => void);
+
+            if (i >= 0) {
+                held.splice(i, 1);
+            }
+        },
+    };
+
+    return { held, deadlines };
+}
+
 describe("Size", () => {
     test("exactly 1 MiB passes the size checks", async () => {
         const hooks = await listen();
@@ -423,6 +447,79 @@ describe("Size", () => {
             );
 
             assert.equal(body.status, 408);
+        } finally {
+            hooks.close();
+        }
+    });
+
+    test("a body that arrived during a stall is read before the deadline ends it: 202, not 408", async () => {
+        const { held, deadlines } = heldDeadlines();
+        const hooks = await listen({ deadlines });
+
+        try {
+            const body = Buffer.from(JSON.stringify(pr()));
+            const bytes = deliveryBytes("pull_request", undefined, { body });
+            const split = bytes.length - body.length + 1;
+            const client = await hold(hooks.port);
+
+            client.socket.write(bytes.subarray(0, split));
+            await waitFor(() => held.length === 1, "the body deadline is armed");
+
+            client.socket.write(bytes.subarray(split));
+            assert.equal(
+                client.socket.writableLength,
+                0,
+                "the rest of the body is in the kernel, not in a user-space buffer",
+            );
+            held.shift()!();
+
+            await waitFor(() => client.closed(), "the server answers and closes");
+            assert.ok(/^HTTP\/1\.1 202/.test(client.text()), client.text());
+            assert.equal(hooks.jobs.length, 1);
+            assert.equal(
+                hooks.events.some((event) => event.type === "refusal"),
+                false,
+            );
+        } finally {
+            hooks.close();
+        }
+    });
+
+    test("a body still incomplete when the deadline ends is 408, with the bytes read and the expected length", async () => {
+        const { held, deadlines } = heldDeadlines();
+        const hooks = await listen({ deadlines });
+
+        try {
+            const client = await hold(hooks.port);
+
+            client.socket.write(
+                requestBytes({
+                    length: 100,
+                    headers: { "Content-Type": "application/json" },
+                    body: Buffer.from("{"),
+                }),
+            );
+            await waitFor(() => held.length === 1, "the body deadline is armed");
+            held.shift()!();
+
+            await waitFor(() => client.closed(), "the server answers and closes");
+            assert.ok(/^HTTP\/1\.1 408/.test(client.text()), client.text());
+
+            const refusals = hooks.events.filter((event) => event.type === "refusal");
+
+            assert.equal(refusals.length, 1);
+            assert.equal(refusals[0]!.entry.outcome, "timeout");
+            assert.equal(refusals[0]!.entry.status, 408);
+            assert.equal(refusals[0]!.entry.bytes, 1);
+            assert.equal(refusals[0]!.entry.expected, 100);
+            assert.equal(
+                hooks.lines.filter((line) =>
+                    / refused peer=127\.0\.0\.1 reason=timeout status=408 bytes=1 expected=100$/.test(
+                        line,
+                    ),
+                ).length,
+                1,
+            );
         } finally {
             hooks.close();
         }
