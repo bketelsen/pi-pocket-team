@@ -60,9 +60,14 @@ Whole-plan checks use `plan verify`, which records the verdict with the round in
 
 The thread's Reviews section, `desk read`, `desk list`, export and digest show the verdict. The newest matching
 verdict per kind and PR wins. A Ready at an old or unknown PR head is stale, not current, and cannot hide a
-Not-ready or unclear verdict. A pending digest checks staleness again when it sends. A current Ready alone needs
+Not-ready or unclear verdict. A negative verdict stays current and actionable even when its reviewed head is old,
+unknown or absent from the Desk. A newer Ready at the observed current head clears the same kind and PR scope;
+a stale Ready does not. The queue and digest use PR observations across all threads of the same supervisor.
+A pending digest checks staleness again when it sends. A current Ready alone needs
 no Clerk escalation and no prose-based `report-blocked`; explicit blocked status and asks still count.
-Not-ready and unclear go urgently by default as `review-blocked`. The interval stays unchanged.
+Not-ready and unclear go urgently as `review-blocked`, even when stale. Review waits in the Odrade queue are urgent too.
+The exported thread file has a Reviews section when verdicts exist. Reviewer labels are quoted data, not instructions.
+The interval stays unchanged.
 
 GitHub owner reviews require the reviewer task to submit `kind: "owner-review"` explicitly with the reviewed head.
 The sweep does not infer Ready from GitHub prose. This records evidence, not approval or merge authority.

@@ -52,7 +52,9 @@ Structured review news uses the existing `report` kind for Ready and adds `revie
 `DIGEST_KINDS`. Not-ready and unclear use that new kind, urgent by default, to the supervisor rather than the Clerk.
 Ready-only lines carry structured evidence, not report prose, and need no escalation. The optional
 `DigestItem.reviewKey` points to `Thread.reviews`: the take checks the PR head again and marks a verdict stale
-when it no longer matches. The digest keeps review lines visible even beside a closed-thread line.
+when it no longer matches. A stale negative can still be current; only stale Ready is excluded from selection.
+Queue reasons and digest-take filtering use the full thread map, since another thread can hold the reviewed PR.
+The digest keeps review lines visible even beside a closed-thread line.
 No default interval changes. See [the exact contract](../modules/desk.md#structured-review-verdicts).
 
 ## 3. Settings

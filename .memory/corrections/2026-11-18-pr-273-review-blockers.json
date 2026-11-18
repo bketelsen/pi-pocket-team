@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk review verdicts",
+  "correction": "Resolve review wait reasons with the full thread map through the queue, sweep and digest take. Staleness invalidates only Ready: negative verdicts stay current and actionable until a newer eligible verdict in the same kind and PR scope replaces them.",
+  "evidence": "https://github.com/bketelsen/pi-pocket-team/pull/273; cross-review result Not ready at head 887536814cb5f1bbda3497bfc61cc30f32b200e8, blocking finding 1 (cross-thread PR verdicts missing from the Odrade queue) and blocking finding 2 (stale Not-ready/unclear verdicts made inert).",
+  "promoted_to": "desk-reviews.test.ts: stale, unknown and unobserved negative verdicts stay current until a newer valid verdict replaces them; cross-thread PR reviews enter the Odrade queue and clear only with a matching Ready"
+}

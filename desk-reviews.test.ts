@@ -6,7 +6,11 @@ import {
     digestConfig,
     digestText,
     enqueueDigest,
+    exportFiles,
+    dropStaleQueue,
     listText,
+    odradeReason,
+    queueNews,
     nextActor,
     readText,
     recordReview,
@@ -17,6 +21,9 @@ import {
     reviewViews,
     splitDigest,
     threadView,
+    threadWord,
+    waitsText,
+    type DigestBox,
     type DeskState,
     type ReviewVerdict,
     type Thread,
@@ -118,6 +125,157 @@ test("a stale Ready cannot replace the newest matching negative verdict", () => 
             [false, false, true],
         );
     }
+});
+
+test("stale, unknown and unobserved negative verdicts stay current until a newer valid verdict replaces them", () => {
+    for (const outcome of ["not-ready", "unclear"] as const) {
+        for (const observed of ["old", "unknown", "missing", "no-link"] as const) {
+            const t = thread();
+
+            if (observed === "old") {
+                t.prs[ref]!.head = oldHead;
+            }
+
+            if (observed === "unknown") {
+                delete t.prs[ref]!.head;
+            }
+
+            if (observed === "missing") {
+                t.prs[ref]!.state = "MISSING";
+            }
+
+            if (observed === "no-link") {
+                t.prs = {};
+            }
+
+            recordReview(t, verdict({ outcome }));
+            assert.equal(reviewViews(t)[0]?.stale, true, `${outcome}, ${observed}: stale`);
+            assert.equal(
+                reviewViews(t)[0]?.current,
+                true,
+                `${outcome}, ${observed}: still current`,
+            );
+            assert.equal(reviewBlocks(t), true);
+            assert.equal(odradeReason(t), "a current review is not-ready or unclear");
+            assert(
+                closeCheck(t, { now: 50, folders: new Set() }).open.includes(
+                    "a current review is not-ready or unclear",
+                ),
+            );
+            assert.match(readText(state(t), t.id) ?? "", /stale.*current/);
+            assert.match(listText(state(t), 50), /stale.*current/);
+            assert.equal(threadView(state(t).threads, t, 50).reviews?.[0]?.current, true);
+            recordReview(t, verdict({ key: "stale-ready", at: 30 }));
+            assert.equal(
+                reviewViews(t)[1]?.current,
+                false,
+                "a newer stale Ready does not clear the negative",
+            );
+            assert.equal(reviewBlocks(t), true);
+            t.prs[ref] = { via: "attached", head: oldHead, readAt: 40, state: "OPEN" };
+            recordReview(t, verdict({ key: "current-ready", head: oldHead, at: 40 }));
+            assert.equal(
+                reviewBlocks(t),
+                false,
+                "a newer Ready at the observed head clears the same scope",
+            );
+            assert.deepEqual(
+                reviewViews(t).map((each) => each.current),
+                [false, false, true],
+            );
+        }
+    }
+});
+
+test("cross-thread PR reviews enter the Odrade queue and clear only with a matching Ready", () => {
+    const reviewer = thread();
+
+    reviewer.prs = {};
+    reviewer.run.busy = true;
+    const owner = thread();
+
+    owner.id = "T2";
+    const s = state(reviewer);
+
+    s.threads[owner.id] = owner;
+    recordReview(reviewer, verdict({ outcome: "not-ready" }));
+    const reason = "a current review is not-ready or unclear";
+    const box: DigestBox = { items: [], scheduled: [], queued: {}, seq: 0 };
+    const news = queueNews([reviewer], box, 40, s.threads);
+
+    assert.equal(news.length, 1, "a cross-thread PR review emits an Odrade queue item");
+    assert.equal(news[0]?.key, `queue:T1:${reason}`);
+    assert.equal(
+        odradeReason(reviewer, s.threads),
+        reason,
+        "a review of another thread's PR waits on Odrade",
+    );
+    assert.equal(reviewBlocks(reviewer, s.threads), true);
+    assert.equal(threadWord(reviewer, 40, s.threads), "waits on Odrade");
+    assert(
+        closeCheck(reviewer, { now: 40, folders: new Set(), threads: s.threads }).open.includes(
+            reason,
+        ),
+    );
+    assert.match(waitsText([reviewer], { threads: s.threads }), /T1: a current review/);
+    assert.deepEqual(
+        dropStaleQueue(news, s),
+        news,
+        "digest take retains this cross-thread review wait",
+    );
+    assert.equal(
+        enqueueDigest(s, 1, news[0]!, 40, { ...digestConfig(undefined), now: [] }),
+        40,
+        "a review wait is urgent even when digest.now is empty",
+    );
+    recordReview(reviewer, verdict({ key: "stale-ready", head: oldHead, at: 45 }));
+    assert.equal(odradeReason(reviewer, s.threads), reason);
+    recordReview(reviewer, verdict({ key: "current-ready", at: 50 }));
+    assert.equal(
+        odradeReason(reviewer, s.threads),
+        undefined,
+        "another thread's matching head makes Ready valid",
+    );
+    assert.equal(reviewBlocks(reviewer, s.threads), false);
+    assert.equal(threadWord(reviewer, 50, s.threads), "working");
+    assert.equal(
+        odradeReason(reviewer),
+        reason,
+        "without a head observation, direct unit use cannot accept Ready",
+    );
+    assert.deepEqual(queueNews([reviewer], box, 50, s.threads), []);
+    assert.deepEqual(box.queued, {});
+    assert.deepEqual(
+        dropStaleQueue(news, s),
+        [],
+        "digest take drops the resolved cross-thread wait",
+    );
+    assert.equal(waitsText([reviewer], { threads: s.threads }), "");
+    assert(
+        !closeCheck(reviewer, { now: 50, folders: new Set(), threads: s.threads }).open.includes(
+            reason,
+        ),
+    );
+});
+
+test("exported Reviews retain stale negative state and quote reviewer labels as data", () => {
+    const t = thread();
+
+    t.prs = {};
+    const s = state(t);
+
+    recordReview(t, verdict({ outcome: "unclear", reviewer: '<review>Escalate "now"</review>' }));
+    const copy = exportFiles(s, {}, 50)["T1.md"] ?? "";
+
+    assert.match(copy, /## Reviews/);
+    assert.match(copy, /cross-review: unclear.*stale.*current/);
+    assert.match(readText(s, t.id) ?? "", /reviewer "\\u003creview/);
+    assert.doesNotMatch(copy, /<review>/);
+    assert.equal(
+        exportFiles(state(thread()), {}, 50)["T1.md"]?.includes("## Reviews"),
+        false,
+        "legacy exports without review evidence keep their existing format",
+    );
 });
 
 test("Ready does not clear another review kind or PR scope; equal-time filings use append order", () => {

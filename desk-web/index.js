@@ -2113,8 +2113,8 @@ export default function setup(pocket) {
                               <ul class="desk-list small">${thread.reviews.map(
                                   (review) => html`<li>
                                   ${review.kind}: <strong>${review.outcome}</strong>
-                                  · ${review.stale ? "stale (PR head differs or is unknown)" : review.current ? "current" : "superseded"}
-                                  · ${review.reviewer} · ${new Date(review.at).toISOString()}
+                                  · ${review.stale ? "stale (PR head differs or is unknown) · " : ""}${review.current ? "current" : review.stale && review.outcome === "ready" ? "not current" : "superseded"}
+                                  · reviewer ${JSON.stringify(review.reviewer)} · ${new Date(review.at).toISOString()}
                                   <div class="mono">${review.ref ? `${review.ref}@${review.head}` : "no PR"}</div>
                               </li>`,
                               )}</ul>`

@@ -3169,7 +3169,7 @@ export function setWatch(
 
     if (closed) {
         // The watch sleeps: the next actor is the one the sweep would give the reopened thread.
-        thread.run.next = nextActor(thread);
+        thread.run.next = nextActor(thread, state?.threads);
 
         return { changed: true, reopened: true };
     }
@@ -5934,7 +5934,12 @@ export function planRepairs(thread: Thread, now: number): number {
  * again, its links are read again, and the wake-up goes to Odrade, not to an agent whose thread was closed. True when
  * it reopened.
  */
-export function repairReopen(thread: Thread, github: GitHubFacts, now: number): boolean {
+export function repairReopen(
+    thread: Thread,
+    github: GitHubFacts,
+    now: number,
+    threads?: Readonly<Record<string, Thread>>,
+): boolean {
     if (thread.state !== "closed" || thread.closed?.why === "dropped") {
         return false;
     }
@@ -5975,7 +5980,7 @@ export function repairReopen(thread: Thread, github: GitHubFacts, now: number): 
     delete thread.run.quietReopen;
     delete thread.run.quietWake;
     recordRepair(thread, found.key, { to: "odrade", why: "closed" }, now);
-    thread.run.next = nextActor(thread);
+    thread.run.next = nextActor(thread, threads);
     addEvent(
         thread,
         `reopened:${String(now)}`,
@@ -6660,16 +6665,20 @@ const SILENT_SESSION = "silent session";
 
 /**
  * Why a thread waits on Odrade now, in `nextActor`'s order, in words: a failed run (`run failed: <line>`, also for a plan
- * thread), a due watch, a found thread, a PR GitHub cannot find, a report that says blocked, else a silent session.
+ * thread), a current negative review (also when stale), a due watch, a found thread, a PR GitHub cannot find, a
+ * report that says blocked, else a silent session.
  * Undefined when Odrade is not next, for another plan thread, or when the thread is parked: a parked thread waits on
  * Brian, not on her.
  */
-export function odradeReason(thread: Thread): string | undefined {
+export function odradeReason(
+    thread: Thread,
+    threads?: Readonly<Record<string, Thread>>,
+): string | undefined {
     if (thread.state === "parked") {
         return undefined;
     }
 
-    if (nextActor(thread) !== "odrade") {
+    if (nextActor(thread, threads) !== "odrade") {
         return undefined;
     }
 
@@ -6679,7 +6688,7 @@ export function odradeReason(thread: Thread): string | undefined {
         return `run failed: ${failed}`;
     }
 
-    if (reviewBlocks(thread)) {
+    if (reviewBlocks(thread, threads)) {
         return "a current review is not-ready or unclear";
     }
 
@@ -6738,6 +6747,8 @@ export type WaitsFacts = {
      * Absent when the live list was not read: the text is then the one the stored facts give.
      */
     busy?: ReadonlySet<string>;
+    /** Full Desk map: a reviewed PR can belong to a thread outside the candidate list. */
+    threads?: Readonly<Record<string, Thread>>;
 };
 
 /**
@@ -6746,8 +6757,11 @@ export type WaitsFacts = {
  * session whose agent works now: its report comes, so it does not wait on Odrade. The other reasons stay.
  */
 export function waitsText(threads: Thread[], facts: WaitsFacts = {}): string {
+    const allThreads =
+        facts.threads ?? Object.fromEntries(threads.map((thread) => [thread.id, thread]));
+
     return threads
-        .map((thread) => ({ thread, reason: odradeReason(thread) }))
+        .map((thread) => ({ thread, reason: odradeReason(thread, allThreads) }))
         .filter((each): each is { thread: Thread; reason: string } => each.reason !== undefined)
         .filter(
             (each) =>
@@ -6763,9 +6777,15 @@ export function waitsText(threads: Thread[], facts: WaitsFacts = {}): string {
 }
 
 /** Whether `waitsText` needs the live session list for `threads`: 1 of them is a silent session with an address. */
-export function waitsNeedLive(threads: Thread[]): boolean {
+export function waitsNeedLive(
+    threads: Thread[],
+    allThreads: Readonly<Record<string, Thread>> = Object.fromEntries(
+        threads.map((thread) => [thread.id, thread]),
+    ),
+): boolean {
     return threads.some(
-        (thread) => thread.address !== undefined && odradeReason(thread) === SILENT_SESSION,
+        (thread) =>
+            thread.address !== undefined && odradeReason(thread, allThreads) === SILENT_SESSION,
     );
 }
 
@@ -7016,7 +7036,8 @@ function urgentDigest(item: DigestItem): boolean {
         reason !== undefined &&
         (reason.startsWith("run failed: ") ||
             reason === "report says blocked" ||
-            reason === "report asks Brian")
+            reason === "report asks Brian" ||
+            reason === "a current review is not-ready or unclear")
     );
 }
 
@@ -7077,12 +7098,19 @@ export function enqueueDigest(
  * a digest carried already. It records each reason in `box.queued`, and deletes the threads that stopped waiting. The
  * caller enqueues the items it gives; nothing is added to the box here.
  */
-export function queueNews(threads: readonly Thread[], box: DigestBox, now: number): DigestItem[] {
+export function queueNews(
+    threads: readonly Thread[],
+    box: DigestBox,
+    now: number,
+    allThreads: Readonly<Record<string, Thread>> = Object.fromEntries(
+        threads.map((thread) => [thread.id, thread]),
+    ),
+): DigestItem[] {
     const items: DigestItem[] = [];
     const waiting = new Set<string>();
 
     for (const thread of threads) {
-        const reason = odradeReason(thread);
+        const reason = odradeReason(thread, allThreads);
 
         if (reason === undefined) {
             continue;
@@ -7976,7 +8004,7 @@ export function dropStaleQueue(
 
         const thread = state?.threads[parsed.id];
 
-        return thread !== undefined && odradeReason(thread) === parsed.reason;
+        return thread !== undefined && odradeReason(thread, state?.threads) === parsed.reason;
     });
 }
 
@@ -12429,7 +12457,11 @@ export function issueLine(
 }
 
 /** A thread's state in 1 or 2 words, for the queue. */
-export function threadWord(thread: Thread, now: number): string {
+export function threadWord(
+    thread: Thread,
+    now: number,
+    threads?: Readonly<Record<string, Thread>>,
+): string {
     if (thread.state === "closed") {
         return "closed";
     }
@@ -12451,7 +12483,7 @@ export function threadWord(thread: Thread, now: number): string {
         return "watching";
     }
 
-    const next = nextActor(thread);
+    const next = nextActor(thread, threads);
 
     return next === "agent"
         ? "working"
@@ -12531,7 +12563,7 @@ export function issuesText(
             const threads = item.threads
                 .map((id) => threadById(state, id))
                 .filter((thread): thread is Thread => thread !== undefined)
-                .map((thread) => `${thread.id} ${threadWord(thread, now)}`);
+                .map((thread) => `${thread.id} ${threadWord(thread, now, state?.threads)}`);
             const owner =
                 item.agent === undefined
                     ? "no owner"
@@ -12614,7 +12646,10 @@ export function issuesView(state: Readonly<DeskState> | undefined, now: number):
             threads: item.threads
                 .map((id) => threadById(state, id))
                 .filter((thread): thread is Thread => thread !== undefined)
-                .map((thread) => ({ id: thread.id, word: threadWord(thread, now) })),
+                .map((thread) => ({
+                    id: thread.id,
+                    word: threadWord(thread, now, state?.threads),
+                })),
             fixedBy: [...item.fixedBy],
             parts: item.partial?.length ?? 0,
             unverified: item.unverified === true,
@@ -13130,7 +13165,7 @@ export function addAsk(
         delete thread.closed;
         delete thread.run.quietReopen;
         delete thread.run.quietWake;
-        thread.run.next = nextActor(thread);
+        thread.run.next = nextActor(thread, state.threads);
     }
 
     const fromText = request.from === undefined ? "" : ` from ${request.from}`;
@@ -13261,7 +13296,7 @@ export function withdrawAsk(
 
     found.ask.resolved = { at: request.at, why, by: request.by };
     // Brian is next no more when this was his last open ask: the page shows it at once, not at the next sweep.
-    found.thread.run.next = nextActor(found.thread);
+    found.thread.run.next = nextActor(found.thread, state.threads);
     addEvent(
         found.thread,
         `withdrawn:${found.ask.id}:${String(request.at)}`,
@@ -14035,7 +14070,11 @@ function longestRun(text: string): number {
 const byId = (a: Thread, b: Thread) => idNumber(a.id) - idNumber(b.id) || a.id.localeCompare(b.id);
 
 /** The export's section for a thread: the page's groups, with closed threads last. */
-function sectionOf(thread: Thread, now: number): string {
+function sectionOf(
+    thread: Thread,
+    now: number,
+    threads?: Readonly<Record<string, Thread>>,
+): string {
     if (thread.state === "closed") {
         return "Closed in the last 7 days";
     }
@@ -14056,7 +14095,7 @@ function sectionOf(thread: Thread, now: number): string {
         return "Found";
     }
 
-    if (nextActor(thread) === "brian") {
+    if (nextActor(thread, threads) === "brian") {
         return "Needs Brian";
     }
 
@@ -14064,7 +14103,7 @@ function sectionOf(thread: Thread, now: number): string {
         return "Stale";
     }
 
-    if (nextActor(thread) === "reviewer") {
+    if (nextActor(thread, threads) === "reviewer") {
         return "Waiting on review";
     }
 
@@ -14077,6 +14116,7 @@ function threadFile(
     reports: readonly StoredReport[] | undefined,
     now: number,
     defangSummary: (text: string) => string = (text) => text,
+    threads?: Readonly<Record<string, Thread>>,
 ): string {
     const folder = folderOf(thread);
     const lines: string[] = [`# ${thread.id} · ${md(thread.title)}`, ""];
@@ -14118,6 +14158,17 @@ function threadFile(
                 `- ${label} · ${pr.state ?? "no state"}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`} · ${pr.next ?? prNext(pr)} · ${pr.via}${pr.title === undefined ? "" : ` · ${md(pr.title)}`}`,
             );
         }
+    }
+
+    const reviews = reviewViews(thread, threads);
+
+    if (reviews.length > 0) {
+        lines.push(
+            "",
+            "## Reviews",
+            "",
+            ...reviews.map((review) => `- ${md(reviewWords(review))}`),
+        );
     }
 
     lines.push("", "## Asks", "");
@@ -14300,7 +14351,9 @@ export function boardRowViews(
             ...(row.error === undefined ? {} : { error: row.error }),
             attempts: row.attempts,
             ...(row.held === undefined ? {} : { held: row.held }),
-            ...(thread === undefined ? {} : { next: nextActor(thread), threadState: thread.state }),
+            ...(thread === undefined
+                ? {}
+                : { next: nextActor(thread, state?.threads), threadState: thread.state }),
             ...(thread?.run.shift === "ended" ? { shiftEnded: true as const } : {}),
         };
     });
@@ -14338,7 +14391,7 @@ export function boardFile(state: Readonly<DeskState> | undefined): string {
                         utc,
                         thread === undefined
                             ? undefined
-                            : { id: thread.id, next: nextActor(thread) },
+                            : { id: thread.id, next: nextActor(thread, state?.threads) },
                     ),
                 )}`,
             );
@@ -14374,7 +14427,7 @@ export function exportFiles(
     const groups = new Map<string, Thread[]>(order.map((title) => [title, []]));
 
     for (const thread of threads) {
-        groups.get(sectionOf(thread, now))?.push(thread);
+        groups.get(sectionOf(thread, now, state?.threads))?.push(thread);
     }
 
     const lines = [
@@ -14396,7 +14449,7 @@ export function exportFiles(
 
         for (const thread of list) {
             lines.push(
-                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread)}${title === "Watching" && thread.watch !== undefined ? ` · watch: ${watchWhen(thread.watch)}${md(watchOnWords(thread.watch))}` : ""}`,
+                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread, state?.threads)}${title === "Watching" && thread.watch !== undefined ? ` · watch: ${watchWhen(thread.watch)}${md(watchOnWords(thread.watch))}` : ""}`,
             );
 
             for (const [ref, pr] of Object.entries(thread.prs).sort(([a], [b]) =>
@@ -14429,6 +14482,8 @@ export function exportFiles(
             thread,
             thread.session === undefined ? undefined : reports[thread.session],
             now,
+            undefined,
+            state?.threads,
         );
     }
 
@@ -14891,7 +14946,7 @@ export function threadsView(
         }
 
         counts.open += 1;
-        counts[nextActor(thread)] += 1;
+        counts[nextActor(thread, threads)] += 1;
 
         if (asleep(thread, now)) {
             counts.watching += 1;
@@ -15222,7 +15277,8 @@ export function reviewViews(
     const newest = new Map<string, ReviewView>();
 
     for (const view of views) {
-        if (view.stale) {
+        // Staleness invalidates Ready only. Negative evidence stays actionable until a newer eligible verdict wins.
+        if (view.stale && view.outcome === "ready") {
             continue;
         }
 
@@ -15242,9 +15298,13 @@ export function reviewViews(
     return views;
 }
 
-/** Structured words only: a Ready digest must not carry prose that asks the Clerk to escalate it. */
+/** Verdict fields only: reviewer labels are quoted data, never report prose or markup. */
 export function reviewWords(review: ReviewView): string {
-    return `${review.kind}: ${review.outcome} · ${review.reviewer} · ${iso(review.at)}${review.ref === undefined ? " · no PR" : ` · ${review.ref}@${review.head ?? "unknown"}`}${review.stale ? " · stale (PR head differs or is unknown)" : review.current ? " · current" : " · superseded"}`;
+    const reviewer = JSON.stringify(review.reviewer)
+        .replaceAll("<", "\\u003c")
+        .replaceAll(">", "\\u003e");
+
+    return `${review.kind}: ${review.outcome} · reviewer ${reviewer} · ${iso(review.at)}${review.ref === undefined ? " · no PR" : ` · ${review.ref}@${review.head ?? "unknown"}`}${review.stale ? " · stale (PR head differs or is unknown)" : ""} · ${review.current ? "current" : review.stale && review.outcome === "ready" ? "not current" : "superseded"}`;
 }
 
 export function reviewLine(thread: Thread, review: ReviewView): string {
@@ -25905,7 +25965,7 @@ export default function createDesk(host: Host, web: Web) {
 
             // The page and the list show Brian as next at once, not at the next sweep.
             if (filedAsks.length > 0) {
-                thread.run.next = nextActor(thread);
+                thread.run.next = nextActor(thread, state.threads);
             }
 
             // The PRs the agent reported go on its thread in the report's commit: a PR the desk may not attach, and a
@@ -28486,8 +28546,9 @@ export default function createDesk(host: Host, web: Web) {
     const busyNow = async (
         threads: Thread[],
         supervisor: ConversationId,
+        allThreads?: Readonly<Record<string, Thread>>,
     ): Promise<ReadonlySet<string> | undefined> => {
-        if (!waitsNeedLive(threads)) {
+        if (!waitsNeedLive(threads, allThreads)) {
             return undefined;
         }
 
@@ -29667,7 +29728,7 @@ export default function createDesk(host: Host, web: Web) {
             delete thread.run.quietReopen;
             delete thread.run.quietWake;
 
-            thread.run.next = nextActor(thread);
+            thread.run.next = nextActor(thread, state.threads);
 
             if (addEvent(thread, `reopened:${String(now)}`, `reopened: ${reason}`, now)) {
                 events += 1;
@@ -29683,7 +29744,7 @@ export default function createDesk(host: Host, web: Web) {
         if (facts.github !== undefined) {
             for (const thread of mine) {
                 // Also a closed task thread of a plan: a PR that conflicts or fails needs its repair.
-                if (repairReopen(thread, facts.github, now)) {
+                if (repairReopen(thread, facts.github, now, state.threads)) {
                     events += 1;
                 }
             }
@@ -29739,7 +29800,7 @@ export default function createDesk(host: Host, web: Web) {
                 events += 1;
             }
 
-            thread.run.next = nextActor(thread);
+            thread.run.next = nextActor(thread, state.threads);
 
             const elsewhere = new Set(
                 open
@@ -30078,7 +30139,7 @@ export default function createDesk(host: Host, web: Web) {
             const mine = Object.values(state.threads).filter(
                 (thread) => thread.supervisor === supervisor,
             );
-            const news = queueNews(mine, box, now);
+            const news = queueNews(mine, box, now, state.threads);
 
             // The reasons a digest carried go in before the items: a box's contents persist in 1 set.
             setDigestBox(state, supervisor, box);
@@ -34216,7 +34277,8 @@ export default function createDesk(host: Host, web: Web) {
                 );
                 // A silent session whose agent works now reports soon: it is not in the queue.
                 const waits = waitsText(candidates, {
-                    busy: await busyNow(candidates, api.conversationId),
+                    busy: await busyNow(candidates, api.conversationId, state?.threads),
+                    threads: state?.threads,
                 });
 
                 if (waits === "") {
@@ -34889,7 +34951,9 @@ export default function createDesk(host: Host, web: Web) {
             return boardRules.rowLine(
                 row,
                 boardLabel,
-                thread === undefined ? undefined : { id: thread.id, next: nextActor(thread) },
+                thread === undefined
+                    ? undefined
+                    : { id: thread.id, next: nextActor(thread, state?.threads) },
             );
         });
 
@@ -34997,7 +35061,7 @@ export default function createDesk(host: Host, web: Web) {
                         boardLabel,
                         thread === undefined
                             ? undefined
-                            : { id: thread.id, next: nextActor(thread) },
+                            : { id: thread.id, next: nextActor(thread, state.threads) },
                     );
                 }),
             ].join("\n");
@@ -36025,6 +36089,7 @@ export default function createDesk(host: Host, web: Web) {
                                           args.report === undefined
                                               ? undefined
                                               : (value) => host.text.defang(value),
+                                          state?.threads,
                                       ),
                             ].join("\n"),
                         );
@@ -38125,7 +38190,7 @@ export default function createDesk(host: Host, web: Web) {
                 };
 
                 for (const thread of open) {
-                    counts[nextActor(thread)] += 1;
+                    counts[nextActor(thread, threads)] += 1;
                 }
 
                 const byActor = (["brian", "agent", "odrade", "reviewer", "none"] as const)
@@ -38152,7 +38217,8 @@ export default function createDesk(host: Host, web: Web) {
                     .map((pr) => pr.ref);
                 // The section and the queue say the same thing: a silent session that works now is left out of both.
                 const waits = waitsText(open, {
-                    busy: await busyNow(open, input.conversationId),
+                    busy: await busyNow(open, input.conversationId, threads),
+                    threads,
                 });
                 const { cap, digest } = await deskConfig();
                 const capped = capView(state, cap, now);
@@ -38202,7 +38268,7 @@ export default function createDesk(host: Host, web: Web) {
                         (thread) =>
                             thread.origin === "found" &&
                             thread.key.startsWith("found:pr:") &&
-                            odradeReason(thread) !== undefined,
+                            odradeReason(thread, threads) !== undefined,
                     )
                         ? [
                               "A found PR that Brian opened himself is his own: mark it with desk own <id>. A PR you take off with desk detach stays off.",
