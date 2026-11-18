@@ -13938,6 +13938,7 @@ function threadFile(
     thread: Thread,
     reports: readonly StoredReport[] | undefined,
     now: number,
+    defangSummary: (text: string) => string = (text) => text,
 ): string {
     const folder = folderOf(thread);
     const lines: string[] = [`# ${thread.id} · ${md(thread.title)}`, ""];
@@ -14009,7 +14010,10 @@ function threadFile(
         }
     }
 
-    lines.push("", "## Reports", "");
+    const summary = defangSummary(lines.join("\n"));
+
+    lines.length = 0;
+    lines.push(summary, "", "## Reports", "");
 
     if (reports === undefined || reports.length === 0) {
         lines.push("None.");
@@ -14958,14 +14962,14 @@ export function readText(
                       : [`Issues: ${(thread.issues ?? []).join(", ")}`]),
                   `Started: ${iso(thread.startedAt)} · last event: ${iso(thread.lastEventAt)}`,
                   ...(thread.keptAt === undefined ? [] : [`Kept: ${iso(thread.keptAt)}`]),
-                  ...(thread.watch === undefined ? [] : [`Watch: ${watchText(thread.watch)}`]),
-                  ...(thread.closed === undefined
-                      ? []
-                      : [
-                            `Closed: ${iso(thread.closed.at)} · ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by}`,
-                        ]),
-                  ...(handledLine === undefined ? [] : [handledLine]),
               ]),
+        ...(thread.watch === undefined ? [] : [`Watch: ${watchText(thread.watch)}`]),
+        ...(thread.closed === undefined
+            ? []
+            : [
+                  `Closed: ${iso(thread.closed.at)} · ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by}`,
+              ]),
+        ...(handledLine === undefined ? [] : [handledLine]),
         prs.length === 0
             ? "PRs: none"
             : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
@@ -35162,6 +35166,12 @@ export default function createDesk(host: Host, web: Web) {
                         "read: true for a short summary with asks, PRs, last events, report prefixes and stored report ids; omitted or false keeps the full read",
                 }),
             ),
+            report: Type.Optional(
+                Type.String({
+                    description:
+                        "read: one report by its exact stored key; keeps the caller's normal thread header (brief if requested), but returns only that report in full; an empty or unknown key is refused",
+                }),
+            ),
             ref: Type.Optional(
                 Type.String({
                     description:
@@ -35551,6 +35561,30 @@ export default function createDesk(host: Host, web: Web) {
             if (args.action === "read") {
                 const id = args.thread?.trim();
 
+                const selectReports = (
+                    reports: Readonly<DeskReportsState> | undefined,
+                    thread: string,
+                ) => {
+                    if (args.report === undefined) {
+                        return reports;
+                    }
+
+                    if (args.report.trim() === "") {
+                        throw new Error("read report needs a non-empty stored report key.");
+                    }
+
+                    const report = reports?.reports.find((each) => each.key === args.report);
+
+                    if (report === undefined) {
+                        throw new Error(`There is no report with that key on ${thread}.`);
+                    }
+
+                    return { reports: [report] };
+                };
+
+                // A selected report is always complete, even beside a brief thread summary.
+                const briefReports = args.brief === true && args.report === undefined;
+
                 // An agent reads its own thread in full, and another thread as its synced copy (`threadFile`, the text
                 // the export writes), read only; brief reads summarize either. No look or sweeper. Every write stays on its own
                 // thread (watch, result).
@@ -35582,6 +35616,18 @@ export default function createDesk(host: Host, web: Web) {
                                       thread.session as ConversationId,
                                       context,
                                   );
+                        const selected = selectReports(reports, thread.id);
+                        const safeThread =
+                            args.report === undefined
+                                ? thread
+                                : {
+                                      ...thread,
+                                      events: thread.events.map((event) =>
+                                          event.key === "bound"
+                                              ? { ...event, text: "session bound" }
+                                              : event,
+                                      ),
+                                  };
 
                         return reply(
                             [
@@ -35591,16 +35637,23 @@ export default function createDesk(host: Host, web: Web) {
                                     ? host.text.defang(
                                           readText(state, thread.id, true, true) ?? "",
                                       ) +
-                                      reportsText(reports, (value) => host.text.defang(value), true)
+                                      reportsText(
+                                          selected,
+                                          (value) => host.text.defang(value),
+                                          briefReports,
+                                      )
                                     : threadFile(
-                                          thread,
+                                          safeThread,
                                           // Defanged as the reports of its own thread are: a report's text cannot pose as
                                           // a message to this session.
-                                          reports?.reports.map((report) => ({
+                                          selected?.reports.map((report) => ({
                                               ...report,
                                               text: host.text.defang(report.text),
                                           })),
                                           Date.now(),
+                                          args.report === undefined
+                                              ? undefined
+                                              : (value) => host.text.defang(value),
                                       ),
                             ].join("\n"),
                         );
@@ -35619,9 +35672,9 @@ export default function createDesk(host: Host, web: Web) {
                     return reply(
                         text +
                             reportsText(
-                                reports,
+                                selectReports(reports, thread.id),
                                 (value) => host.text.defang(value),
-                                args.brief === true,
+                                briefReports,
                             ),
                     );
                 }
@@ -35659,9 +35712,9 @@ export default function createDesk(host: Host, web: Web) {
                 return reply(
                     found.text +
                         reportsText(
-                            reports,
+                            selectReports(reports, id.replace(/^#/, "").toUpperCase()),
                             (value) => host.text.defang(value),
-                            args.brief === true,
+                            briefReports,
                         ),
                 );
             }
