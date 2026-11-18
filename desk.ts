@@ -6741,6 +6741,16 @@ export const DIGEST_NOW: readonly DigestKind[] = [
     "plan-revise",
     "escalation-urgent",
 ];
+/** Urgent news never waits for the interval, even when `digest.now` omits its kind. */
+const DIGEST_URGENT: readonly DigestKind[] = [
+    "shift-blocked",
+    "answer-action",
+    "repair",
+    "issue-urgent",
+    "report-blocked",
+    "escalation-urgent",
+];
+
 /** The kinds the Clerk gets, by default: the routine news. The issue kinds go to the supervisor: she plans the shifts. */
 export const DIGEST_CLERK: readonly DigestKind[] = [
     "report",
@@ -6948,6 +6958,22 @@ function setDigestBox(state: DeskState, supervisor: number, box: DigestBox): voi
     state.digests = { ...(state.digests ?? {}), [String(supervisor)]: box };
 }
 
+/** Urgent kinds and urgent queue reasons bypass batching without changing the stored item's kind or key. */
+function urgentDigest(item: DigestItem): boolean {
+    if (DIGEST_URGENT.includes(item.kind)) {
+        return true;
+    }
+
+    const reason = queueKeyOf(item)?.reason;
+
+    return (
+        reason !== undefined &&
+        (reason.startsWith("run failed: ") ||
+            reason === "report says blocked" ||
+            reason === "report asks Brian")
+    );
+}
+
 /**
  * Add 1 item to a supervisor's box, and give the time of the digest task to create: none when an item with that key is
  * there already, or a scheduled time at or before the item's wanted time covers it. Above `DIGEST_MAX_ITEMS`, the
@@ -6985,11 +7011,9 @@ export function enqueueDigest(
         });
     }
 
-    // The Clerk asked for an urgent escalation to go at once: it does, also when the setting's `now` leaves it out.
+    // The interval applies only to routine news. Urgent news also takes the items already waiting.
     const wanted =
-        config.now.includes(item.kind) || item.kind === "escalation-urgent"
-            ? now
-            : now + config.minutes * 60_000;
+        config.now.includes(item.kind) || urgentDigest(item) ? now : now + config.minutes * 60_000;
     // A task at or before the wanted time takes this item too: no second task.
     const covered = box.scheduled.some((at) => at <= wanted);
 
@@ -7735,8 +7759,9 @@ export function escalationDropOf(
 }
 
 /**
- * The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor, and so does an
- * escalation, also when the setting's `clerk` names its kind. With no Clerk, every item is the supervisor's. The issue kinds are in no default list of the Clerk: only the supervisor plans shifts.
+ * Routing is independent of urgency: the Clerk takes the kinds in `clerk` unless `now` names them. Escalations
+ * always stay with the supervisor. With no Clerk, every item is the supervisor's. The issue kinds are in no default
+ * list of the Clerk: only the supervisor plans shifts.
  */
 export function splitDigest(
     items: readonly DigestItem[],
@@ -31254,7 +31279,7 @@ export default function createDesk(host: Host, web: Web) {
                     const config = await deskConfig();
                     const { digest, journal } = config;
                     const clerk = clerkOf(state, supervisor);
-                    // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
+                    // Route by `clerk` and `now`, independently of mandatory urgency; escalations stay with the supervisor.
                     const split = splitDigest(items, clerk !== undefined, digest);
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);
