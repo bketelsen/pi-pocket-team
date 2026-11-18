@@ -3,5 +3,5 @@
   "scope": "docs/beacon.md",
   "correction": "A policy experiment must compare equivalent post-settings control and treatment sessions; a comparison across a concurrent compaction-settings boundary cannot yield a keep decision.",
   "evidence": "bketelsen/pi-pocket-team#265: cross-review (github-copilot/claude-sonnet-5.5) of 41078a420f65d96d3302cbfb752b43eb20925aa7, finding 1 (high, blocking)",
-  "promoted_to": "docs/beacon.md"
+  "promoted_to": "AGENTS.md"
 }

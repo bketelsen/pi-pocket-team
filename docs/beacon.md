@@ -48,20 +48,27 @@ boundary) to installation, before the policy loads. The control and treatment th
 
 Count only new linked tasks started under this policy; leave existing tasks on their original threads. For this
 experiment, an ordinary implementation task is a desk thread whose recorded model-router `route.kind` is exactly
-`implement`; exclude plan, review, debug, research, write, operate and other kinds. Match control and treatment by
-agent, repository and session model. Keep only matched cells with at least 5 completed control tasks and 5 completed
-post-policy tasks; a cell with no match is reported and excluded. Report every cell and its sample, and pool all
-included cells for the decision. Do not hand-select task kinds after the result is known.
+`implement`; exclude plan, review, debug, research, write, operate and other kinds. A completed task has
+`thread.state == "closed"`, `thread.closed.why == "done"`, and `thread.closed.outcome` of `completed` or `verified`.
+Count and report tasks with no recorded `route.kind`; exclude them. If all qualifying tasks lack a kind, the review
+can only extend. Match control and treatment by agent, repository and session model. Keep only matched cells with at
+least 5 completed control tasks and 5 completed post-policy tasks; a cell with no match is reported and excluded.
+Report every cell and its sample, and pool all included cells for the decision. Do not hand-select task kinds after
+the result is known.
 
 **Metrics and quality guard.** Read median request context and cache-read cost per call from the session records
 for those comparable tasks, including their worker subagents consistently before and after. Report cache-read cost
-per call as total cache-read cost divided by calls; do not substitute total session cost. Review Q1 review rounds
-per PR for the affected agents and work repositories against both frozen cohorts above: the all-PR baseline is
-median 2 / P90 3, and the recent subset baseline is median 1 / P90 3. Compare P90 on the matching cohort.
+per call as total cache-read cost divided by calls; do not substitute total session cost. Recompute Q1 review rounds
+from the frozen 30-day and recent records for exactly the affected agents, repositories and worker-model strata.
+The all-team frozen rows (median 2 / P90 3 and median 1 / P90 3) are descriptive only, not the comparison population.
+Report a control-window review-round row beside each post-policy worker-model row when a control PR has a finished
+review; do not use it as the keep control unless its cells meet the quality sample rule below.
 The existing audit reads review rounds in `metrics.Q1.prRounds`; session records supply the cost signals. This
 prompt-only change adds no collection, stored kind or field; linked-session outcomes and desk reports already exist.
-Attribute a post-policy PR through its `thread.prs` link only after its newest cross-review has finished; open PRs
-with no finished review stay pending and are excluded from the 2026-11-25 quality numerator. Report pending PRs.
+Attribute a post-policy PR through its `thread.prs` link. Its newest cross-review is finished when the matching
+latest review call has a parsed `reviewAnswers.ready` value (true or false); report and exclude a PR with no parsed
+answer or a missing link. Open PRs with no finished review stay pending and are excluded from the 2026-11-25 quality
+numerator. Report pending PRs.
 
 **Confounders.** Split or disclose agent, repository, task kind and size, model/provider, worker and reviewer model,
 thinking level, time of day, cache pricing/hits, task completion bias and concurrent policy changes. At
@@ -73,22 +80,24 @@ to that settings change. A result that lacks this control extends, never keeps.
 
 The `openai/gpt-6.1-sol` worker trial ends on 2026-11-23 and uses Q1 cross-review rounds. Split its PRs from the
 other worker models in the quality report and compare each with the same worker-model stratum in the frozen
-baseline; never pool those results into a single unmatched Q1 claim. The Murbella diagnostic used
-`anthropic/claude-opus-5-5`; the Teg diagnostic used `openai/gpt-6-astra`, so neither diagnostic is the MAI model
-that prompted this policy or evidence of the setting's effect. This extension cannot set per-role compaction
+baseline; never pool those results into a single unmatched Q1 claim. The Murbella diagnostic used `anthropic/claude-opus-5-5`, a model on the reserve list, so its old run is not a
+post-settings control. The Teg diagnostic used `openai/gpt-6-astra`, which is not on that list; neither diagnostic is
+alone evidence of this policy's effect. This extension cannot set per-role compaction
 through Pocket's public extension API. This experiment changes neither configuration nor core compaction.
 
 **Minimum sample and decision.** Review on **2026-11-25** with at least **20 completed post-policy implementation
 tasks** and **8 finished reviewed PRs**, all in matched agent/repository/model cells that meet the 5-and-5 cell
-minimum. The control must begin after the settings boundary and have the same saved settings. Recompute the frozen Q1
+minimum. A worker-model quality stratum needs at least **3 finished reviewed PRs** in each of its treatment and
+frozen-baseline cohorts to enter the quality decision; report smaller strata, exclude them from keep/undo, and
+extend if the remaining strata do not reach the 8-PR minimum. The control must begin after the settings boundary and have the same saved settings. Recompute the frozen Q1
 baseline for exactly the affected agents, repositories and worker-model strata; do not compare them with all-team
 populations. Apply the same no-rise rule to both the 30-day and recent-subset baselines: a median rise greater than
 0 rounds or a nearest-rank P90 rise of 1 or more fails the quality guard. The recent subset is still reported as the
 primary quality sensitivity check because it controls for older work less well matched to the post-policy tasks.
 
 Keep only if the pooled treatment median request context across the included matched `implement` tasks is at least
-**20% lower** than the weighted control median, and every reported matched cell has the same 20% direction with no
-failure in the quality guard. For this calculation, each treatment and control call keeps its recorded context.
+**20% lower** than the weighted control median, and every included matched cell is at least **20% lower**, with no
+failure in the quality guard. Excluded cells do not enter this condition and must be listed with the exclusion reason. For this calculation, each treatment and control call keeps its recorded context.
 The control call weight in a cell is `treatment calls in that cell / control calls in that cell`; the weighted median
 is the context where the normalized cumulative call weight crosses 0.5, with linearly averaged middle contexts when
 needed. This gives each control cell the treatment cell's share of calls. Report cache-read cost per call beside the
