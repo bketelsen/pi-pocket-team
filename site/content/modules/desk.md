@@ -2,7 +2,7 @@
 
 One thread for each piece of work the team runs in the background: T13, T14, … A thread holds the work, its agents, its repository, its PRs, its asks, its dated check, its events and its reports. `team_delegate` opens the thread before the linked session starts, and the desk closes it when every part is closed.
 
-Files: `desk.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `team_message`; the page is "Desk" on the rail, with a badge.
+Files: `desk.ts`, `_tool-time.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `team_message`; the page is "Desk" on the rail, with a badge.
 
 ## The page
 
@@ -21,7 +21,7 @@ Native clients receive the bound session id in the owner-only thread views, when
 
 ## The tools
 
-A session with a supervisor identity uses `desk`; another session is refused.
+A session with a supervisor identity uses `desk`; another session is refused. `desk` and `plan` results begin their first text item with the server's current local date, 24-hour time and zone, including refusals and blocked calls. The clock comes first so Pocket's default output truncation keeps it. If the clock or zone is unavailable, that line says so and keeps the original text after it. Pocket can skip the result hook after repeated restart cutoffs; those terminal results may have no clock line. A digest already carries its time in its header, so it gets no second clock line.
 
 - `list` and `read`: one line for each open thread, or one thread in full with its agents, repository, sessions, PRs, the wake-ups not sent yet, asks, the last 10 events and the reports.
 - `sync`: sweep the threads now.

@@ -444,6 +444,7 @@ describe("run-end answers with the desk", { skip: SKIP }, () => {
         mkdirSync(dropIns, { recursive: true });
 
         for (const file of [
+            "_tool-time.ts",
             "team.ts",
             "desk.ts",
             "night-shift.ts",

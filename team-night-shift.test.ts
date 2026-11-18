@@ -864,6 +864,7 @@ before(async () => {
     const dropIns = join(dataDir, "extensions");
 
     mkdirSync(dropIns, { recursive: true });
+    cpSync(join(import.meta.dirname, "_tool-time.ts"), join(dropIns, "_tool-time.ts"));
     cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
     cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
     cpSync(join(import.meta.dirname, "night-shift.ts"), join(dropIns, "night-shift.ts"));

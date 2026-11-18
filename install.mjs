@@ -17,6 +17,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MODULES = [
+    "_tool-time.ts",
     "team.ts",
     "team-web",
     "homewiki.ts",

@@ -181,6 +181,12 @@ Pi Pocket sets the child's actual working directory before the first request: pr
 
 **Run-end answers before a desk-tracked start.** Since Pi Pocket 0.28.0, a linked session's run end goes to the session that started it, and starts a run there. Reports come by `team_message` to the desk, so before each desk-tracked start Team calls the desk's optional `reportsOff` for the supervisor, outside any commit: a delegated task, a shift, the Clerk, a plan start (from `team_delegate` and from the Desk page's New plan), and a plan consult. The desk turns the supervisor's run-end answers off once (Pocket's `linkedSessions.reports`, Pi Pocket 0.29.0 and later, and the fork's tags from 0.28.0-bk.1), and records it; see [Desk](desk.md#what-these-parts-do). A failure is 1 warning notice in the supervisor's session, and the start goes on. An older desk has no `reportsOff`: Team skips the call. `team_work` and the Team panel's **Start linked task** do not call it, so their lead keeps its answers, unless that lead is a desk supervisor: the switch is on the lead, so it holds for every session the lead started.
 
+## Tool clock
+
+Results of Team's own tools (`team_delegate`, `team_work`, `team_message`, `team_memory` and `team_sessions`) begin their first text item with the server's current local date, 24-hour time and zone. Team reads the clock and default zone for each result, including a refusal, blocked call or another tool error. The clock comes before the original text so Pocket's default head-retain output limits keep it. If the clock or zone cannot be read, that line says that the current time is unavailable; the original result otherwise stays intact.
+
+The clock uses Pocket's `afterTool` hook, including interruptions when the hook runs. Pocket can skip all such hooks after repeated restart cutoffs, so those terminal results may have no clock line. This does not stamp unrelated tools or desk digest messages.
+
 ## Prototype boundaries
 
 - Direct identity selection keeps the existing model, folder, and history. Use a fresh session for a fresh task; select the model in Pi Pocket's native picker.
@@ -218,7 +224,7 @@ The rail has a second Team button, with the supervisor's name ("Odrade") and a c
 
 ## Team files
 
-Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity` (`persona`, and `cleared` for an explicit none); UI routes are in the owner-only `/api/x/team/` namespace. The MCP guard also reads 2 of Pi Pocket's own documents, never writing them: `pocket.sessions` (each session's `linkedFrom` and folder) and `pocket.subagents` (each subagent's conversation).
+Runtime copies: `~/.pi-pocket/extensions/team.ts`, `_tool-time.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity` (`persona`, and `cleared` for an explicit none); UI routes are in the owner-only `/api/x/team/` namespace. The MCP guard also reads 2 of Pi Pocket's own documents, never writing them: `pocket.sessions` (each session's `linkedFrom` and folder) and `pocket.subagents` (each subagent's conversation).
 
 Runtime imports use Pi Pocket's public extension API and installed Pi packages. Test and preview scripts (`team.test.ts`, `team-memory.test.ts`, `preview.ts`) use the checkout's internal test harness, isolated temporary data, and a fake model. They are not installed.
 

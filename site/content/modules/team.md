@@ -2,7 +2,7 @@
 
 Team gives Pi Pocket named people. An identity is a Markdown profile: a name, a model, the repositories that person owns, and a home folder. In a session that carries the identity, Pi becomes that person. A supervisor delegates self-contained tasks into the agents' repositories, and each agent keeps its own lessons across every repository it tends.
 
-Files: `team.ts` and `team-web/`. The module also adds 2 prompt sections, the `team_delegate`, `team_work` and `team_memory` tools, and the "Your team" rail page.
+Files: `team.ts`, `_tool-time.ts` and `team-web/`. The module also adds 2 prompt sections, the `team_delegate`, `team_work`, `team_message`, `team_memory` and `team_sessions` tools, and the "Your team" rail page.
 
 ## Turn it on, and use it
 
@@ -63,6 +63,10 @@ Pi Pocket's memory has 2 scopes: a project, and everywhere. Team adds a third la
 - **Pi proposes, the owner approves.** The `team_memory` tool acts on the session's identity. A proposed change leaves the lesson in force until it is approved, and an approval holds only if the text is still what the owner saw.
 - **Review on the page.** In the Team panel each agent lists its lessons, waiting ones first, with Approve, Discard, Edit and Forget. A lesson the owner adds there counts at once.
 - **Rules.** A lesson is one line, at most 300 characters. An agent keeps at most 40 approved lessons, and one writer may have at most 20 waiting for each agent. A tool call that runs again after a restart finds the lesson it saved, so it never adds one twice.
+
+## Tool clock
+
+Team tool results begin their first text item with the server's current local date, 24-hour time and zone, including refusals and blocked calls. The clock comes first so Pocket's default output truncation keeps it. If the clock or zone is unavailable, that line says so and keeps the original text after it. Pocket can skip the result hook after repeated restart cutoffs; those terminal results may have no clock line. Unrelated tools and desk digest messages get no extra stamp.
 
 ## Limits and rules
 

@@ -26,6 +26,12 @@ import {
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
+import type * as ToolTimeModule from "./_tool-time.ts";
+
+/** Load the shared formatter with this module's reload key, as Desk does for its helpers. */
+const toolTime = (await import(
+    new URL(`./_tool-time.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof ToolTimeModule;
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
 export async function linkedSend(
@@ -5321,10 +5327,15 @@ export default function createTeam(host: Host, web: Web) {
         },
     });
 
+    const toolClock = hook(ToolTask, {
+        afterTool: (call, result) =>
+            toolTime.isClockTool("team", call.name) ? toolTime.withToolTime(result) : undefined,
+    });
+
     return defineExtension({
         name: "named-team",
         tools: [delegateTool, work, message, list, teamMemory],
-        hooks: [homeGuard, mcpGuard, privateGuard],
+        hooks: [homeGuard, mcpGuard, privateGuard, toolClock],
         sections: [
             section("named_team", async (input, context) => {
                 const identity = await resolveIdentity(
