@@ -1501,6 +1501,15 @@ export const MAX_PENDING = 20;
  */
 export type TeamApi = {
     version: 1;
+    /** Start and register the current Clerk profile under Desk's replay-stable daily key. */
+    rotateClerk?: (request: {
+        supervisor: number;
+        read: Pick<DocumentReader, "snapshot">;
+        commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+        context: Context;
+        key: string;
+        at: number;
+    }) => Promise<{ session: number; address: string }>;
     persona: (
         read: DocumentReader,
         conversationId: ConversationId,
@@ -2277,8 +2286,8 @@ export default function createTeam(host: Host, web: Web) {
     };
 
     /**
-     * Start the supervisor's Clerk: 1 long-lived linked session, registered on the desk in the same commit as its
-     * identity, under the start's replay key. It opens no desk thread, so it does not count toward the cap. 1 Clerk for
+     * Start the supervisor's Clerk: 1 daily linked session, registered on the desk in the same commit as its identity,
+     * under the start's replay key. It opens no desk thread, so it does not count toward the cap. 1 active Clerk for
      * each supervisor: a second start while the first one's session is there is refused with its address.
      */
     const startClerk = async (
@@ -2287,7 +2296,8 @@ export default function createTeam(host: Host, web: Web) {
         title: string,
         cwd: string | undefined,
         deps: Pick<DelegateDeps, "source" | "key" | "read" | "commit" | "context">,
-    ): Promise<DelegateResult> => {
+        rotation?: { at: number },
+    ): Promise<DelegateResult & { session: number; address: string }> => {
         const model = clerkModel(persona);
         const desk = deskApi();
         const supervisor = Number(deps.source);
@@ -2300,7 +2310,7 @@ export default function createTeam(host: Host, web: Web) {
         // A replay of the start that made this Clerk: its session is the same one, and nothing changes.
         const replay = here !== undefined && here.key !== undefined && here.key === key;
 
-        if (here !== undefined && desk !== undefined && !replay) {
+        if (here !== undefined && desk !== undefined && !replay && rotation === undefined) {
             const sessions = await host.linkedSessions.list(deps.source);
             const live = sessions.find((session) => session.address === here.address);
 
@@ -2336,11 +2346,28 @@ export default function createTeam(host: Host, web: Web) {
                     session: Number(started.session),
                     address: started.address,
                     agent: persona.id,
-                    at: Date.now(),
+                    at: rotation?.at ?? Date.now(),
                     key,
+                    ...(cwd === undefined ? {} : { cwd }),
                 });
             }
         });
+
+        // Keep the old context available for replay and in-flight calls, but remove its daily session from the live list.
+        if (
+            rotation !== undefined &&
+            here !== undefined &&
+            here.address !== started.address &&
+            typeof host.linkedSessions.archive === "function"
+        ) {
+            await host.linkedSessions
+                .archive(
+                    deps.source,
+                    { to: here.address },
+                    `${key}:archive:${String(here.session)}`,
+                )
+                .catch(() => undefined);
+        }
 
         // The desk page loads again: the Clerk is registered now.
         desk?.changed?.();
@@ -2747,13 +2774,24 @@ export default function createTeam(host: Host, web: Web) {
                 at: number;
                 /** The start's replay key. */
                 key?: string;
+                cwd?: string;
             },
         ) => Promise<void>;
         /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
         clerkOf: (
             tx: Tx,
             supervisor: number,
-        ) => Promise<{ address: string; key?: string } | undefined>;
+        ) => Promise<
+            | {
+                  session: number;
+                  address: string;
+                  agent: string;
+                  key?: string;
+                  cwd?: string;
+                  history?: { session: number; address: string; key?: string }[];
+              }
+            | undefined
+        >;
         /**
          * Tell the desk page that the desk changed. Call it after the commit that used `open`, `bind`, `fail`, `route`,
          * `file` or `clerk` returned, never inside it. An older desk has none: skip the call.
@@ -3112,6 +3150,55 @@ export default function createTeam(host: Host, web: Web) {
             };
         },
     };
+
+    published.rotateClerk = async (request) => {
+        const desk = deskApi();
+        const here = await request.commit((tx) => desk?.clerkOf(tx, request.supervisor));
+
+        if (desk === undefined || here === undefined) {
+            throw new Error("No Clerk is registered for this supervisor.");
+        }
+
+        // This survives the host's finite start-receipt retention, and never reactivates an older day's Clerk.
+        const replay = [here, ...(here.history ?? [])].find((each) => each.key === request.key);
+
+        if (replay !== undefined) {
+            if (
+                replay.session === here.session &&
+                typeof host.linkedSessions.archive === "function"
+            ) {
+                for (const previous of here.history ?? []) {
+                    await host.linkedSessions
+                        .archive(
+                            request.supervisor as ConversationId,
+                            { to: previous.address },
+                            `${request.key}:archive:${String(previous.session)}`,
+                        )
+                        .catch(() => undefined);
+                }
+            }
+
+            return { session: replay.session, address: replay.address };
+        }
+
+        const persona = (await roster(directory)).find((each) => each.id === here.agent);
+
+        if (persona?.role !== "clerk") {
+            throw new Error("The registered Clerk has no current Clerk profile.");
+        }
+
+        const started = await startClerk(
+            persona,
+            "Run the desk. Routine desk news arrives in digest messages.",
+            "Daily desk",
+            persona.workspace ?? persona.home ?? here.cwd,
+            { ...request, source: request.supervisor as ConversationId },
+            { at: request.at },
+        );
+
+        return { session: started.session, address: started.address };
+    };
+
     const sharedTeam = globalThis as unknown as Record<symbol, TeamApi | undefined>;
 
     // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
