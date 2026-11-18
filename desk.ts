@@ -6968,8 +6968,7 @@ function urgentDigest(item: DigestItem): boolean {
 
     return (
         reason !== undefined &&
-        (reason.startsWith("watch is due: ") ||
-            reason.startsWith("run failed: ") ||
+        (reason.startsWith("run failed: ") ||
             reason === "report says blocked" ||
             reason === "report asks Brian")
     );
@@ -7760,8 +7759,9 @@ export function escalationDropOf(
 }
 
 /**
- * The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor, and so does an
- * escalation, also when the setting's `clerk` names its kind. With no Clerk, every item is the supervisor's. The issue kinds are in no default list of the Clerk: only the supervisor plans shifts.
+ * Routing is independent of urgency: the Clerk takes the kinds in `clerk` unless `now` names them. Escalations
+ * always stay with the supervisor. With no Clerk, every item is the supervisor's. The issue kinds are in no default
+ * list of the Clerk: only the supervisor plans shifts.
  */
 export function splitDigest(
     items: readonly DigestItem[],
@@ -7774,7 +7774,6 @@ export function splitDigest(
               (item) =>
                   config.clerk.includes(item.kind) &&
                   !config.now.includes(item.kind) &&
-                  !urgentDigest(item) &&
                   !ESCALATION_KINDS.includes(item.kind),
           )
         : [];
@@ -31280,7 +31279,7 @@ export default function createDesk(host: Host, web: Web) {
                     const config = await deskConfig();
                     const { digest, journal } = config;
                     const clerk = clerkOf(state, supervisor);
-                    // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
+                    // Route by `clerk` and `now`, independently of mandatory urgency; escalations stay with the supervisor.
                     const split = splitDigest(items, clerk !== undefined, digest);
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);

@@ -13113,7 +13113,6 @@ describe("the digest's rules", () => {
             made("red-check", "repair"),
             made("conflict", "repair"),
             made("answer", "answer-action"),
-            made("queue:T1:watch is due: check release", "queue"),
             made("queue:T1:run failed: provider error", "queue"),
             made("queue:T1:report says blocked", "queue"),
             made("queue:T1:report asks Brian", "queue"),
@@ -13131,11 +13130,6 @@ describe("the digest's rules", () => {
             assert.equal(enqueueDigest(state, 5, made("routine", "report"), now, settings), due);
             assert.equal(enqueueDigest(state, 5, item, now + 1, settings), now + 1, item.key);
             assert.deepEqual(
-                splitDigest([item], true, settings),
-                { ours: [item], theirs: [] },
-                item.key,
-            );
-            assert.deepEqual(
                 takeDigest(state, 5, now + 1).items.map((each) => each.key),
                 ["routine", item.key],
             );
@@ -13145,6 +13139,60 @@ describe("the digest's rules", () => {
                 "the old empty window carries no second digest",
             );
             assert.deepEqual(state.digests?.["5"]?.scheduled, []);
+        }
+    });
+
+    test("digest timing and Clerk routing are independent: due watches batch; urgent queue news does not", () => {
+        const now = 1_000_000;
+        const settings = digestConfig({ minutes: 30 });
+        const interval = settings.minutes * 60_000;
+
+        for (const [reason, delay] of [
+            ["watch is due: check release", interval],
+            ["run failed: provider error", 0],
+            ["report says blocked", 0],
+            ["report asks Brian", 0],
+        ] as const) {
+            const state = empty();
+            const item = made(`queue:T1:${reason}`, "queue");
+            const due = now + delay;
+
+            assert.equal(enqueueDigest(state, 5, item, now, settings), due, reason);
+            const taken = takeDigest(state, 5, due).items;
+
+            assert.deepEqual(taken, [item], "the kind and key stay unchanged");
+            assert.deepEqual(
+                splitDigest(taken, true, settings),
+                { ours: [], theirs: [item] },
+                reason,
+            );
+            assert.deepEqual(splitDigest(taken, false, settings), { ours: [item], theirs: [] });
+            assert.deepEqual(
+                splitDigest(taken, true, digestConfig({ now: ["queue"] })),
+                { ours: [item], theirs: [] },
+                "digest.now still overrides digest.clerk",
+            );
+            assert.deepEqual(
+                splitDigest(taken, true, digestConfig({ clerk: [] })),
+                { ours: [item], theirs: [] },
+                "a kind absent from digest.clerk goes to the supervisor",
+            );
+        }
+
+        // Mandatory urgency controls timing only, not routing, for non-queue kinds too.
+        for (const kind of [
+            "shift-blocked",
+            "answer-action",
+            "repair",
+            "issue-urgent",
+            "report-blocked",
+        ] as const) {
+            const state = empty();
+            const item = made(kind, kind);
+            const configured = digestConfig({ minutes: 30, now: [], clerk: [kind] });
+
+            assert.equal(enqueueDigest(state, 5, item, now, configured), now);
+            assert.deepEqual(splitDigest([item], true, configured), { ours: [], theirs: [item] });
         }
     });
 
