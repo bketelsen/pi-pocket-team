@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+    applyWatchDecision,
     closeCheck,
     DIGEST_KINDS,
     digestConfig,
@@ -256,6 +257,81 @@ test("cross-thread PR reviews enter the Odrade queue and clear only with a match
             reason,
         ),
     );
+});
+
+test("machine watch integration preserves review blockers and cross-thread Ready resolution", () => {
+    for (const mode of ["negative-pass", "ready-pass", "ready-pending"] as const) {
+        const reviewer = thread();
+
+        reviewer.prs = {};
+        reviewer.run.busy = true;
+        reviewer.watch = {
+            checkOn: "1970-01-01",
+            check: "Check the required checks",
+            setAt: 1,
+            setBy: "test",
+            key: "watch:1",
+            dueAt: 2,
+            on: { kind: "pr", ref, event: "merged" },
+            condition: { kind: "pr", ref, test: "checks-green" },
+        };
+        const owner = thread();
+
+        owner.id = "T2";
+        const s = state(reviewer);
+
+        s.threads[owner.id] = owner;
+        recordReview(reviewer, verdict({ outcome: "not-ready" }));
+
+        if (mode !== "negative-pass") {
+            recordReview(reviewer, verdict({ key: "ready:2", at: 30 }));
+        }
+
+        assert.equal(
+            applyWatchDecision(
+                reviewer,
+                {
+                    key: "watch:1",
+                    decision: {
+                        status: mode === "ready-pending" ? "pending" : "pass",
+                        text: "required checks",
+                        head,
+                    },
+                },
+                40,
+                s,
+            ),
+            true,
+        );
+
+        if (mode === "negative-pass") {
+            assert.equal(
+                reviewer.state,
+                "open",
+                "machine proof cannot close a thread with a review blocker",
+            );
+            assert.equal(reviewer.watch.result, undefined);
+            assert.equal(reviewer.watch.machine?.status, "unknown");
+            assert.match(reviewer.watch.machine?.text ?? "", /Pass refused: a current review/);
+            assert.equal(reviewer.run.next, "odrade");
+        } else if (mode === "ready-pass") {
+            assert.equal(
+                reviewer.state,
+                "closed",
+                "a valid newer Ready permits the machine-proven pass",
+            );
+            assert.equal(reviewer.watch.machine?.status, "pass");
+        } else {
+            assert.equal(reviewer.state, "open");
+            assert.equal(reviewer.watch.retry?.attempts, 1);
+            assert.equal(reviewer.watch.machine, undefined);
+            assert.equal(
+                reviewer.run.next,
+                "agent",
+                "a retry resolves Ready with the full thread map too",
+            );
+        }
+    }
 });
 
 test("exported Reviews retain stale negative state and quote reviewer labels as data", () => {

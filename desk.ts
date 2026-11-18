@@ -316,6 +316,20 @@ export type WatchOn =
     | { kind: "pr"; ref: string; event: "merged" | "reviewed" }
     | { kind: "pr"; ref: string; event: "labelled"; label: string };
 
+/** An explicit machine check. It never comes from the watch's prose or its wake event. */
+export type WatchCondition =
+    | { kind: "pr"; ref: string; test: "merged" | "checks-green" }
+    | { kind: "run"; repo: string; id: number; test: "succeeded" };
+
+export type WatchConditionRead = WatchDecision | { status: "pending"; text: string; head: string };
+
+export type WatchDecision = {
+    status: "pass" | "fail" | "unknown";
+    text: string;
+    /** The full head SHA proved by a required-check read, independent of the display text's length limit. */
+    head?: string;
+};
+
 /** One dated check on a thread. Stored data: never rename a field or change what it means. */
 export type Watch = {
     /** "2026-10-29": a day on the server's clock, in local time. */
@@ -340,6 +354,12 @@ export type Watch = {
      * whichever comes first. Absent: a dated watch only, as before the field.
      */
     on?: WatchOn;
+    /** Explicit parsed condition; absent keeps the original human check. */
+    condition?: WatchCondition;
+    /** The sweep's one assessment of this watch. Unknown and refused passes need a person. */
+    machine?: WatchDecision & { at: number; key: string };
+    /** Nonfinal required-check reads, committed with the sweep. Not a final assessment. */
+    retry?: { attempts: number; at: number };
     /**
      * How the event happened, in words ("PR owner/name#12 merged"), when the event, not the date, made the watch due.
      * Set once, with `dueAt`. Absent when the date made it due, or nothing did yet.
@@ -1921,7 +1941,7 @@ export type OpenRequest = {
      * A dated check, set with the thread: `team_delegate`'s `watch`. `on` is its optional event (`parseWatchOn`): the
      * watch is due at the event or at the date, whichever comes first.
      */
-    watch?: { checkOn: string; check: string; by: string; on?: string };
+    watch?: { checkOn: string; check: string; by: string; on?: string; condition?: string };
     /** The delegation's task text: every queued issue whose ref or URL is in it links to the new thread. */
     task?: string;
     /**
@@ -2074,7 +2094,17 @@ export function openThread(
             throw new Error(on.error);
         }
 
+        const condition =
+            request.watch.condition === undefined
+                ? undefined
+                : parseWatchCondition(request.watch.condition, state, request.id);
+
+        if (condition !== undefined && "error" in condition) {
+            throw new Error(condition.error);
+        }
+
         watch = {
+            ...(condition === undefined ? {} : { condition }),
             checkOn: when.checkOn,
             ...(when.checkTime === undefined ? {} : { checkTime: when.checkTime }),
             check,
@@ -2703,6 +2733,11 @@ function watchText(watch: Watch): string {
             : [
                   `due ${iso(watch.dueAt)}${watch.onFired === undefined ? "" : ` (${watch.onFired})`}`,
               ]),
+        ...(watch.retry !== undefined && watch.machine === undefined && watch.result === undefined
+            ? [
+                  `waiting for required checks (${String(watch.retry.attempts)}/${String(WATCH_CHECK_ATTEMPTS)})`,
+              ]
+            : []),
         ...(watch.result === undefined
             ? []
             : [
@@ -2729,11 +2764,15 @@ export function asleep(thread: Thread, now: number): boolean {
     return watch !== undefined && !watchReached(watch, now);
 }
 
-/** A watched thread at or after its check time or its recorded event, with no result yet: the desk wakes it. */
+/** A watch ready for a human check: reached, unresolved, and not waiting for a bounded required-check retry. */
 export function isDue(thread: Thread, now: number): boolean {
     const watch = openWatch(thread);
 
-    return watch !== undefined && watchReached(watch, now);
+    return (
+        watch !== undefined &&
+        watchReached(watch, now) &&
+        !(watch.retry !== undefined && watch.machine === undefined)
+    );
 }
 
 /** What the sweep knows when it looks for a watch's event: every thread on the desk, and the GitHub read. */
@@ -2764,15 +2803,16 @@ function watchRefOk(ref: string): boolean {
     return match !== null && isRepoName(match[1] ?? "") && Number(match[2]) <= GITHUB_INT_MAX;
 }
 
-/** A `pr:` watch that still waits for its event: no result, not due, on a thread that is not closed. */
+/** A live PR event that has not fired, or a PR condition that has no assessment yet (also when due). */
 function pendingPrWatch(thread: Thread): boolean {
     const watch = thread.watch;
 
     return (
         thread.state !== "closed" &&
-        watch?.on?.kind === "pr" &&
+        watch !== undefined &&
         watch.result === undefined &&
-        watch.dueAt === undefined
+        ((watch.on?.kind === "pr" && watch.dueAt === undefined) ||
+            (watch.condition?.kind === "pr" && watch.machine === undefined))
     );
 }
 
@@ -2795,30 +2835,31 @@ function prWatchRefusal(
 
 /**
  * The PRs that the open `pr:` watches wait for, for the sweep to pin: a watch on a thread that is not closed (a parked
- * thread keeps its watch, and is pinned too) with no result and no wake, and a ref that may go into a query (a bad stored ref is skipped). The oldest `setAt` first, at
+ * thread keeps its watch, and is pinned too), with no result and an event or assessment still pending. A ref must be valid
+ * for a query (a bad stored ref is skipped). The oldest `setAt` first, at
  * most `MAX_PR_WATCHES` refs. A watch that is not pinned gets no event from this read: its date stays the fallback.
  */
 export function prWatchPins(threads: Iterable<Thread>): string[] {
     const waiting = [...threads]
-        .filter(
-            (thread) =>
-                pendingPrWatch(thread) &&
-                thread.watch?.on?.kind === "pr" &&
-                watchRefOk(thread.watch.on.ref),
-        )
+        .filter(pendingPrWatch)
         .sort((a, b) => (a.watch?.setAt ?? 0) - (b.watch?.setAt ?? 0) || a.id.localeCompare(b.id));
     const refs: string[] = [];
 
     for (const thread of waiting) {
-        const on = thread.watch?.on;
-        const ref = on?.kind === "pr" ? on.ref : "";
+        const watch = thread.watch;
+        const candidates = [
+            watch?.on?.kind === "pr" ? watch.on.ref : "",
+            watch?.condition?.kind === "pr" ? watch.condition.ref : "",
+        ];
 
-        if (refs.length >= MAX_PR_WATCHES) {
-            break;
-        }
-
-        if (!refs.some((each) => each.toLowerCase() === ref.toLowerCase())) {
-            refs.push(ref);
+        for (const ref of candidates) {
+            if (
+                refs.length < MAX_PR_WATCHES &&
+                watchRefOk(ref) &&
+                !refs.some((each) => each.toLowerCase() === ref.toLowerCase())
+            ) {
+                refs.push(ref);
+            }
         }
     }
 
@@ -2899,6 +2940,462 @@ export function parseWatchOn(
     return { kind: "pr", ref, event: "labelled", label };
 }
 
+/** Parse only the explicit machine grammar. No prose and no implicit condition from `on`. */
+export function parseWatchCondition(
+    text: string,
+    state?: Readonly<DeskState>,
+    self?: string,
+): WatchCondition | { error: string } {
+    const pr = /^pr:(\S+) (merged|checks-green)$/.exec(text.trim());
+
+    if (pr !== null && watchRefOk(pr[1] ?? "")) {
+        const refusal = prWatchRefusal(state, self);
+
+        return refusal === undefined
+            ? { kind: "pr", ref: pr[1]!, test: pr[2] as "merged" | "checks-green" }
+            : { error: refusal };
+    }
+
+    const run = /^run:(\S+)#([1-9][0-9]*) succeeded$/.exec(text.trim());
+
+    if (run !== null && isRepoName(run[1] ?? "") && Number.isSafeInteger(Number(run[2]))) {
+        return { kind: "run", repo: run[1]!, id: Number(run[2]), test: "succeeded" };
+    }
+
+    return {
+        error: "A watch condition is exactly pr:owner/name#12 merged, pr:owner/name#12 checks-green, or run:owner/name#123 succeeded.",
+    };
+}
+
+export function watchConditionText(condition: WatchCondition): string {
+    return condition.kind === "pr"
+        ? `pr:${condition.ref} ${condition.test}`
+        : `run:${condition.repo}#${String(condition.id)} succeeded`;
+}
+
+/** The page size of the branch rules read: a result of this many rows may be cut, so it is unknown. */
+const WATCH_RULES_PAGE = 100;
+
+/** The largest number of distinct sweep reads that defer a watch for running required checks. */
+export const WATCH_CHECK_ATTEMPTS = 3;
+const watchResultLine = (text: string): string => flatLine(text).slice(0, MAX_LINE);
+const watchUnknown = (text: string): WatchDecision => ({
+    status: "unknown",
+    text: watchResultLine(text),
+});
+const watchObject = (value: unknown): Record<string, unknown> => (isObject(value) ? value : {});
+
+/** Only GitHub's specific absence of classic protection is safe to replace with an empty requirement list. */
+function classicChecksAbsent(error: unknown): boolean {
+    const failure = watchObject(error);
+    let body = failure;
+
+    if (typeof failure.stdout === "string") {
+        try {
+            body = watchObject(JSON.parse(failure.stdout));
+        } catch {
+            return false;
+        }
+    }
+
+    const stderrStatus =
+        typeof failure.stderr === "string"
+            ? /\(HTTP (\d{3})\)/.exec(failure.stderr)?.[1]
+            : undefined;
+    const statuses = [body.status, failure.status, stderrStatus].filter(
+        (value) => value !== undefined,
+    );
+
+    return (
+        body.message === "Branch not protected" &&
+        statuses.length > 0 &&
+        statuses.every((value) => value === 404 || value === "404")
+    );
+}
+
+/**
+ * Read a due condition, with no model. Required-check proof needs both the classic protection and effective branch
+ * rules, complete check/status lists, and the same PR head before and after. An unread source never means green.
+ * `api` is a read-only GitHub REST call; tests inject it. Only 404 Branch not protected means no classic requirements.
+ * A pending read is not a final assessment: the sweep retries it with a durable, bounded counter.
+ */
+export async function readWatchCondition(
+    condition: WatchCondition,
+    github: GitHubFacts | undefined,
+    api: (path: string) => Promise<unknown>,
+): Promise<WatchConditionRead> {
+    const label = watchConditionText(condition);
+
+    try {
+        if (condition.kind === "run") {
+            if (
+                !isRepoName(condition.repo) ||
+                !Number.isSafeInteger(condition.id) ||
+                condition.id < 1 ||
+                condition.test !== "succeeded"
+            ) {
+                return watchUnknown("Invalid stored run condition");
+            }
+
+            const run = watchObject(
+                await api(`repos/${condition.repo}/actions/runs/${String(condition.id)}`),
+            );
+            const repo = watchObject(run.repository).full_name;
+
+            if (
+                run.id !== condition.id ||
+                typeof repo !== "string" ||
+                repo.toLowerCase() !== condition.repo.toLowerCase()
+            ) {
+                return watchUnknown(`${label}: run identity is unknown`);
+            }
+
+            if (run.status === "completed" && run.conclusion === "success") {
+                return { status: "pass", text: `${label}: proved` };
+            }
+
+            if (
+                run.status === "completed" &&
+                [
+                    "failure",
+                    "cancelled",
+                    "timed_out",
+                    "action_required",
+                    "neutral",
+                    "skipped",
+                    "stale",
+                    "startup_failure",
+                ].includes(String(run.conclusion))
+            ) {
+                return {
+                    status: "fail",
+                    text: watchResultLine(`${label}: ${String(run.conclusion)}`),
+                };
+            }
+
+            return watchUnknown(`${label}: run state is not final or is unknown`);
+        }
+
+        if (!watchRefOk(condition.ref) || !["merged", "checks-green"].includes(condition.test)) {
+            return watchUnknown("Invalid stored PR condition");
+        }
+
+        if (github === undefined || (github.incomplete?.length ?? 0) > 0) {
+            return watchUnknown(`${label}: GitHub read is incomplete`);
+        }
+
+        // Only a pin proves the condition; an open-list row is not a replacement for a failed pin.
+        const pr = Object.values(github.prs).find(
+            (each) => each.ref.toLowerCase() === condition.ref.toLowerCase(),
+        );
+
+        if (pr === undefined) {
+            return watchUnknown(`${label}: PR pin is unread`);
+        }
+
+        if (condition.test === "merged") {
+            return ["OPEN", "CLOSED", "MERGED"].includes(pr.state)
+                ? { status: pr.state === "MERGED" ? "pass" : "fail", text: `${label}: ${pr.state}` }
+                : watchUnknown(`${label}: PR state is unknown`);
+        }
+
+        const { repo, number } = splitRef(condition.ref);
+        const path = `repos/${repo}`;
+        const pullPath = `${path}/pulls/${String(number)}`;
+        const before = watchObject(await api(pullPath));
+        const head = watchObject(before.head).sha;
+        const base = watchObject(before.base).ref;
+
+        if (
+            typeof head !== "string" ||
+            !/^[0-9a-f]{40}$/.test(head) ||
+            head !== pr.head ||
+            typeof base !== "string" ||
+            base === ""
+        ) {
+            return watchUnknown(`${label}: PR head mismatch or missing head/base`);
+        }
+
+        let protection: Record<string, unknown>;
+
+        try {
+            protection = watchObject(
+                await api(
+                    `${path}/branches/${encodeURIComponent(base)}/protection/required_status_checks`,
+                ),
+            );
+        } catch (error) {
+            if (!classicChecksAbsent(error)) {
+                throw error;
+            }
+
+            protection = { contexts: [], checks: [] };
+        }
+
+        const rules = await api(
+            `${path}/rules/branches/${encodeURIComponent(base)}?per_page=${String(WATCH_RULES_PAGE)}`,
+        );
+
+        if (
+            !Array.isArray(protection.contexts) ||
+            !Array.isArray(protection.checks) ||
+            !Array.isArray(rules)
+        ) {
+            return watchUnknown(`${label}: required checks are not known`);
+        }
+
+        // One page only: a full page may hide a required check on the next page, so it never proves green.
+        if (rules.length >= WATCH_RULES_PAGE) {
+            return watchUnknown(`${label}: branch rules may be cut at ${String(WATCH_RULES_PAGE)}`);
+        }
+
+        const required: { name: string; app: number | null }[] = [];
+
+        const add = (name: unknown, app: unknown): boolean => {
+            if (
+                typeof name !== "string" ||
+                name === "" ||
+                (app !== null &&
+                    app !== undefined &&
+                    (!Number.isSafeInteger(app) || Number(app) < 1))
+            ) {
+                return false;
+            }
+
+            if (!required.some((each) => each.name === name && each.app === (app ?? null))) {
+                required.push({ name, app: typeof app === "number" ? app : null });
+            }
+
+            return true;
+        };
+
+        for (const check of protection.checks) {
+            const row = watchObject(check);
+
+            if (!add(row.context, row.app_id)) {
+                return watchUnknown(`${label}: invalid required check`);
+            }
+        }
+
+        for (const name of protection.contexts) {
+            if (typeof name !== "string") {
+                return watchUnknown(`${label}: invalid required context`);
+            }
+
+            if (!required.some((each) => each.name === name) && !add(name, null)) {
+                return watchUnknown(`${label}: invalid required context`);
+            }
+        }
+
+        for (const rule of rules) {
+            const row = watchObject(rule);
+
+            if (typeof row.type !== "string") {
+                return watchUnknown(`${label}: invalid branch rule`);
+            }
+
+            if (row.type !== "required_status_checks") {
+                continue;
+            }
+
+            const checks = watchObject(row.parameters).required_status_checks;
+
+            if (!Array.isArray(checks)) {
+                return watchUnknown(`${label}: unread required branch rule`);
+            }
+
+            for (const check of checks) {
+                const item = watchObject(check);
+
+                if (!add(item.context, item.integration_id)) {
+                    return watchUnknown(`${label}: invalid required branch check`);
+                }
+            }
+        }
+
+        if (required.length === 0) {
+            return watchUnknown(`${label}: no known required checks`);
+        }
+
+        const runs = watchObject(
+            await api(`${path}/commits/${head}/check-runs?per_page=100&filter=latest`),
+        );
+        const statuses = watchObject(await api(`${path}/commits/${head}/status?per_page=100`));
+
+        if (
+            !Array.isArray(runs.check_runs) ||
+            runs.total_count !== runs.check_runs.length ||
+            !Array.isArray(statuses.statuses) ||
+            statuses.total_count !== statuses.statuses.length ||
+            statuses.sha !== head
+        ) {
+            return watchUnknown(`${label}: check read is incomplete or head mismatched`);
+        }
+
+        let failed = false;
+        let pending = false;
+
+        for (const check of required) {
+            const candidates = [
+                ...runs.check_runs.map((item) => ({ kind: "run", row: watchObject(item) })),
+                ...statuses.statuses.map((item) => ({ kind: "status", row: watchObject(item) })),
+            ].filter(
+                ({ kind, row }) =>
+                    (kind === "run" ? row.name : row.context) === check.name &&
+                    (check.app === null ||
+                        (kind === "run" && watchObject(row.app).id === check.app)),
+            );
+
+            if (candidates.length !== 1) {
+                return watchUnknown(`${label}: missing or ambiguous required check ${check.name}`);
+            }
+
+            const { kind, row } = candidates[0]!;
+
+            if (kind === "run" && row.head_sha !== head) {
+                return watchUnknown(`${label}: check head mismatch`);
+            }
+
+            const state =
+                kind === "run"
+                    ? row.status === "completed"
+                        ? row.conclusion
+                        : row.status
+                    : row.state;
+
+            if (state === "success") {
+                continue;
+            }
+
+            if (["pending", "queued", "in_progress", "waiting"].includes(String(state))) {
+                pending = true;
+                continue;
+            }
+
+            if (
+                ![
+                    "failure",
+                    "error",
+                    "cancelled",
+                    "timed_out",
+                    "action_required",
+                    "neutral",
+                    "skipped",
+                    "stale",
+                    "startup_failure",
+                ].includes(String(state))
+            ) {
+                return watchUnknown(`${label}: unknown required check state`);
+            }
+
+            failed = true;
+        }
+
+        const after = watchObject(await api(pullPath));
+
+        if (watchObject(after.head).sha !== head || watchObject(after.base).ref !== base) {
+            return watchUnknown(`${label}: PR head/base changed during the read`);
+        }
+
+        if (pending) {
+            return {
+                status: "pending",
+                head,
+                text: watchResultLine(`${label}: required checks are still running`),
+            };
+        }
+
+        return {
+            status: failed ? "fail" : "pass",
+            head,
+            text: watchResultLine(`${label} at ${head}: ${failed ? "not green" : "proved"}`),
+        };
+    } catch {
+        // No GitHub body or credential-bearing exception text enters the thread.
+        return watchUnknown(`${label}: GitHub condition read failed`);
+    }
+}
+
+/** Apply only the assessment for this watch, once, in the sweep's commit. Keep all result safeguards. */
+export function applyWatchDecision(
+    thread: Thread,
+    read: { key: string; decision: WatchConditionRead } | undefined,
+    now: number,
+    state: Readonly<DeskState>,
+): boolean {
+    const watch = openWatch(thread);
+
+    if (
+        watch?.condition === undefined ||
+        watch.machine !== undefined ||
+        read?.key !== watch.key ||
+        !watchReached(watch, now) ||
+        (watch.retry !== undefined && watch.retry.at >= now)
+    ) {
+        return false;
+    }
+
+    const key = `watch:machine:${watch.key}`;
+    let decision: WatchDecision;
+
+    if (read.decision.status === "pending") {
+        const attempts = (watch.retry?.attempts ?? 0) + 1;
+
+        watch.retry = { attempts, at: now };
+
+        if (attempts < WATCH_CHECK_ATTEMPTS) {
+            addEvent(
+                thread,
+                `watch:retry:${watch.key}:${String(attempts)}`,
+                `watch waits for required checks (${String(attempts)}/${String(WATCH_CHECK_ATTEMPTS)})`,
+                now,
+            );
+            thread.run.next = nextActor(thread, state.threads);
+
+            return true;
+        }
+
+        decision = watchUnknown(
+            `Required checks are still running after ${String(attempts)} sweep reads`,
+        );
+    } else {
+        decision = read.decision;
+    }
+
+    // A proved watch condition does not resolve a review blocker on the work itself.
+    if (decision.status === "pass" && reviewBlocks(thread, state.threads)) {
+        decision = watchUnknown("Pass refused: a current review is not-ready or unclear");
+    }
+
+    if (decision.status !== "unknown") {
+        const result = recordResult(
+            thread,
+            {
+                pass: decision.status === "pass",
+                text: watchResultLine(decision.text),
+                by: "desk",
+                key,
+                at: now,
+                closedBy: "desk",
+                ...(numberOr(thread.run.lastUserEntry) === undefined
+                    ? {}
+                    : { userEntry: numberOr(thread.run.lastUserEntry)! }),
+            },
+            state,
+        );
+
+        if ("error" in result) {
+            decision = watchUnknown(`Pass refused: ${result.error}`);
+        }
+    }
+
+    watch.machine = { ...decision, text: watchResultLine(decision.text), at: now, key };
+    addEvent(thread, key, `watch machine ${decision.status}: ${watch.machine.text}`, now);
+    thread.run.next = nextActor(thread, state.threads);
+
+    return true;
+}
+
 /** A watch's event as text: `closed:T14`, `pr:owner/name#12 merged`, or `pr:owner/name#12 labelled:ready`. */
 export function watchOnText(on: WatchOn): string {
     if (on.kind === "closed") {
@@ -2911,8 +3408,11 @@ export function watchOnText(on: WatchOn): string {
 }
 
 /** " or on <event>" after a watch's date, or "" for a watch with no event. */
-function watchOnWords(watch: Pick<Watch, "on">): string {
-    return watch.on === undefined ? "" : ` or on ${watchOnText(watch.on)}`;
+function watchOnWords(watch: Pick<Watch, "on" | "condition">): string {
+    return (
+        (watch.on === undefined ? "" : ` or on ${watchOnText(watch.on)}`) +
+        (watch.condition === undefined ? "" : `; condition ${watchConditionText(watch.condition)}`)
+    );
 }
 
 /** A PR's facts in the GitHub read: the pinned read first, then its repository's open list. The ref's case is free. */
@@ -3034,6 +3534,8 @@ export type WatchRequest = {
     at: number;
     /** The watch's event text (`parseWatchOn`), or absent for a dated watch only. */
     on?: string;
+    /** Explicit machine condition (`parseWatchCondition`); never inferred from `check` or `on`. */
+    condition?: string;
 };
 
 /** The keys of every watch set on a thread (`run.watchKeys`): none for a thread from before the field. */
@@ -3134,6 +3636,15 @@ export function setWatch(
         return on;
     }
 
+    const condition =
+        request.condition === undefined
+            ? undefined
+            : parseWatchCondition(request.condition, state, thread.id);
+
+    if (condition !== undefined && "error" in condition) {
+        return condition;
+    }
+
     // Every check passed: a closed done thread opens again, as the sweep's reopen and the attach reopen do.
     if (closed) {
         thread.state = "open";
@@ -3152,6 +3663,7 @@ export function setWatch(
     // `run.watchKeys` for good, so a replay of it changes nothing, also after the events moved on.
     thread.run.watchKeys = [...watchKeysOf(thread), request.key];
     thread.watch = {
+        ...(condition === undefined ? {} : { condition }),
         checkOn: when.checkOn,
         ...(when.checkTime === undefined ? {} : { checkTime: when.checkTime }),
         check,
@@ -3250,6 +3762,13 @@ export function recordResult(
                 page ? "the pass" : "desk result",
                 page ? "page" : "tool",
             ),
+        };
+    }
+
+    // A pass must not end a plan task while one of its PRs remains open or unread.
+    if (request.pass && thread.planTask !== undefined && Object.values(thread.prs).some(prOpen)) {
+        return {
+            error: `${thread.id} delivers a plan task with an open or unread PR: a watch pass cannot close it.`,
         };
     }
 
@@ -6574,12 +7093,22 @@ export function nextActor(thread: Thread, threads?: Readonly<Record<string, Thre
     if (thread.watch !== undefined) {
         const watch = thread.watch;
 
+        if (
+            watch.result === undefined &&
+            watch.retry !== undefined &&
+            watch.machine === undefined
+        ) {
+            return "agent";
+        }
+
         if (watch.result === undefined && watch.dueAt !== undefined) {
             return "odrade";
         }
 
         if (watch.result !== undefined && !watch.result.pass) {
-            return "agent";
+            return watch.machine?.status === "fail" && watch.machine.key === watch.result.key
+                ? "odrade"
+                : "agent";
         }
     }
 
@@ -6697,6 +7226,13 @@ export function odradeReason(
     }
 
     const watch = thread.watch;
+
+    if (
+        watch?.machine !== undefined &&
+        (watch.result === undefined || watch.result.key === watch.machine.key)
+    ) {
+        return `watch ${watch.machine.status === "fail" ? "failed" : "unclear"}: ${watch.machine.text}`;
+    }
 
     if (watch !== undefined && watch.result === undefined && watch.dueAt !== undefined) {
         return `watch is due: ${watch.check}`;
@@ -14699,6 +15235,10 @@ export type ThreadView = {
         check: string;
         setBy: string;
         due: boolean;
+        /** The explicit machine condition, as normalized text. Absent: a human check. */
+        condition?: string;
+        /** The sweep's one assessment, when it reached this machine watch. */
+        machine?: WatchDecision & { at: number; key: string };
         result?: { pass: boolean; text: string; by: string; at: number };
         /** Its event as text (`watchOnText`): "pr:owner/name#12 merged". Absent: a dated watch only. */
         on?: string;
@@ -14817,6 +15357,12 @@ export function threadView(
                       check: thread.watch.check,
                       setBy: thread.watch.setBy,
                       due: isDue(thread, now),
+                      ...(thread.watch.condition === undefined
+                          ? {}
+                          : { condition: watchConditionText(thread.watch.condition) }),
+                      ...(thread.watch.machine === undefined
+                          ? {}
+                          : { machine: { ...thread.watch.machine } }),
                       ...(thread.watch.on === undefined
                           ? {}
                           : { on: watchOnText(thread.watch.on) }),
@@ -26311,6 +26857,7 @@ export default function createDesk(host: Host, web: Web) {
         /** By folder: its linked worktrees, or null when git cannot list them. */
         worktrees?: Record<string, WorktreeFact[] | null>;
         github?: GitHubFacts;
+        watchDecisions?: Record<string, { key: string; decision: WatchConditionRead }>;
         /** Why the GitHub read failed, in one line; absent when it worked. */
         githubError?: string;
         /** Roster repository names that are not "owner/name": skipped, never queried. */
@@ -28883,6 +29430,42 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        const watchDecisions: NonNullable<SweepFacts["watchDecisions"]> = {};
+        const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
+
+        const watchApi = async (path: string): Promise<unknown> => {
+            const { stdout } = await run(gh, ["api", "--method", "GET", path], {
+                timeout: 30_000,
+                maxBuffer: 2 * 1024 * 1024,
+                encoding: "utf8",
+            });
+
+            return JSON.parse(stdout);
+        };
+
+        for (const thread of open) {
+            const watch = thread.watch;
+
+            if (
+                watch?.condition === undefined ||
+                watch.machine !== undefined ||
+                watch.result !== undefined ||
+                (watch.retry !== undefined && watch.retry.at >= now) ||
+                (!watchReached(watch, now) &&
+                    watchOnFired(watch, {
+                        threads: state?.threads ?? {},
+                        github: githubRead.facts,
+                    }) === undefined)
+            ) {
+                continue;
+            }
+
+            watchDecisions[thread.id] = {
+                key: watch.key,
+                decision: await readWatchCondition(watch.condition, githubRead.facts, watchApi),
+            };
+        }
+
         const { authors, ownAuthors, queue: queueRaw } = await deskConfig();
         // The issue queue: its own read, after the PR read. A failure of one never touches the other.
         const queueSetting = queueConfig(queueRaw, ownersOfRepos(rosterRepos));
@@ -28963,6 +29546,7 @@ export default function createDesk(host: Host, web: Web) {
             ...(githubRead.error === undefined ? {} : { githubError: githubRead.error }),
             ...(skipped.size === 0 ? {} : { githubSkipped: [...skipped].sort() }),
             githubAsked: [...repositories],
+            watchDecisions,
             ...(queue === undefined ? {} : { queue }),
             authors,
             ownAuthors,
@@ -29798,6 +30382,16 @@ export default function createDesk(host: Host, web: Web) {
             // one, may come first: a target thread that closed, or a PR in this sweep's GitHub read.
             if (wakeWatch(thread, now, { threads: state.threads, github: facts.github })) {
                 events += 1;
+            }
+
+            if (applyWatchDecision(thread, facts.watchDecisions?.[thread.id], now, state)) {
+                events += 1;
+
+                if (thread.state === "closed") {
+                    // A machine-proven pass has no Clerk work. Keep the journal, but enqueue no closure news.
+                    await journalClosed(tx, state, thread, now);
+                    continue;
+                }
             }
 
             thread.run.next = nextActor(thread, state.threads);
@@ -35558,7 +36152,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use watch and result on its own thread only, and read on any thread (its own in full, another as its read-only copy). Actions: list (one line per open thread), read (one thread in full by default, or a short summary with brief: true), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask, or while it delivers a plan task with no PR and no plan nochange), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes), usage (anyone with the desk tool: subscription usage (provider percent, reset, burn, projection, grants) and the ledger at list price; read only). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use watch and result on its own thread only, and read on any thread (its own in full, another as its read-only copy). Actions: list (one line per open thread), read (one thread in full by default, or a short summary with brief: true), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps; condition adds an explicit machine check, whose proven pass needs no Clerk turn), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask, while its plan task has an open or unread PR, or while it delivers a plan task with no PR and no plan nochange), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes), usage (anyone with the desk tool: subscription usage (provider percent, reset, burn, projection, grants) and the ledger at list price; read only). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -35662,6 +36256,12 @@ export default function createDesk(host: Host, web: Web) {
                 Type.String({
                     description:
                         "watch: an event that makes the check due before its date: closed:T14, pr:owner/name#12 merged, pr:owner/name#12 reviewed, or pr:owner/name#12 labelled:<label>",
+                }),
+            ),
+            condition: Type.Optional(
+                Type.String({
+                    description:
+                        "watch: machine condition, exactly pr:owner/name#12 merged, pr:owner/name#12 checks-green, or run:owner/name#123 succeeded. The due sweep records pass/fail without a model; incomplete or ambiguous proof needs the Clerk. on only wakes; it is not a condition.",
                 }),
             ),
             pass: Type.Optional(
@@ -36363,6 +36963,9 @@ export default function createDesk(host: Host, web: Web) {
                                 key,
                                 at,
                                 ...(args.on === undefined ? {} : { on: args.on }),
+                                ...(args.condition === undefined
+                                    ? {}
+                                    : { condition: args.condition }),
                             },
                             state,
                         );

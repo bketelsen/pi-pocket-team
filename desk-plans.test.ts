@@ -7561,13 +7561,22 @@ describe("a watch's pass on a task thread with no PR (#178 P4)", () => {
         assert.equal(taskOf(graph, "t1").state, "done");
     });
 
-    test("a thread with a merged PR, or an open PR, keeps the sweep's rules", () => {
+    test("a merged PR permits a pass; an open or unread task PR refuses it", () => {
         for (const prState of ["MERGED", "OPEN", undefined] as const) {
             const { state } = buildingPlan();
             const thread = watched(state, "T2");
 
             prOn(state, "T2", "frostyard/snow#1", prState);
-            assert.deepEqual(pass(state, thread), { changed: true }, String(prState));
+            const result = pass(state, thread);
+
+            if (prState === "MERGED") {
+                assert.deepEqual(result, { changed: true });
+            } else {
+                assert("error" in result);
+                assert.match(result.error, /open or unread PR/);
+                assert.equal(thread.state, "open");
+                assert.equal(thread.watch?.result, undefined);
+            }
         }
     });
 
