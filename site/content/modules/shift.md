@@ -59,7 +59,7 @@ State is one document per conversation, `x.night-shift.goal`. It is stored data.
 
 ## Delegated shifts
 
-A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. Each round also gives the supervisor's address, from the linked session's first message, so Pi can ask a question before then with `team_message`. Its summary also writes 1 line `PRS:` with each PR the shift touched, as `owner/name#N`, or `PRS: none`: the desk puts each PR on the thread. `night_shift` is the old name of `shift`, with the same fields; a call that gives both is refused.
+A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. Each round also gives the supervisor's address, from the linked session's first message, so Pi can ask a question before then with `team_message`. Its summary also writes 1 line `PRS:` with each PR the shift touched, as `owner/name#N`, or `PRS: none`: the desk puts each PR on the thread. The model-facing schema offers `shift` only. Before schema validation, a compatibility guard accepts the old `night_shift` name, with the same fields, when `shift` is absent. A call that gives both is refused before any session or desk work starts.
 
 A shift from the tool takes no free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command itself from `pr`, `repo`, `checks` and `label`. Both modules must be on in **Menu → Extensions**.
 
@@ -77,7 +77,7 @@ A shift from the tool takes no free check command. `pr_check` is the only check 
 The feature was called "night shift". It runs at any hour, so it is now "shift".
 
 - `/night-shift` still works: it does what `/team-shift` does, and each answer starts with "`/night-shift` is now `/team-shift`."
-- `night_shift` in `team_delegate` still works: it takes the same fields as `shift`.
+- `night_shift` in `team_delegate` still works through the compatibility guard when `shift` is absent. It takes the same fields, but the schema advertises only `shift`.
 - The command is `/team-shift`, not `/shift`: Pi Pocket requires a `-` in an extension command name.
 - The file `night-shift.ts`, the folder `night-shift-web/`, the module name in **Menu → Extensions**, and the stored names (`x.night-shift.goal`, `x.night-shift.driver`) keep the old name: they are stored data or live identity.
 

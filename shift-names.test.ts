@@ -124,15 +124,15 @@ const ALLOWED: Allowed[] = [
     },
     {
         file: "team.ts",
-        text: "The old name of shift, with the same fields. Give shift or night_shift, not both.",
+        text: "night_shift",
         count: 1,
-        why: "the description of the alias argument night_shift",
+        why: "the execute-time defense refuses the unadvertised compatibility name if a caller hook is bypassed",
     },
     {
         file: "team.ts",
         text: "Give shift or night_shift, not both.",
-        count: 1,
-        why: "the refusal of a call that gives both arguments",
+        count: 2,
+        why: "the caller guard and execute-time defense refuse a call that gives both arguments",
     },
     // desk.ts
     {

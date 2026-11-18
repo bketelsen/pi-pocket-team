@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
+import * as teamModule from "./team.ts";
 import {
     checkFingerprint,
     checkNote,
@@ -52,6 +53,29 @@ const TASK = "Tend the test repository";
 const SUMMARY = "SUMMARY-TEXT";
 
 // ─── The delegated request ───────────────────────────────────────────────────
+
+test("team_delegate prepares the canonical shift argument before schema validation", () => {
+    const prepareDelegateArguments = (
+        teamModule as typeof teamModule & { prepareDelegateArguments: (args: unknown) => unknown }
+    ).prepareDelegateArguments;
+
+    assert.equal(typeof prepareDelegateArguments, "function");
+    const legacy = { stop_when: "done" };
+    const oldCall = { agent: "duncan", night_shift: legacy };
+    const prepared = prepareDelegateArguments(oldCall) as Record<string, unknown>;
+
+    assert.equal(prepared.shift, legacy);
+    assert.equal(Object.hasOwn(prepared, "night_shift"), false);
+    assert.throws(
+        () => prepareDelegateArguments({ shift: legacy, night_shift: legacy }),
+        /Give shift or night_shift, not both\./,
+    );
+    assert.equal(prepareDelegateArguments(null), null);
+
+    const canonical = { agent: "duncan", shift: legacy };
+
+    assert.equal(prepareDelegateArguments(canonical), canonical);
+});
 
 describe("delegatedRequest", () => {
     // 2026-10-21 23:30 in New York (EDT, UTC-4).
@@ -646,6 +670,8 @@ let shift = 0;
 let waitStart = "";
 /** The description of `team_delegate`, as the model last got it. */
 let delegateDescription: string | undefined;
+/** The advertised parameter schema, not a schema inferred from calls in the transcript. */
+let delegateParameters: object | undefined;
 let app: App;
 
 const answer = (text: string) => fauxAssistantMessage([fauxText(text)]);
@@ -658,6 +684,17 @@ const teamCall = (args: object) =>
  */
 const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
+
+    for (const message of request.messages) {
+        if (message.role === "system") {
+            const tool = message.toolsAdded?.find((tool) => tool.name === "team_delegate");
+
+            if (tool !== undefined) {
+                delegateParameters = tool.parameters;
+            }
+        }
+    }
+
     // The tool declarations travel in the request's messages: the description is 1 JSON string there.
     const declared = /Supervisor only: give a self-contained task(?:[^"\\]|\\.)*/.exec(
         JSON.stringify(request),
@@ -1016,6 +1053,15 @@ describe("delegated goals", () => {
         );
         assert.equal(app.sessions().length, before);
         assert.equal(linkedTo(source).length, 0);
+    });
+
+    test("the team_delegate schema advertises shift only, not its compatibility alias", () => {
+        assert.ok(delegateParameters !== undefined, "the model got team_delegate parameters");
+        const properties = (delegateParameters as { properties: Record<string, unknown> })
+            .properties;
+
+        assert.ok(Object.hasOwn(properties, "shift"));
+        assert.equal(Object.hasOwn(properties, "night_shift"), false);
     });
 
     test("the team_delegate description names the feature shift only", () => {

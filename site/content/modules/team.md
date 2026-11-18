@@ -36,6 +36,8 @@ An agent with several repositories gets its lessons split between them. Reposito
 
 `team_delegate` takes an `agent`, a `task`, an optional `title`, and a `repository` when the agent owns more than one. A single owned repository is selected automatically. The tool's optional `title` names the desk thread and the linked session; without it, the task's first non-empty line is the title.
 
+For a delegated shift, the model-facing schema offers `shift` only. Before schema validation, a compatibility guard accepts the old `night_shift` name, with the same fields, when `shift` is absent. A call that gives both is refused before any session or desk work starts. See [Shift](shift.md#delegated-shifts).
+
 When the folder is the top of a git work tree, each delegation gets its own worktree beside the main checkout, at `<checkout>--<agent>-<slug>` on branch `<agent>/<slug>`, so 2 jobs in 1 repository share no folder and no branch. Remove the worktree when its pull request merges.
 
 A folder that is not there is refused before the session starts, and before any desk thread opens: nothing is cloned and no folder is made. The refusal names the folder and the repository, and gives the `git clone` command, or says that Brian makes the folder or fixes the profile of an agent with no repository.

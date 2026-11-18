@@ -1986,6 +1986,21 @@ const listed = (lesson: Lesson) =>
     `[${lesson.id}] ${flat(lesson.text)}${lesson.pending === true ? " (waiting for the owner's approval)" : lesson.proposal?.forget === true ? " (forgetting it waits for the owner's approval)" : lesson.proposal?.text !== undefined ? " (new text waits for the owner's approval)" : ""}`;
 const WAITS = "it waits for the owner's approval in the Team panel";
 
+/** Hide the legacy shift alias from the model schema, but map callers that still use it before validation. */
+export function prepareDelegateArguments(args: unknown): unknown {
+    if (args === null || typeof args !== "object" || Array.isArray(args)) {
+        return args;
+    }
+
+    const { night_shift, ...canonical } = args as Record<string, unknown>;
+
+    if (canonical.shift !== undefined && night_shift !== undefined) {
+        throw new Error("Give shift or night_shift, not both.");
+    }
+
+    return night_shift === undefined ? args : { ...canonical, shift: night_shift };
+}
+
 /** team_message's limits: its schema and `teamMessageProblems` use the same numbers. */
 export const MESSAGE_LIMITS = {
     message: 6000,
@@ -4469,11 +4484,6 @@ export default function createTeam(host: Host, web: Web) {
                     "A goal for the linked session: it runs as a shift, in rounds, until stop_when holds or a limit ends it.",
                 ),
             ),
-            night_shift: Type.Optional(
-                shiftArgument(
-                    "The old name of shift, with the same fields. Give shift or night_shift, not both.",
-                ),
-            ),
             plan: Type.Optional(
                 Type.Object(
                     {
@@ -4529,17 +4539,18 @@ export default function createTeam(host: Host, web: Web) {
                 }),
             ),
         }),
+        // Keep the old name usable without advertising 2 complete goal branches to the model.
+        prepareArguments: (args) => prepareDelegateArguments(args) as never,
         replay: "safe",
         execute: async (args, api, context) => {
             const { agent, task, repository, plan } = args;
 
-            // `night_shift` is the old name of `shift`. Both at once is refused before anything starts; the rest of the
-            // call reads 1 value.
-            if (args.shift !== undefined && args.night_shift !== undefined) {
+            // The caller hook maps the old name before validation. A direct execute path must not bypass that validation.
+            if (Object.hasOwn(args, "night_shift")) {
                 throw new Error("Give shift or night_shift, not both.");
             }
 
-            const night_shift = args.shift ?? args.night_shift;
+            const night_shift = args.shift;
 
             // The absolute stop belongs to the desk's goal board (`startShift`): a model never sets it.
             if (
