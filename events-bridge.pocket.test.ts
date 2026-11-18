@@ -114,7 +114,12 @@ describe("the events bridge in Pocket", () => {
 
         mkdirSync(dropIns, { recursive: true });
 
-        for (const file of ["team.ts", "events-bridge.ts", "_events-bridge-nats.mjs"]) {
+        for (const file of [
+            "_tool-time.ts",
+            "team.ts",
+            "events-bridge.ts",
+            "_events-bridge-nats.mjs",
+        ]) {
             cpSync(join(import.meta.dirname, file), join(dropIns, file));
         }
 

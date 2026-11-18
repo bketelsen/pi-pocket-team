@@ -290,6 +290,7 @@ describe("GET file in Pocket", () => {
         mkdirSync(dropIns, { recursive: true });
 
         for (const each of [
+            "_tool-time.ts",
             "desk.ts",
             "_desk-usage.ts",
             "_desk-dashboard.ts",

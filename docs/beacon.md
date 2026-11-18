@@ -164,6 +164,16 @@ Gaps:
   experiment (first principle), for 1 task kind first; Brian decides; at the review date the audit compares live
   routes with the shadow baseline, and Brian keeps it, extends it, or turns it back to shadow.
 
+## Message clock trial
+
+[PR #268](https://github.com/bketelsen/pi-pocket-team/pull/268) adds a clock to incoming agent-session messages, not tool results. [Team](modules/team.md#message-clock), [Desk](modules/desk.md#the-module-complete) and [Shift](modules/shift.md#delegated-shifts) use the shared helper; Desk digests keep their existing `Now …` header.
+
+- **Hypothesis:** a local clock in delegation briefs and ordinary linked-session messages reduces turns used only to run `date`, without the repeated context cost of stamping every tool result.
+- **Metric and baseline:** date-only turns per week. The 2026-11-11..18 session-entry review counted 395 date-only turns and about 50M context tokens. That token total is baseline context volume, not a promised saving.
+- **Collection and audit:** Pocket already stores incoming messages, tool calls and model usage in session entries. The stamp is recorded in those incoming messages; no new store or document kind is added. The weekly review reads those entries and counts turns whose only tool work runs `date`, using the same classification as the baseline. There is no automated daily-audit check for this metric yet.
+- **Proposed success threshold:** at most 316 date-only turns in a full 7-day post-install window, a reduction of at least 20% from 395. Minimum sample: 1 complete week after install. Review date: 2026-11-25; extend if a complete post-install week is not available. Keep only if the threshold holds; otherwise undo or extend explicitly, never keep an inconclusive result by default.
+- **Confounders:** message and task volume, repository, task kind, time of night, other prompt changes and concurrent changes to long-wait tools. Compare those before attributing a reduction to this change.
+
 ## How to use this beacon
 
 A PR author:
