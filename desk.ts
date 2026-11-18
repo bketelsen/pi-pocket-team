@@ -7735,13 +7735,78 @@ export function escalationDropOf(
 }
 
 /**
- * The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor, and so does an
- * escalation, also when the setting's `clerk` names its kind. With no Clerk, every item is the supervisor's. The issue kinds are in no default list of the Clerk: only the supervisor plans shifts.
+ * A sweep's routine close needs no Clerk decision. Keep an unclear close: the current thread must prove the same
+ * completed close, with no open ask, failed run, blocked report, or PR whose final state is unknown.
+ * Report items are never suppressed here: a done report can be a shift summary or a review result.
+ */
+function routineDigestClose(item: DigestItem, state: Readonly<DeskState>): boolean {
+    const thread = state.threads[item.thread];
+
+    if (
+        item.kind !== "closed" ||
+        thread === undefined ||
+        thread.state !== "closed" ||
+        thread.closed?.why !== "done" ||
+        thread.closed.by !== "sweep" ||
+        thread.closed.outcome !== "completed" ||
+        thread.closed.at !== item.at ||
+        thread.lastEventAt > item.at ||
+        hasOpenAsk(thread) ||
+        thread.run.busy === true ||
+        shiftWorks(thread.run.shift) ||
+        (numberOr(thread.run.dirty) ?? 0) > 0 ||
+        (numberOr(thread.run.ahead) ?? 0) > 0 ||
+        thread.run.aheadUnknown !== undefined ||
+        (thread.run.worktrees !== undefined &&
+            (!Array.isArray(thread.run.worktrees) || thread.run.worktrees.length > 0)) ||
+        thread.run.failed !== undefined ||
+        thread.run.reportBlocked !== false ||
+        thread.run.reportAsks !== false
+    ) {
+        return false;
+    }
+
+    const repo = thread.repo === undefined ? "" : ` ${thread.repo}`;
+
+    if (
+        item.line !==
+        `[desk] ${thread.id}${repo} · closed: done, nothing remains · desk read ${thread.id}`
+    ) {
+        return false;
+    }
+
+    // A named but unattached PR, or a refused attachment, is not proof that nothing remains.
+    const seen = thread.run.seenPrs;
+
+    if (
+        (seen !== undefined &&
+            (!Array.isArray(seen) ||
+                seen.some((ref) => typeof ref !== "string" || thread.prs[ref] === undefined))) ||
+        thread.events.some((event) =>
+            /^(?:report-pr:|report-pr-refused:|report-prs-missing:)/.test(event.key),
+        )
+    ) {
+        return false;
+    }
+
+    return Object.values(thread.prs).every(
+        (link) =>
+            link.state === "MERGED" &&
+            typeof link.readAt === "number" &&
+            link.readAt >= (numberOr(thread.run.prsReadAt) ?? item.at),
+    );
+}
+
+/**
+ * The Clerk takes the routine kinds, except a proven routine close. A kind that goes at once and an escalation
+ * always stay with the supervisor. With no Clerk, every item is the supervisor's. Without current state, keep all
+ * news. The issue kinds are in no default Clerk list: only the supervisor plans shifts.
  */
 export function splitDigest(
     items: readonly DigestItem[],
     hasClerk: boolean,
     config: DigestConfig,
+    state?: Readonly<DeskState>,
 ): { theirs: DigestItem[]; ours: DigestItem[] } {
     // An escalation is the Clerk's own news for the supervisor: it never goes back to the Clerk.
     const theirs = hasClerk
@@ -7753,7 +7818,13 @@ export function splitDigest(
           )
         : [];
 
-    return { theirs, ours: items.filter((item) => !theirs.includes(item)) };
+    return {
+        theirs:
+            state === undefined
+                ? theirs
+                : theirs.filter((item) => !routineDigestClose(item, state)),
+        ours: items.filter((item) => !theirs.includes(item)),
+    };
 }
 
 /** One message a digest task sends: the supervisor's, or the Clerk's. */
@@ -31255,7 +31326,7 @@ export default function createDesk(host: Host, web: Web) {
                     const { digest, journal } = config;
                     const clerk = clerkOf(state, supervisor);
                     // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
-                    const split = splitDigest(items, clerk !== undefined, digest);
+                    const split = splitDigest(items, clerk !== undefined, digest, state);
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);
                     // The journal's zone, or the server's. The checkpoint keeps the text, so a replay says the same time.
