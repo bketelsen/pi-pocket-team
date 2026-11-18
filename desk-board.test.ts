@@ -1892,6 +1892,7 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
             mkdirSync(dropIns, { recursive: true });
 
             for (const file of [
+                "_tool-time.ts",
                 "desk.ts",
                 "_desk-usage.ts",
                 "_desk-dashboard.ts",

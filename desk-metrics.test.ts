@@ -2311,6 +2311,7 @@ describe("GET dashboard in Pocket", () => {
         mkdirSync(dropIns, { recursive: true });
 
         for (const file of [
+            "_tool-time.ts",
             "desk.ts",
             "_desk-usage.ts",
             "_desk-dashboard.ts",

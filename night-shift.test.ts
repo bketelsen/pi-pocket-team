@@ -111,9 +111,11 @@ describe("Pi Pocket compatibility", () => {
         assert.equal(result, undefined);
         assert.deepEqual(call, {
             source,
-            request: { ...request, steer: false },
+            request: { ...request, message: call?.request.message, steer: false },
             key,
         });
+        assert.match(call?.request.message ?? "", /^Current time: [^\n]+\ncontinue$/);
+        assert.equal(request.message, "continue", "the caller's request is unchanged");
     });
 });
 
@@ -779,6 +781,7 @@ before(async () => {
     const dropIns = join(dataDir, "extensions");
 
     mkdirSync(dropIns, { recursive: true });
+    cpSync(join(import.meta.dirname, "_tool-time.ts"), join(dropIns, "_tool-time.ts"));
     cpSync(join(import.meta.dirname, "night-shift.ts"), join(dropIns, "night-shift.ts"));
     cpSync(join(import.meta.dirname, "night-shift-web"), join(dropIns, "night-shift-web"), {
         recursive: true,

@@ -96,6 +96,21 @@ const script: Parameters<typeof scriptedModel>[0] = (request) => {
     }
 
     for (const text of turnTexts(request as never)) {
+        // Every Team-created first message uses taskText: tasks, shifts, Clerk, plans, consults and home work.
+        if (text.includes("Task from the source session:\n")) {
+            const clocks = text.split("\n").filter((line) => line.startsWith("Current time:"));
+
+            assert.equal(
+                clocks.length,
+                1,
+                "each first linked-session message carries exactly 1 clock",
+            );
+            assert.match(
+                clocks[0] ?? "",
+                /^Current time: \d{4,}-\d{2}-\d{2} \d{2}:\d{2} .+ \(.+\)\.$/,
+            );
+        }
+
         const run = /run-tool (\S+) (\{.*\})\s*$/s.exec(text);
 
         if (run !== null) {
@@ -444,6 +459,7 @@ describe("run-end answers with the desk", { skip: SKIP }, () => {
         mkdirSync(dropIns, { recursive: true });
 
         for (const file of [
+            "_tool-time.ts",
             "team.ts",
             "desk.ts",
             "night-shift.ts",

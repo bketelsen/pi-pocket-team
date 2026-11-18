@@ -21,6 +21,7 @@ const extensions = join(root, "data", "extensions");
 
 mkdirSync(extensions, { recursive: true });
 cpSync(join(import.meta.dirname, "team.ts"), join(extensions, "team.ts"));
+cpSync(join(import.meta.dirname, "_tool-time.ts"), join(extensions, "_tool-time.ts"));
 cpSync(join(import.meta.dirname, "team-web"), join(extensions, "team-web"), { recursive: true });
 const app = await openApp(scriptedModel());
 

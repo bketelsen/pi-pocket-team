@@ -253,6 +253,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
     const dropIns = join(root, "data", "extensions");
 
     mkdirSync(dropIns, { recursive: true });
+    cpSync(join(import.meta.dirname, "_tool-time.ts"), join(dropIns, "_tool-time.ts"));
     cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
     cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
     let requestContext = "";

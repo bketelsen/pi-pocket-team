@@ -26,6 +26,12 @@ import {
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
+import type * as ToolTimeModule from "./_tool-time.ts";
+
+/** Load the shared formatter with this module's reload key, as Desk does for its helpers. */
+const toolTime = (await import(
+    new URL(`./_tool-time.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof ToolTimeModule;
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
 export async function linkedSend(
@@ -34,7 +40,11 @@ export async function linkedSend(
     request: { to: string; message: string },
     key: string,
 ): Promise<void> {
-    const compatible = { ...request, steer: false };
+    const compatible = {
+        ...request,
+        message: toolTime.withMessageTime(request.message),
+        steer: false,
+    };
 
     await host.linkedSessions.send(source, compatible, key);
 }
@@ -2251,7 +2261,9 @@ export default function createTeam(host: Host, web: Web) {
     ) => {
         const where = worktree === undefined ? "" : worktreeText(worktree);
 
-        return `${identityText(persona, false, planning)}\n\n${where === "" ? "" : `${where}\n\n`}Task from the source session:\n${message}`;
+        return toolTime.withMessageTime(
+            `${identityText(persona, false, planning)}\n\n${where === "" ? "" : `${where}\n\n`}Task from the source session:\n${message}`,
+        );
     };
 
     /**

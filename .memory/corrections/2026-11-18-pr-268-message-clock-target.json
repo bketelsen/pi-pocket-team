@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "message-clock-target",
+  "correction": "Put the clock on Team-created first linked-session messages and ordinary Team, Desk and Shift linked sends, not on each tool result. Keep an existing clock line and the timed Desk digest header. Inject the instant and zone in clock tests instead of changing global Date.now or process.env.TZ.",
+  "evidence": "bketelsen/pi-pocket-team#268; owner review of 06be1b2: https://github.com/bketelsen/pi-pocket-team/pull/268#pullrequestreview-5964602763",
+  "promoted_to": "_tool-time.test.ts; team-reports-off.test.ts"
+}

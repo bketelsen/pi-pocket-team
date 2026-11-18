@@ -2,7 +2,7 @@
 
 One thread for each piece of work the team runs in the background: T13, T14, … A thread holds the work, its agents, its repository, its PRs, its asks, its dated check, its events and its reports. `team_delegate` opens the thread before the linked session starts, and the desk closes it when every part is closed.
 
-Files: `desk.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `team_message`; the page is "Desk" on the rail, with a badge.
+Files: `desk.ts`, `_tool-time.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `team_message`; the page is "Desk" on the rail, with a badge.
 
 ## The page
 
@@ -21,7 +21,7 @@ Native clients receive the bound session id in the owner-only thread views, when
 
 ## The tools
 
-A session with a supervisor identity uses `desk`; another session is refused.
+A session with a supervisor identity uses `desk`; another session is refused. Ordinary linked-session messages from Desk carry 1 clock line before their text: the server's current local date, 24-hour time and zone, read fresh for each new message. If the clock or zone is unavailable, the line says so. A message with an existing clock line keeps it, even when forwarded, so wrapping it again adds no second line. `desk` and `plan` results get no stamp. Digest deliveries keep only their existing `Now …` header.
 
 - `list` and `read`: one line for each open thread, or one thread in full with its agents, repository, sessions, PRs, the wake-ups not sent yet, asks, the last 10 events and the reports. With `desk {action: "read", thread: "T13", brief: true}`, `read` gives a short summary: the header (id, state, title, next actor, agents and repository), `Handled`, `Watch` and `Closed` operational lines when present, PRs, asks, the last 10 events, report prefixes and report ids (their stored `key`, JSON-quoted). Each prefix keeps the first 3 newline-separated lines, then at most 300 UTF-16 code units; `…` means text was cut. Reports remain fenced and defanged as data. No reports gives `Reports: none`, and plan threads are safe too. Omitted `brief` or `brief: false` keeps the full read unchanged.
 - To fetch 1 report, add `report: "<stored key>"` to `read`. Use the JSON-decoded id from a brief read; matching is exact, including case and whitespace. The response keeps the normal thread summary (`brief: true`) or the caller's normal full header, followed by only that report in full, defanged once. The usual data warning and `<report>` fence stay, without a `Report id:` line. An agent reading another thread without `brief` keeps its read-only warning and Markdown copy, with the selected report in a backtick fence under `## Reports`; its summary is defanged and its binding event says `session bound`. No session, address or queued wake-up fields are added. Empty or whitespace-only keys are refused with `read report needs a non-empty stored report key.` Unknown keys, no reports and no bound session give `There is no report with that key on T13.` Omitting `report` keeps all reports and the existing full-read format. Authorization does not change.

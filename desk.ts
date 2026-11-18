@@ -80,6 +80,12 @@ import type * as MetricsModule from "./_desk-metrics.ts";
 import type * as UsageModule from "./_desk-usage.ts";
 import type * as BoardModule from "./_desk-board.ts";
 import type * as MeterModule from "./_desk-meter.ts";
+import type * as ToolTimeModule from "./_tool-time.ts";
+
+/** Load the shared formatter with this module's reload key, as for the other helpers below. */
+const toolTime = (await import(
+    new URL(`./_tool-time.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof ToolTimeModule;
 
 /**
  * A JSON value, the same shape as chord's `JsonValue`. Kept here: chord 1.5.2 (Pi Pocket 0.28.2 and later) no longer
@@ -95,7 +101,11 @@ export async function linkedSend(
     request: { to: string; message: string },
     key: string,
 ): Promise<void> {
-    const compatible = { ...request, steer: false };
+    const compatible = {
+        ...request,
+        message: toolTime.withMessageTime(request.message),
+        steer: false,
+    };
 
     await host.linkedSessions.send(source, compatible, key);
 }
@@ -7083,14 +7093,7 @@ function putBeforeRead(line: string, text: string): string {
  * A time as a reader of the digest reads it, in 1 zone: `2026-10-29 15:20 EDT`. The zone's short name is the one `Intl`
  * gives, such as "EDT", or "GMT-4" where it has no other.
  */
-export function deskTime(at: number, timeZone: string): string {
-    const name =
-        new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "short" })
-            .formatToParts(new Date(at))
-            .find((part) => part.type === "timeZoneName")?.value ?? timeZone;
-
-    return `${journalDay(at, timeZone)} ${journalTime(at, timeZone)} ${name}`;
-}
+export const deskTime = toolTime.deskTime;
 
 /** 1 line of a digest message, and the items it carries: its own, and for a closed line the reports folded into it. */
 type DigestEntry = { line: string; items: DigestItem[] };
@@ -23450,37 +23453,11 @@ function serverZone(): string {
     return typeof zone === "string" && zone !== "" && zoneOk(zone) ? zone : JOURNAL_ZONE;
 }
 
-/** The parts of a time in 1 zone, as `Intl` gives them. */
-function zoneParts(at: number, timeZone: string): Record<string, string> {
-    return Object.fromEntries(
-        new Intl.DateTimeFormat("en-US", {
-            timeZone,
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-            hour: "2-digit",
-            minute: "2-digit",
-            hourCycle: "h23",
-        })
-            .formatToParts(new Date(at))
-            .filter((part) => part.type !== "literal")
-            .map((part) => [part.type, part.value]),
-    );
-}
-
 /** The day of a time in 1 zone: `2026-10-28`. An entry that waited still goes in the day it closed. */
-export function journalDay(at: number, timeZone: string): string {
-    const parts = zoneParts(at, timeZone);
-
-    return `${parts.year ?? ""}-${parts.month ?? ""}-${parts.day ?? ""}`;
-}
+export const journalDay = toolTime.journalDay;
 
 /** The time of day of a time in 1 zone: `14:32`, 24-hour. */
-export function journalTime(at: number, timeZone: string): string {
-    const parts = zoneParts(at, timeZone);
-
-    return `${parts.hour ?? ""}:${parts.minute ?? ""}`;
-}
+export const journalTime = toolTime.journalTime;
 
 /** 1 PR of an entry: its ref, and the link and title when the desk has them. */
 export type JournalPr = { ref: string; url?: string; title?: string };
