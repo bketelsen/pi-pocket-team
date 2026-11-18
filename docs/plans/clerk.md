@@ -18,10 +18,10 @@ wakes Odrade only for judgement.
 
 - A named agent with `role: clerk` in its profile (`~/.config/pi-pocket-team/agents/clerk.md`). Its
   `workspace` is Odrade's desk folder (`~/agents/odrade`).
-- 1 daily linked session of the supervisor. Odrade starts it once with
-  `team_delegate agent=clerk task="Run the desk."`. The start registers it as her Clerk on the desk. At the first
-  digest taken on each later local day, the desk rotates it to a fresh session from the current profile. It opens no
-  desk thread and does not count toward the cap.
+- 1 bounded-context linked session of the supervisor. Odrade starts it once with
+  `team_delegate agent=clerk task="Run the desk."`. The start registers it as her Clerk on the desk. After 6 routine
+  Clerk digests, or at the first such digest of a later local day, the desk rotates it to a fresh session from the
+  current profile. It opens no desk thread and does not count toward the cap.
 - Its model is the profile's `model`. **The Clerk never falls back to the supervisor's model:** when the
   profile has no model, or the owner's allowed list for subagents does not hold it, `team_delegate` refuses
   the start and names the setting to fix. The model is `github-copilot/gpt-6-luna`.
@@ -29,7 +29,8 @@ wakes Odrade only for judgement.
   address. The active registration keeps earlier sessions in `history` for 14 days, so in-flight digests and
   escalations can finish and the 7-day usage window stays attributed. Team archives each replaced session. A digest
   that rotates records its target and fallback before delivery. A digest taken before midnight stays with its
-  recorded Clerk. Rotation failure keeps the prior Clerk; delivery failure then goes to the supervisor. When the
+  recorded Clerk. Rotation failure keeps the prior Clerk and does not advance its counter or cycle, so a later digest
+  retries the same bounded key; delivery failure then goes to the supervisor. When the
   active Clerk's session is archived, the sweep moves retained registrations to `retiredClerks`, and desk news goes to
   the supervisor again; historical Clerk calls still map to that supervisor.
 
@@ -141,8 +142,8 @@ the desk.
 ## 6. How Odrade hands it work
 
 1. Once: `team_delegate agent=clerk task="Run the desk."` The result gives the active Clerk's address.
-2. Routine desk news then goes to the active Clerk by itself (Section 3). The desk rotates that session at the
-   first digest of a new local day and then shows the new address.
+2. Routine desk news then goes to the active Clerk by itself (Section 3). The desk rotates that session after 6
+   routine Clerk digests, or at the first such digest of a new local day, and then shows the new address.
 3. Odrade can send it a task at any time with `team_message` to the active address: "record T121 in decided.md",
    "send the after-merge check of T95 to Lucilla". The Clerk answers only when the task asks for a result.
 4. Odrade's desk section shows `Clerk: <address>` while one is registered.
@@ -219,9 +220,10 @@ does that. Write to Odrade in ASD-STE100.
   `session`, `address`, `agent`, `at` and `key`, plus optional `cwd` and 14-day `history` registrations.
   `DeskState.retiredClerks` keeps those registrations when the active session is archived.
   The registration lands in the same commit as the Clerk's identity. A manual replay or delayed historical
-  registration cannot reactivate an old session; a daily replay key returns its session from active or history.
+  registration cannot reactivate an old session; a replay key with the date and cycle returns its session from active
+  or history.
   A new manual call is refused when a live active Clerk is there.
-- A digest target's optional `rotation` holds the daily key and take time. The `deliver` phase resolves it through
+- A digest target's optional `rotation` holds the date-and-cycle key and take time. The `deliver` phase resolves it through
   Team, commits a fixed conversation and supervisor fallback, then submits. A restart submits with the same target,
   text and request id. In-flight `escalate` calls retain access: historical Clerk sessions still map to the
   supervisor and to the Clerk agent for permissions and usage accounting.

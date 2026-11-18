@@ -1501,7 +1501,7 @@ export const MAX_PENDING = 20;
  */
 export type TeamApi = {
     version: 1;
-    /** Start and register the current Clerk profile under Desk's replay-stable daily key. */
+    /** Start and register the current Clerk profile under Desk's replay-stable date-and-cycle key. */
     rotateClerk?: (request: {
         supervisor: number;
         read: Pick<DocumentReader, "snapshot">;
@@ -2286,7 +2286,7 @@ export default function createTeam(host: Host, web: Web) {
     };
 
     /**
-     * Start the supervisor's Clerk: 1 daily linked session, registered on the desk in the same commit as its identity,
+     * Start the supervisor's Clerk: 1 bounded-context linked session, registered in the same commit as its identity,
      * under the start's replay key. It opens no desk thread, so it does not count toward the cap. 1 active Clerk for
      * each supervisor: a second start while the first one's session is there is refused with its address.
      */
@@ -2296,7 +2296,7 @@ export default function createTeam(host: Host, web: Web) {
         title: string,
         cwd: string | undefined,
         deps: Pick<DelegateDeps, "source" | "key" | "read" | "commit" | "context">,
-        rotation?: { at: number },
+        rotation?: { at: number; cycle: number },
     ): Promise<DelegateResult & { session: number; address: string }> => {
         const model = clerkModel(persona);
         const desk = deskApi();
@@ -2348,12 +2348,13 @@ export default function createTeam(host: Host, web: Web) {
                     agent: persona.id,
                     at: rotation?.at ?? Date.now(),
                     key,
+                    ...(rotation === undefined ? {} : { digests: 0, cycle: rotation.cycle }),
                     ...(cwd === undefined ? {} : { cwd }),
                 });
             }
         });
 
-        // Keep the old context available for replay and in-flight calls, but remove its daily session from the live list.
+        // Keep the old context available for replay and in-flight calls, but remove it from the live list.
         if (
             rotation !== undefined &&
             here !== undefined &&
@@ -2775,6 +2776,8 @@ export default function createTeam(host: Host, web: Web) {
                 /** The start's replay key. */
                 key?: string;
                 cwd?: string;
+                digests?: number;
+                cycle?: number;
             },
         ) => Promise<void>;
         /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
@@ -2788,6 +2791,8 @@ export default function createTeam(host: Host, web: Web) {
                   agent: string;
                   key?: string;
                   cwd?: string;
+                  digests?: number;
+                  cycle?: number;
                   history?: { session: number; address: string; key?: string }[];
               }
             | undefined
@@ -3178,7 +3183,9 @@ export default function createTeam(host: Host, web: Web) {
                 }
             }
 
-            return { session: replay.session, address: replay.address };
+            return replay.session === here.session
+                ? { session: replay.session, address: replay.address }
+                : { session: here.session, address: here.address };
         }
 
         const persona = (await roster(directory)).find((each) => each.id === here.agent);
@@ -3190,10 +3197,10 @@ export default function createTeam(host: Host, web: Web) {
         const started = await startClerk(
             persona,
             "Run the desk. Routine desk news arrives in digest messages.",
-            "Daily desk",
+            "Desk batch",
             persona.workspace ?? persona.home ?? here.cwd,
             { ...request, source: request.supervisor as ConversationId },
-            { at: request.at },
+            { at: request.at, cycle: (here.cycle ?? 0) + 1 },
         );
 
         return { session: started.session, address: started.address };

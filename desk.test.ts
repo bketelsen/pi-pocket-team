@@ -1773,6 +1773,300 @@ const thread = (patch: Partial<Thread> = {}): Thread => ({
 
 const facts = (now = 1000, folders: string[] = []) => ({ now, folders: new Set(folders) });
 
+describe("Clerk routine closure suppression", () => {
+    const at = 1000;
+    const closed: DigestItem = {
+        key: "closed:T1",
+        thread: "T1",
+        kind: "closed",
+        line: "[desk] T1 frostyard/test · closed: done, nothing remains · desk read T1",
+        at,
+    };
+    const safe = (): Thread =>
+        thread({
+            state: "closed",
+            closed: { at, why: "done", by: "sweep", outcome: "completed" },
+            run: { reportBlocked: false, reportAsks: false },
+        });
+    const stateOf = (value: Thread): DeskState => ({ ...empty(), threads: { T1: value } });
+    const config = digestConfig(undefined);
+
+    test("a proven routine close reaches neither model, and the stored thread stays unchanged", () => {
+        for (const prs of [
+            {},
+            { "frostyard/test#7": { via: "attached", state: "MERGED", readAt: at } },
+        ] as Thread["prs"][]) {
+            const value = safe();
+
+            value.prs = prs;
+            const state = stateOf(value);
+            const before = structuredClone(state);
+
+            assert.deepEqual(splitDigest([closed], true, config, state), { theirs: [], ours: [] });
+            assert.deepEqual(state, before);
+        }
+
+        assert.deepEqual(splitDigest([], true, config, empty()), { theirs: [], ours: [] });
+    });
+
+    test("an open ask, an open or unknown PR, and an unclear close stay in the Clerk digest", () => {
+        const cases: [string, (value: Thread) => void][] = [
+            [
+                "open ask",
+                (value) => {
+                    value.asks = [{ id: "T1a", text: "Choose a key", at: 1, by: "duncan" }];
+                },
+            ],
+            [
+                "open PR",
+                (value) => {
+                    value.prs = {
+                        "frostyard/test#7": { via: "attached", state: "OPEN", readAt: at },
+                    };
+                },
+            ],
+            [
+                "unknown PR",
+                (value) => {
+                    value.prs = { "frostyard/test#7": { via: "attached" } };
+                },
+            ],
+            [
+                "missing PR",
+                (value) => {
+                    value.prs = { "frostyard/test#7": { via: "attached", state: "MISSING" } };
+                },
+            ],
+            [
+                "unattached PR",
+                (value) => {
+                    value.run.seenPrs = ["frostyard/test#7"];
+                },
+            ],
+            [
+                "unread merged PR",
+                (value) => {
+                    value.prs = { "frostyard/test#7": { via: "attached", state: "MERGED" } };
+                },
+            ],
+            [
+                "stale merged PR",
+                (value) => {
+                    value.prs = {
+                        "frostyard/test#7": { via: "attached", state: "MERGED", readAt: at - 1 },
+                    };
+                },
+            ],
+            [
+                "unchecked report",
+                (value) => {
+                    delete value.run.reportBlocked;
+                },
+            ],
+            [
+                "unchecked decision",
+                (value) => {
+                    delete value.run.reportAsks;
+                },
+            ],
+            [
+                "blocked report",
+                (value) => {
+                    value.run.reportBlocked = true;
+                },
+            ],
+            [
+                "report asks Brian",
+                (value) => {
+                    value.run.reportAsks = true;
+                },
+            ],
+            [
+                "failed run",
+                (value) => {
+                    value.run.failed = "provider failed";
+                },
+            ],
+            [
+                "new event",
+                (value) => {
+                    value.lastEventAt = at + 1;
+                },
+            ],
+            [
+                "busy session",
+                (value) => {
+                    value.run.busy = true;
+                },
+            ],
+            [
+                "running shift",
+                (value) => {
+                    value.run.shift = "running";
+                },
+            ],
+            [
+                "dirty folder",
+                (value) => {
+                    value.run.dirty = 1;
+                },
+            ],
+            [
+                "unpushed commit",
+                (value) => {
+                    value.run.ahead = 1;
+                },
+            ],
+            [
+                "unknown commits",
+                (value) => {
+                    value.run.aheadUnknown = "git status failed";
+                },
+            ],
+            [
+                "worktree work",
+                (value) => {
+                    value.run.worktrees = [{ path: "/work/other", dirty: 1, unpushed: 0 }];
+                },
+            ],
+            [
+                "reopened thread",
+                (value) => {
+                    value.state = "open";
+                },
+            ],
+            [
+                "another close",
+                (value) => {
+                    value.closed = { at: at + 1, why: "done", by: "sweep", outcome: "completed" };
+                },
+            ],
+            [
+                "watch result",
+                (value) => {
+                    value.closed = { at, why: "done", by: "desk", outcome: "verified" };
+                },
+            ],
+            [
+                "old close",
+                (value) => {
+                    value.closed = { at, why: "done", by: "sweep" };
+                },
+            ],
+            [
+                "failed close",
+                (value) => {
+                    value.closed = { at, why: "failed", by: "sweep" };
+                },
+            ],
+            [
+                "abandoned work",
+                (value) => {
+                    value.closed = { at, why: "done", by: "sweep", outcome: "abandoned" };
+                },
+            ],
+            [
+                "refused PR",
+                (value) => {
+                    value.events.push({
+                        key: "report-pr-refused:r:0",
+                        text: "PR not attached",
+                        at,
+                    });
+                },
+            ],
+        ];
+
+        for (const [name, change] of cases) {
+            const value = safe();
+
+            change(value);
+            assert.deepEqual(
+                splitDigest([closed], true, config, stateOf(value)),
+                { theirs: [closed], ours: [] },
+                name,
+            );
+        }
+
+        for (const line of ["[desk] T1 closed", `${closed.line} · review result`]) {
+            const unclear = { ...closed, line };
+
+            assert.deepEqual(splitDigest([unclear], true, config, stateOf(safe())).theirs, [
+                unclear,
+            ]);
+        }
+
+        assert.deepEqual(splitDigest([closed], true, config, empty()).theirs, [closed]);
+        assert.deepEqual(splitDigest([closed], true, config).theirs, [closed]);
+    });
+
+    test("shift summaries, review results, blocked reports, and ambiguous reports remain without folding", () => {
+        const reports: DigestItem[] = [
+            { ...closed, key: "shift:done", kind: "shift", line: "[desk] T1 · shift report: done" },
+            {
+                ...closed,
+                key: "report:review",
+                kind: "report",
+                line: "[desk] T1 · review result: Ready, Blocking: none",
+            },
+            {
+                ...closed,
+                key: "report:unclear",
+                kind: "report",
+                line: "[desk] T1 · reported: probably done; check what remains",
+            },
+            {
+                ...closed,
+                key: "report:blocked",
+                kind: "report-blocked",
+                line: "[desk] T1 · report blocked",
+            },
+            {
+                ...closed,
+                key: "shift:failed",
+                kind: "shift-blocked",
+                line: "[desk] T1 · shift report failed",
+            },
+        ];
+        const split = splitDigest([...reports, closed], true, config, stateOf(safe()));
+
+        assert.deepEqual(split.theirs, reports.slice(0, 3));
+        assert.deepEqual(split.ours, reports.slice(3));
+        const text = digestText(split.theirs);
+
+        assert.match(text, /shift report: done/);
+        assert.match(text, /review result: Ready/);
+        assert.match(text, /probably done/);
+        assert.doesNotMatch(text, /closed: done/);
+
+        const report = reports[1]!;
+        const besideClose = splitDigest([report, closed], true, config, stateOf(safe()));
+
+        assert.deepEqual(besideClose, { theirs: [report], ours: [] });
+        assert.deepEqual(digestShown(besideClose.theirs), [report]);
+        assert.deepEqual(digestText(besideClose.theirs).split("\n"), [
+            "[desk] digest: 1 new. Read each with desk read <id> before you act.",
+            report.line,
+        ]);
+    });
+
+    test("no Clerk and supervisor routing keep the existing closure news", () => {
+        const state = stateOf(safe());
+
+        assert.deepEqual(splitDigest([closed], false, config, state), {
+            theirs: [],
+            ours: [closed],
+        });
+        assert.deepEqual(splitDigest([closed], true, digestConfig({ clerk: [] }), state).ours, [
+            closed,
+        ]);
+        assert.deepEqual(
+            splitDigest([closed], true, digestConfig({ now: ["closed"] }), state).ours,
+            [closed],
+        );
+    });
+});
+
 describe("threadAhead", () => {
     test("a delegated thread counts only the unpushed commits from its start second on", () => {
         // Started at 5000.9 seconds: a commit at second 5000 is its own, one at 4999 is not.
@@ -13250,19 +13544,28 @@ describe("the digest's rules", () => {
               ) => string | undefined)
             | undefined;
 
-        assert.equal(typeof rotate, "function", "the daily rotation rule exists");
+        assert.equal(typeof rotate, "function", "the bounded rotation rule exists");
         const at = Date.parse("2026-11-01T03:59:59Z");
-        const clerk: Clerk = { session: 77, address: "session-a", agent: "clerk", at };
+        const clerk: Clerk = {
+            session: 77,
+            address: "session-a",
+            agent: "clerk",
+            at,
+            digests: 6,
+            cycle: 2,
+        };
         const key = (time: string, zone = "America/New_York") =>
             rotate!(clerk, 5, Date.parse(time), zone);
 
-        assert.equal(key("2026-11-01T03:59:59Z"), undefined);
-        assert.equal(key("2026-11-01T04:00:00Z"), "x.desk.clerk:5:2026-11-01");
+        assert.equal(key("2026-11-01T03:59:59Z"), "x.desk.clerk:5:2026-10-31:3");
+        clerk.digests = 5;
+        assert.equal(key("2026-11-01T04:00:00Z"), "x.desk.clerk:5:2026-11-01:3");
         assert.equal(
             key("2026-11-01T06:00:00Z"),
-            "x.desk.clerk:5:2026-11-01",
+            "x.desk.clerk:5:2026-11-01:3",
             "DST repeats no date",
         );
+        clerk.digests = 5;
         assert.equal(
             key("2026-10-30T04:00:00Z"),
             undefined,
@@ -14530,7 +14833,7 @@ function topLevelFields(selection: string): string[] {
     return words;
 }
 
-describe("Clerk daily rotation", () => {
+describe("Clerk bounded-context rotation", () => {
     /** Real Team and Desk definitions, with an injected clock, durable documents, and host receipts. */
     const fixture = () => {
         const folder = join(root, "clerk-daily-rotation");
@@ -14796,14 +15099,14 @@ describe("Clerk daily rotation", () => {
         };
     };
 
-    test("day change starts one current-profile Clerk; the same day and historical key reuse it", async () => {
+    test("day change or six routine digests starts one current-profile Clerk; the key reuses it", async () => {
         const f = fixture();
 
         try {
             await f.take();
             await f.deliver();
             assert.equal(f.made.length, 1);
-            assert.equal(f.made[0]!.key, "x.desk.clerk:5:2026-10-31");
+            assert.equal(f.made[0]!.key, "x.desk.clerk:5:2026-10-31:1");
             assert.equal(f.made[0]!.request.model, "faux/faux-2");
             assert.equal(
                 f.made[0]!.request.cwd,
@@ -14828,20 +15131,31 @@ describe("Clerk daily rotation", () => {
             await f.take("report:2");
             await f.deliver();
             await f.rotate(f.made[0]!.key);
-            assert.equal(f.made.length, 1, "a second daily rotation never recreates the session");
-            f.setTime("2026-11-01T12:00:00Z");
-            await f.take("report:3");
+            assert.equal(f.made.length, 1, "the rotation key replay never recreates the session");
+
+            for (let count = 3; count <= 6; count += 1) {
+                await f.take(`report:${String(count)}`);
+                await f.deliver();
+            }
+
+            assert.equal(f.made.length, 1, "six routine digests use one Clerk session");
+            await f.take("report:7");
             await f.deliver();
-            assert.equal(f.made.length, 2, "the next day rotates once again");
+            assert.equal(f.made.length, 2, "the seventh routine digest starts the next batch");
+            assert.equal(f.made[1]!.key, "x.desk.clerk:5:2026-10-31:2");
+            f.setTime("2026-11-01T12:00:00Z");
+            await f.take("report:8");
+            await f.deliver();
+            assert.equal(f.made.length, 3, "a new day rotates once again");
             const previous = await f.rotate(f.made[0]!.key);
 
-            assert.equal(previous.session, 100);
+            assert.equal(previous.session, 102, "an old key delivers through the active Clerk");
             assert.equal(
                 clerkOf(f.state, 5)?.session,
-                101,
-                "an old key cannot reactivate yesterday",
+                102,
+                "an old key cannot reactivate an earlier batch",
             );
-            assert.equal((clerkOf(f.state, 5) as Clerk & { history?: Clerk[] }).history?.length, 2);
+            assert.equal((clerkOf(f.state, 5) as Clerk & { history?: Clerk[] }).history?.length, 3);
             assert.equal(supervisorOfClerk(f.state, 77), 5);
             assert.equal(deskAgentSessions(f.state).get(77), "clerk");
         } finally {
@@ -14901,7 +15215,7 @@ describe("Clerk daily rotation", () => {
             f.setTime("2026-10-30T23:00:00Z");
             await f.take();
             f.setTime("2026-10-31T12:00:00Z");
-            await f.rotate("x.desk.clerk:5:2026-10-31");
+            await f.rotate("x.desk.clerk:5:2026-10-31:1");
             await f.deliver();
             assert.deepEqual(
                 [...f.admitted.values()].map((each) => each.to),
@@ -14919,6 +15233,9 @@ describe("Clerk daily rotation", () => {
 
             try {
                 f.failStart();
+                clerkOf(f.state, 5)!.at = Date.parse("2026-10-31T12:00:00Z");
+                clerkOf(f.state, 5)!.digests = 6;
+                clerkOf(f.state, 5)!.cycle = 4;
 
                 if (oldGone) {
                     f.unavailable.add(77);
@@ -14932,10 +15249,29 @@ describe("Clerk daily rotation", () => {
                 );
                 assert.equal(f.made.length, 0);
                 assert.equal(clerkOf(f.state, 5)?.session, 77);
+                assert.equal(clerkOf(f.state, 5)?.digests, 6, "failure keeps the batch count");
+                assert.equal(clerkOf(f.state, 5)?.cycle, 4, "failure keeps the batch cycle");
                 assert(f.notices.some((text) => text.includes("rotation refused")));
             } finally {
                 f.restore();
             }
+        }
+    });
+
+    test("a legacy Clerk counts its first routine digest without rotating", async () => {
+        const f = fixture();
+
+        try {
+            clerkOf(f.state, 5)!.at = Date.parse("2026-10-31T12:00:00Z");
+            delete clerkOf(f.state, 5)!.digests;
+            delete clerkOf(f.state, 5)!.cycle;
+            await f.take();
+            await f.deliver();
+            assert.equal(f.made.length, 0);
+            assert.equal(clerkOf(f.state, 5)?.digests, 1);
+            assert.equal(clerkOf(f.state, 5)?.cycle, undefined);
+        } finally {
+            f.restore();
         }
     });
 
@@ -30621,6 +30957,94 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
             return tasks;
         };
+
+        test("a safe routine close sends no digest to either model and records no news mark", async () => {
+            const stub = stubDesk();
+
+            digestMinutes(15);
+
+            const { source, linked, thread } = await delegated("routine-close-only");
+
+            try {
+                const clerk = await handClerk(source, "routine-close-only-clerk");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await clearDigests();
+                // Start the real digest task, then give its box only the sweep's routine closure news.
+                await stub.tool(
+                    { action: "escalate", thread: thread.id, text: "task starter" },
+                    Number(clerk),
+                    "task-routine-close",
+                    "call-start",
+                );
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const value = state.threads[thread.id]!;
+                    const at = Date.now();
+
+                    value.state = "closed";
+                    value.closed = { at, why: "done", by: "sweep", outcome: "completed" };
+                    value.prs = {};
+                    value.run.reportBlocked = false;
+                    value.run.reportAsks = false;
+                    delete value.run.failed;
+                    delete value.run.seenPrs;
+                    state.digests![String(Number(source))]!.items = [
+                        {
+                            key: `closed:${value.id}`,
+                            thread: value.id,
+                            kind: "closed",
+                            line: `[desk] ${value.id} frostyard/test · closed: done, nothing remains · desk read ${value.id}`,
+                            at,
+                        },
+                    ];
+                }, context);
+
+                const [waiting] = await digestTasks(source);
+
+                assert(waiting, "a digest task waits");
+                digestMinutes(0);
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000);
+
+                const settled = await app.harness.waitForTask(waiting.id, context);
+
+                assert.equal(
+                    (settled.state as { outcome?: { status?: string } }).outcome?.status,
+                    "completed",
+                );
+                const after = await deskState();
+
+                assert.equal(after?.threads[thread.id]?.state, "closed");
+                assert.equal(after?.threads[thread.id]?.run.clerkNews, undefined);
+                assert.equal(after?.threads[thread.id]?.run.told, undefined);
+                assert.deepEqual(after?.digests?.[String(Number(source))]?.items, []);
+
+                for (const session of [source, clerk]) {
+                    assert.equal(
+                        (await modelTexts(app, session)).some((text) =>
+                            text.includes("[desk] digest:"),
+                        ),
+                        false,
+                        "no digest reaches a model",
+                    );
+                }
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestMinutes(0);
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
 
         test("a take that drops every item sends no message to anybody, ends, and keeps its records", async () => {
             const stub = stubDesk();

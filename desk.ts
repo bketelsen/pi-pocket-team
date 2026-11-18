@@ -656,7 +656,7 @@ export type DigestBox = {
     sentAt?: number;
 };
 
-/** One registered Clerk: the supervisor's long-lived desk session. Stored data: never rename a field. */
+/** One registered Clerk: the supervisor's bounded-context desk session. Stored data: never rename a field. */
 export type Clerk = {
     /** The Clerk session's conversation id. */
     session: number;
@@ -669,9 +669,16 @@ export type Clerk = {
     key?: string;
     /** The workspace selected at start. Absent in older registrations. */
     cwd?: string;
-    /** Previous registrations, oldest first. Append-only: in-flight work can still use these sessions. */
+    /** Clerk digest batches taken in this session. Absent in registrations from before the counter. */
+    digests?: number;
+    /** The monotonic rotation generation. Absent in registrations from before bounded rotation. */
+    cycle?: number;
+    /** Previous registrations, oldest first. In-flight work can still use these sessions. */
     history?: Omit<Clerk, "history">[];
 };
+
+/** Rotate after this many routine Clerk digests, before the context reaches another compaction cycle. */
+export const CLERK_DIGEST_LIMIT = 6;
 
 /** Keep enough Clerk history for the 7-day usage window plus a safe margin. Old sessions may still call the desk. */
 export const CLERK_HISTORY_KEEP_MS = 14 * 24 * 3600_000;
@@ -679,7 +686,7 @@ export const CLERK_HISTORY_KEEP_MS = 14 * 24 * 3600_000;
 /** One Clerk registration, without its history. */
 type ClerkPast = Omit<Clerk, "history">;
 
-/** Active and retained registrations: the active Clerk, its daily history, and archived registrations. */
+/** Active and retained registrations: the active Clerk, its prior batches, and archived registrations. */
 export function clerkRegistrations(
     state: Readonly<DeskState> | undefined,
     supervisor?: number,
@@ -7821,14 +7828,79 @@ export function escalationDropOf(
 }
 
 /**
- * Routing is independent of urgency: the Clerk takes the kinds in `clerk` unless `now` names them. Escalations
- * always stay with the supervisor. With no Clerk, every item is the supervisor's. The issue kinds are in no default
- * list of the Clerk: only the supervisor plans shifts.
+ * A sweep's routine close needs no Clerk decision. Keep an unclear close: the current thread must prove the same
+ * completed close, with no open ask, failed run, blocked report, or PR whose final state is unknown.
+ * Report items are never suppressed here: a done report can be a shift summary or a review result.
+ */
+function routineDigestClose(item: DigestItem, state: Readonly<DeskState>): boolean {
+    const thread = state.threads[item.thread];
+
+    if (
+        item.kind !== "closed" ||
+        thread === undefined ||
+        thread.state !== "closed" ||
+        thread.closed?.why !== "done" ||
+        thread.closed.by !== "sweep" ||
+        thread.closed.outcome !== "completed" ||
+        thread.closed.at !== item.at ||
+        thread.lastEventAt > item.at ||
+        hasOpenAsk(thread) ||
+        thread.run.busy === true ||
+        shiftWorks(thread.run.shift) ||
+        (numberOr(thread.run.dirty) ?? 0) > 0 ||
+        (numberOr(thread.run.ahead) ?? 0) > 0 ||
+        thread.run.aheadUnknown !== undefined ||
+        (thread.run.worktrees !== undefined &&
+            (!Array.isArray(thread.run.worktrees) || thread.run.worktrees.length > 0)) ||
+        thread.run.failed !== undefined ||
+        thread.run.reportBlocked !== false ||
+        thread.run.reportAsks !== false
+    ) {
+        return false;
+    }
+
+    const repo = thread.repo === undefined ? "" : ` ${thread.repo}`;
+
+    if (
+        item.line !==
+        `[desk] ${thread.id}${repo} · closed: done, nothing remains · desk read ${thread.id}`
+    ) {
+        return false;
+    }
+
+    // A named but unattached PR, or a refused attachment, is not proof that nothing remains.
+    const seen = thread.run.seenPrs;
+
+    if (
+        (seen !== undefined &&
+            (!Array.isArray(seen) ||
+                seen.some((ref) => typeof ref !== "string" || thread.prs[ref] === undefined))) ||
+        thread.events.some((event) =>
+            /^(?:report-pr:|report-pr-refused:|report-prs-missing:)/.test(event.key),
+        )
+    ) {
+        return false;
+    }
+
+    return Object.values(thread.prs).every(
+        (link) =>
+            link.state === "MERGED" &&
+            typeof link.readAt === "number" &&
+            link.readAt >= (numberOr(thread.run.prsReadAt) ?? item.at),
+    );
+}
+
+/**
+ * The Clerk takes the routine kinds, except a proven routine close. Routing is independent of urgency: `clerk`
+ * decides its routine kinds, and `now` keeps a kind with the supervisor. Escalations always stay with the supervisor.
+ * With no Clerk, every item is the supervisor's. Without current state, keep every item. The issue kinds are in no
+ * default Clerk list: only the supervisor plans shifts.
  */
 export function splitDigest(
     items: readonly DigestItem[],
     hasClerk: boolean,
     config: DigestConfig,
+    state?: Readonly<DeskState>,
 ): { theirs: DigestItem[]; ours: DigestItem[] } {
     // An escalation is the Clerk's own news for the supervisor: it never goes back to the Clerk.
     const theirs = hasClerk
@@ -7840,7 +7912,13 @@ export function splitDigest(
           )
         : [];
 
-    return { theirs, ours: items.filter((item) => !theirs.includes(item)) };
+    return {
+        theirs:
+            state === undefined
+                ? theirs
+                : theirs.filter((item) => !routineDigestClose(item, state)),
+        ours: items.filter((item) => !theirs.includes(item)),
+    };
 }
 
 /** One message a digest task sends: the supervisor's, or the Clerk's. */
@@ -7852,7 +7930,7 @@ export type DigestMessage = {
     rotation?: { key: string; at: number };
 };
 
-/** A daily start key only after the registration's local day. No wall-clock reads. */
+/** A replay-stable start key at a day boundary, or after `CLERK_DIGEST_LIMIT` routine Clerk digests. */
 export function clerkRotationKey(
     clerk: Clerk,
     supervisor: number,
@@ -7860,9 +7938,11 @@ export function clerkRotationKey(
     timeZone: string,
 ): string | undefined {
     const day = journalDay(at, timeZone);
+    const rotate =
+        day > journalDay(clerk.at, timeZone) || (clerk.digests ?? 0) >= CLERK_DIGEST_LIMIT;
 
-    return day > journalDay(clerk.at, timeZone)
-        ? `x.desk.clerk:${String(supervisor)}:${day}`
+    return rotate
+        ? `x.desk.clerk:${String(supervisor)}:${day}:${String((clerk.cycle ?? 0) + 1)}`
         : undefined;
 }
 
@@ -23909,7 +23989,7 @@ type TeamApi = {
         context: Context,
     ) => Promise<TeamMember | undefined>;
     roster: () => Promise<TeamMember[]>;
-    /** Rotate the registered Clerk under a daily key. An older Team has none: keep the recorded Clerk. */
+    /** Rotate the registered Clerk under a date-and-cycle key. An older Team has none: keep the recorded Clerk. */
     rotateClerk?: (request: {
         supervisor: number;
         read: Pick<DocumentReader, "snapshot">;
@@ -25898,6 +25978,8 @@ export default function createDesk(host: Host, web: Web) {
                     address: request.address,
                     agent: request.agent,
                     at: request.at,
+                    ...(request.digests === undefined ? {} : { digests: request.digests }),
+                    ...(request.cycle === undefined ? {} : { cycle: request.cycle }),
                     ...(request.key === undefined ? {} : { key: request.key }),
                     ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
                     ...(keptHistory.length === 0 ? {} : { history: keptHistory }),
@@ -29691,7 +29773,7 @@ export default function createDesk(host: Host, web: Web) {
                 .filter((address): address is string => typeof address === "string"),
         );
 
-        // A Clerk's active, daily and retired sessions are known work: none becomes a found thread.
+        // A Clerk's active, historical and retired sessions are known work: none becomes a found thread.
         for (const clerk of clerkRegistrations(state)) {
             addresses.add(clerk.address);
         }
@@ -31438,8 +31520,8 @@ export default function createDesk(host: Host, web: Web) {
                     const config = await deskConfig();
                     const { digest, journal } = config;
                     const clerk = clerkOf(state, supervisor);
-                    // Route by `clerk` and `now`, independently of mandatory urgency; escalations stay with the supervisor.
-                    const split = splitDigest(items, clerk !== undefined, digest);
+                    // Route by `clerk` and `now`, independently of urgency; omit only a proven routine close.
+                    const split = splitDigest(items, clerk !== undefined, digest, state);
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);
                     // The journal's zone, or the server's. The checkpoint keeps the text, so a replay says the same time.
@@ -31504,6 +31586,10 @@ export default function createDesk(host: Host, web: Web) {
                     if (theirs.length > 0 && clerk !== undefined) {
                         const key = clerkRotationKey(clerk, supervisor, now.at, now.timeZone);
 
+                        if (key === undefined) {
+                            clerk.digests = (clerk.digests ?? 0) + 1;
+                        }
+
                         messages.push({
                             conversation: clerk.session,
                             text: withFooter(digestText(theirs, now)),
@@ -31542,6 +31628,7 @@ export default function createDesk(host: Host, web: Web) {
                 // Persist the rotation result before any submit. A replay keeps both the target and request id.
                 if (messages.some((message) => message.rotation !== undefined)) {
                     const resolved: DigestMessage[] = [];
+                    const rotatedSessions: number[] = [];
 
                     for (const message of messages) {
                         const { rotation, ...fixed } = message;
@@ -31568,11 +31655,9 @@ export default function createDesk(host: Host, web: Web) {
                                     ...rotation,
                                 });
 
-                                if (
-                                    started !== undefined &&
-                                    started.session !== fixed.conversation
-                                ) {
+                                if (started !== undefined) {
                                     fixed.conversation = started.session;
+                                    rotatedSessions.push(started.session);
                                 }
                             } catch (error) {
                                 host.notice(
@@ -31586,13 +31671,19 @@ export default function createDesk(host: Host, web: Web) {
                         resolved.push(fixed);
                     }
 
-                    await runtime.commit(
-                        () => ({
+                    await runtime.commit(async (tx) => {
+                        const state = await tx.doc(DeskThreads);
+                        const active = clerkOf(state, task.input.supervisor);
+
+                        if (active !== undefined && rotatedSessions.includes(active.session)) {
+                            active.digests = (active.digests ?? 0) + 1;
+                        }
+
+                        return {
                             status: "running",
                             checkpoint: { phase: "deliver", messages: resolved },
-                        }),
-                        context,
-                    );
+                        };
+                    }, context);
 
                     return;
                 }
