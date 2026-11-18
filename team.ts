@@ -479,7 +479,7 @@ function ciRequiredContexts(value: unknown): string[] {
 
 const ciWorkflowRunLimit = 1000;
 
-/** A run read closes the gap before an aggregator check exists, not a second source of failure verdicts. */
+/** Active head workflows prevent PASS and NO CHECKS; check buckets still decide failure. */
 function ciWorkflowsPending(value: unknown): boolean {
     if (!Array.isArray(value)) {
         throw new Error("gh returned malformed workflow runs");
@@ -523,7 +523,7 @@ const ciLine = (text: string, max = 200): string => text.replace(/\s+/g, " ").tr
  * Wait in this call. Effective branch rules name checks that gh pr checks can omit before an aggregator exists.
  * A pass needs every required context, no active head workflow and a final same-head/base confirmation. Empty and
  * unknown buckets never pass. The deadline covers resolution, polling and logs; a new head discards the observation,
- * without extending that deadline. Empty checks on one head return NO CHECKS after 5 minutes. Polling backs off
+ * without extending that deadline. NO CHECKS needs 5 minutes of empty checks with no active head workflow. Polling backs off
  * 30s, 60s, then 90s thereafter to protect the shared GitHub budget. Dependencies inject time and cancellation.
  */
 export async function waitForCi(
@@ -644,6 +644,27 @@ export async function waitForCi(
             return [...new Set(pages.flatMap(ciRequiredContexts))];
         };
 
+        const workflowsPending = async (): Promise<boolean> => {
+            const runs = await command([
+                "run",
+                "list",
+                "--repo",
+                address.repo,
+                "--commit",
+                head,
+                "--limit",
+                String(ciWorkflowRunLimit),
+                "--json",
+                "status,conclusion",
+            ]);
+
+            if (runs.code !== 0) {
+                throw new Error(`Cannot read head workflow runs: ${reason(runs)}`);
+            }
+
+            return ciWorkflowsPending(json(runs));
+        };
+
         const confirm = async (): Promise<boolean> => {
             const confirmation = await command([
                 "pr",
@@ -758,10 +779,20 @@ export async function waitForCi(
             }
 
             if (rows.length === 0) {
-                noChecksSince ??= observedAt;
+                if (await workflowsPending()) {
+                    // A matrix can run for minutes before its required aggregator check exists.
+                    noChecksSince = undefined;
+                } else {
+                    noChecksSince ??= observedAt;
 
-                if (observedAt - noChecksSince >= 5 * 60_000) {
-                    return `NO CHECKS: ${label} (${head.slice(0, 12)}); no checks reported for at least 5 minutes on this head.`;
+                    if (observedAt - noChecksSince >= 5 * 60_000) {
+                        if (!(await confirm())) {
+                            noChecksSince = undefined;
+                            continue;
+                        }
+
+                        return `NO CHECKS: ${label} (${head.slice(0, 12)}); no checks reported for at least 5 minutes on this head, with no active head workflow.`;
+                    }
                 }
             } else {
                 noChecksSince = undefined;
@@ -842,33 +873,14 @@ export async function waitForCi(
                     ),
                 );
 
-                if (present) {
-                    const runs = await command([
-                        "run",
-                        "list",
-                        "--repo",
-                        address.repo,
-                        "--commit",
-                        head,
-                        "--limit",
-                        String(ciWorkflowRunLimit),
-                        "--json",
-                        "status,conclusion",
-                    ]);
-
-                    if (runs.code !== 0) {
-                        throw new Error(`Cannot read head workflow runs: ${reason(runs)}`);
+                if (present && !(await workflowsPending())) {
+                    // Rules and workflow reads can take time. Recheck the head and base after both gates.
+                    if (!(await confirm())) {
+                        noChecksSince = undefined;
+                        continue;
                     }
 
-                    if (!ciWorkflowsPending(json(runs))) {
-                        // Rules and workflow reads can take time. Recheck the head and base after both gates.
-                        if (!(await confirm())) {
-                            noChecksSince = undefined;
-                            continue;
-                        }
-
-                        return `PASS: ${label} (${head.slice(0, 12)}); all ${all ? "checks (none required)" : "required checks"} passed or skipped.`;
-                    }
+                    return `PASS: ${label} (${head.slice(0, 12)}); all ${all ? "checks (none required)" : "required checks"} passed or skipped.`;
                 }
             }
 
@@ -5848,7 +5860,7 @@ export default function createTeam(host: Host, web: Web) {
         defineTool({
             name: "team_wait_for_ci",
             description:
-                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, NO PR, NO CHECKS after 5 minutes on one head, ERROR, or INTERRUPTED on module disposal. Verifies effective required check names and waits for head workflows to finish; uses all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
+                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, NO PR, NO CHECKS after 5 minutes on one head with no active workflow, ERROR, or INTERRUPTED on module disposal. Verifies effective required check names and waits for head workflows to finish; uses all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
             parameters: Type.Object({
                 pr: Type.Optional(
                     Type.Union([
