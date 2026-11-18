@@ -40,7 +40,11 @@ export async function linkedSend(
     request: { to: string; message: string },
     key: string,
 ): Promise<void> {
-    const compatible = { ...request, steer: false };
+    const compatible = {
+        ...request,
+        message: toolTime.withMessageTime(request.message),
+        steer: false,
+    };
 
     await host.linkedSessions.send(source, compatible, key);
 }
@@ -2257,7 +2261,9 @@ export default function createTeam(host: Host, web: Web) {
     ) => {
         const where = worktree === undefined ? "" : worktreeText(worktree);
 
-        return `${identityText(persona, false, planning)}\n\n${where === "" ? "" : `${where}\n\n`}Task from the source session:\n${message}`;
+        return toolTime.withMessageTime(
+            `${identityText(persona, false, planning)}\n\n${where === "" ? "" : `${where}\n\n`}Task from the source session:\n${message}`,
+        );
     };
 
     /**
@@ -5327,15 +5333,10 @@ export default function createTeam(host: Host, web: Web) {
         },
     });
 
-    const toolClock = hook(ToolTask, {
-        afterTool: (call, result) =>
-            toolTime.isClockTool("team", call.name) ? toolTime.withToolTime(result) : undefined,
-    });
-
     return defineExtension({
         name: "named-team",
         tools: [delegateTool, work, message, list, teamMemory],
-        hooks: [homeGuard, mcpGuard, privateGuard, toolClock],
+        hooks: [homeGuard, mcpGuard, privateGuard],
         sections: [
             section("named_team", async (input, context) => {
                 const identity = await resolveIdentity(

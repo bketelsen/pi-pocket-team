@@ -3,314 +3,192 @@ import {
     cleanUp,
     context,
     lastText,
-    modelTexts,
     newSession,
     openApp,
     owner,
     root,
     say,
     scriptedModel,
+    until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
 import { cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { boundOutput } from "@earendil-works/chord/output";
-import type { ToolExecutionResult } from "@earendil-works/pi-durable";
-import { isClockTool, toolTimeLine, withToolTime } from "./_tool-time.ts";
-import { digestText } from "./desk.ts";
-import { Identity } from "./team.ts";
+import type { ConversationId } from "@earendil-works/pi-durable";
+import type { Host } from "./_pocket.d.ts";
+import { toolTimeLine, withMessageTime } from "./_tool-time.ts";
+import { digestText, linkedSend as deskSend } from "./desk.ts";
+import { linkedSend as shiftSend } from "./night-shift.ts";
+import { Identity, linkedSend as teamSend } from "./team.ts";
 
 const AT = Date.UTC(2026, 10, 16, 17, 34);
 const UTC_LINE = "Current time: 2026-11-16 17:34 UTC (UTC).";
 const NEW_YORK_LINE = "Current time: 2026-11-16 12:34 EST (America/New_York).";
 const FALLBACK = "Current time unavailable (server clock or time zone could not be read).";
+const CLOCK_LINE = /^Current time: \d{4,}-\d{2}-\d{2} \d{2}:\d{2} [^\r\n]+ \([^\r\n]+\)\.$/m;
 
-/** Pocket's modelTexts serializes the content array; inspect its text, not that JSON encoding. */
-function contentText(serialized: string): string {
-    const content = JSON.parse(serialized) as { type: string; text?: string }[];
+/** Each delivered message has 1 clock line and otherwise keeps its complete body. */
+function stampedBody(message: string): string {
+    const [line, ...body] = message.split("\n");
 
-    return content
-        .filter((item) => item.type === "text")
-        .map((item) => item.text ?? "")
-        .join("\n");
-}
+    assert.match(line ?? "", CLOCK_LINE);
+    assert.equal(message.split("\n").filter((item) => CLOCK_LINE.test(item)).length, 1);
 
-/** Keep every clock and formatter replacement inside this test, including when an assertion fails. */
-async function withClock(run: () => void | Promise<void>): Promise<void> {
-    const now = Date.now;
-    const formatter = Intl.DateTimeFormat;
-    const timeZone = process.env.TZ;
-
-    try {
-        Date.now = () => AT;
-        process.env.TZ = "UTC";
-        await run();
-    } finally {
-        Date.now = now;
-        Intl.DateTimeFormat = formatter;
-
-        if (timeZone === undefined) {
-            delete process.env.TZ;
-        } else {
-            process.env.TZ = timeZone;
-        }
-    }
-}
-
-/** Change only the default-zone read; explicit-zone formatting still uses the real formatter. */
-function defaultZone(read: () => unknown): void {
-    Intl.DateTimeFormat = new Proxy(Intl.DateTimeFormat, {
-        construct(target, args) {
-            return args.length === 0
-                ? { resolvedOptions: () => ({ timeZone: read() }) }
-                : Reflect.construct(target, args);
-        },
-    });
+    return body.join("\n");
 }
 
 after(cleanUp);
 
-test("toolTimeLine formats the exact UTC date, 24-hour time and server zone", () =>
-    withClock(() => {
-        assert.equal(toolTimeLine(), UTC_LINE);
-    }));
+test("toolTimeLine formats injected UTC and New York clocks exactly", () => {
+    assert.equal(toolTimeLine(AT, "UTC"), UTC_LINE);
+    assert.equal(toolTimeLine(AT, "America/New_York"), NEW_YORK_LINE);
+    assert.equal(toolTimeLine(AT + 60_000, "UTC"), "Current time: 2026-11-16 17:35 UTC (UTC).");
+});
 
-test("toolTimeLine reads a changed TZ for the next result", () =>
-    withClock(() => {
-        assert.equal(toolTimeLine(), UTC_LINE);
-        process.env.TZ = "America/New_York";
-        assert.equal(toolTimeLine(), NEW_YORK_LINE);
-    }));
+test("runtime default zone is resolved fresh for every message, with an injected instant", (t) => {
+    const formatter = Intl.DateTimeFormat;
+    let zone = "UTC";
+    let reads = 0;
 
-test("toolTimeLine never caches the default-zone resolution", () =>
-    withClock(() => {
-        let zone = "UTC";
-        let reads = 0;
+    t.mock.method(
+        Intl,
+        "DateTimeFormat",
+        new Proxy(formatter, {
+            construct(target, args) {
+                if (args.length === 0) {
+                    reads += 1;
 
-        defaultZone(() => {
-            reads += 1;
+                    return { resolvedOptions: () => ({ timeZone: zone }) };
+                }
 
-            return zone;
-        });
-        assert.equal(toolTimeLine(), UTC_LINE);
-        zone = "America/New_York";
-        assert.equal(toolTimeLine(), NEW_YORK_LINE);
-        assert.equal(reads, 2, "each result resolves the server time zone anew");
-    }));
+                return Reflect.construct(target, args);
+            },
+        }),
+    );
+    assert.equal(withMessageTime("first", AT), `${UTC_LINE}\nfirst`);
+    zone = "America/New_York";
+    assert.equal(withMessageTime("second", AT), `${NEW_YORK_LINE}\nsecond`);
+    assert.equal(reads, 2);
+});
 
-for (const zone of [undefined, "", "   ", "Not/A_Zone"]) {
-    test(`toolTimeLine gives an honest fallback for zone ${JSON.stringify(zone)}`, () =>
-        withClock(() => {
-            defaultZone(() => zone);
-            assert.equal(toolTimeLine(), FALLBACK);
-        }));
+for (const zone of ["", "   ", "Not/A_Zone"]) {
+    test(`an injected invalid zone ${JSON.stringify(zone)} gives an honest fallback`, () => {
+        assert.equal(toolTimeLine(AT, zone), FALLBACK);
+        assert.equal(
+            withMessageTime("Keep this message.", AT, zone),
+            `${FALLBACK}\nKeep this message.`,
+        );
+    });
 }
 
-for (const clock of [NaN, Infinity, 8.64e15 + 1]) {
-    test(`toolTimeLine gives an honest fallback for invalid clock ${String(clock)}`, () =>
-        withClock(() => {
-            Date.now = () => clock;
-            assert.equal(toolTimeLine(), FALLBACK);
-        }));
+for (const at of [NaN, Infinity, -Infinity, 8.64e15 + 1]) {
+    test(`an injected invalid clock ${String(at)} gives an honest fallback`, () => {
+        assert.equal(toolTimeLine(at, "UTC"), FALLBACK);
+    });
 }
 
-test("toolTimeLine contains a clock read failure", () =>
-    withClock(() => {
-        Date.now = () => {
-            throw new Error("clock unavailable");
-        };
-
-        assert.equal(toolTimeLine(), FALLBACK);
-    }));
-
-test("toolTimeLine contains a formatter construction failure", () =>
-    withClock(() => {
-        Intl.DateTimeFormat = new Proxy(Intl.DateTimeFormat, {
+test("a failed default-zone read cannot block a message", (t) => {
+    t.mock.method(
+        Intl,
+        "DateTimeFormat",
+        new Proxy(Intl.DateTimeFormat, {
             construct() {
                 throw new Error("formatter unavailable");
             },
-        });
-        assert.equal(toolTimeLine(), FALLBACK);
-    }));
-
-test("toolTimeLine contains a formatToParts failure", () =>
-    withClock(() => {
-        Intl.DateTimeFormat = new Proxy(Intl.DateTimeFormat, {
-            construct(target, args) {
-                return args.length === 0
-                    ? Reflect.construct(target, args)
-                    : {
-                          formatToParts() {
-                              throw new Error("formatting failed");
-                          },
-                      };
-            },
-        });
-        assert.equal(toolTimeLine(), FALLBACK);
-    }));
-
-test("withToolTime preserves result fields and output without mutating the original", () =>
-    withClock(() => {
-        const result = {
-            output: [{ type: "text" as const, text: "Existing result." }],
-            isError: true,
-            diagnostics: [{ severity: "error" as const, code: "blocked", message: "Refused." }],
-            details: { retry: false },
-            structuredOutput: { answer: "no" },
-        };
-        const stamped = withToolTime(result);
-
-        assert.notEqual(stamped, result);
-        assert.notEqual(stamped.output, result.output);
-        assert.deepEqual(result.output, [{ type: "text", text: "Existing result." }]);
-        assert.deepEqual(stamped, {
-            ...result,
-            output: [{ type: "text", text: `${UTC_LINE}\nExisting result.` }],
-        });
-        assert.equal(stamped.diagnostics, result.diagnostics);
-        assert.equal(stamped.details, result.details);
-        assert.equal(stamped.structuredOutput, result.structuredOutput);
-    }));
-
-test("withToolTime adds only the clock output when an error has no output", () =>
-    withClock(() => {
-        const result = {
-            isError: true,
-            diagnostics: [{ severity: "error" as const, code: "tool_error", message: "Refused." }],
-        };
-        const stamped = withToolTime(result);
-
-        assert.deepEqual(stamped.output, [{ type: "text", text: UTC_LINE }]);
-        assert.equal(stamped.isError, true);
-        assert.equal(stamped.diagnostics, result.diagnostics);
-        assert.equal(Object.hasOwn(result, "output"), false);
-    }));
-
-test("the shared filter covers exactly the 7 owned names, without double-stamping or near matches", () => {
-    const team = ["team_delegate", "team_work", "team_message", "team_memory", "team_sessions"];
-    const desk = ["desk", "plan"];
-    const excluded = ["", "schedule", "bash", "team", "subagent", "codemode", "events_list"];
-    const names = [...team, ...desk];
-
-    for (const owner of ["team", "desk"] as const) {
-        const expected = owner === "team" ? team : desk;
-
-        for (const name of [...names, ...excluded]) {
-            assert.equal(isClockTool(owner, name), expected.includes(name), `${owner}: ${name}`);
-        }
-
-        for (const name of names) {
-            for (const near of [
-                `${name}_extra`,
-                `nested.${name}`,
-                ` ${name}`,
-                name.toUpperCase(),
-            ]) {
-                assert.equal(isClockTool(owner, near), false, `${owner}: ${near}`);
-            }
-        }
-    }
+        }),
+    );
+    assert.equal(withMessageTime("Keep this message.", AT), `${FALLBACK}\nKeep this message.`);
 });
 
-test("withToolTime changes only the first text item, preserving other items and their order", () =>
-    withClock(() => {
-        const image = { type: "image" as const, data: "AA==", mimeType: "image/png" };
-        const first = { type: "text" as const, text: "" };
-        const last = { type: "text" as const, text: "Original text." };
-        const output = [image, first, image, last];
-        const stamped = withToolTime({ output });
-
-        assert.deepEqual(stamped.output, [image, { ...first, text: `${UTC_LINE}\n` }, image, last]);
-        assert.deepEqual(output, [image, first, image, last]);
-        assert.equal(stamped.output[0], image);
-        assert.equal(stamped.output[2], image);
-        assert.equal(stamped.output[3], last);
-        assert.deepEqual(withToolTime({ output: [image] }).output, [
-            { type: "text", text: UTC_LINE },
-            image,
-        ]);
-        assert.deepEqual(withToolTime({ output: [] }).output, [{ type: "text", text: UTC_LINE }]);
-    }));
-
-/** Mirror Pi Durable's boundContent: concatenate text without separators, replace the first text on head truncation. */
-function boundContent(output: NonNullable<ToolExecutionResult["output"]>) {
-    const texts = output.filter((item) => item.type === "text");
-    const bounded = boundOutput(texts.map((item) => item.text).join(""), {
-        maxBytes: 50 * 1024,
-        maxLines: 2000,
-        retain: "head",
+for (const message of ["", "continue", "First line.\nSecond line."]) {
+    test(`the message clock prefixes exactly 1 line and preserves ${JSON.stringify(message)}`, () => {
+        assert.equal(withMessageTime(message, AT, "UTC"), `${UTC_LINE}\n${message}`);
     });
-
-    return {
-        ...bounded,
-        content:
-            bounded.droppedBytes === 0
-                ? output
-                : output.flatMap((item) =>
-                      item.type !== "text"
-                          ? [item]
-                          : item === texts[0]
-                            ? [{ ...item, text: bounded.text }]
-                            : [],
-                  ),
-    };
 }
 
-for (const limit of ["bytes", "lines"] as const) {
-    for (const delta of [-1, 0, 1]) {
-        test(`the clock survives default head retention at the ${limit} limit ${delta >= 0 ? "+" : ""}${delta}`, () =>
-            withClock(() => {
-                const maximum = limit === "bytes" ? 50 * 1024 : 2000;
-                const size = maximum + delta;
-                const body =
-                    limit === "bytes"
-                        ? "x".repeat(size - Buffer.byteLength(`${UTC_LINE}\n`))
-                        : Array.from({ length: size - 1 }, () => "x").join("\n");
-                const image = { type: "image" as const, data: "AA==", mimeType: "image/png" };
-                const result = withToolTime({
-                    output: [
-                        image,
-                        { type: "text" as const, text: "" },
-                        image,
-                        { type: "text" as const, text: body },
-                    ],
-                });
-                const bounded = boundContent(result.output);
-                const text = bounded.content
-                    .flatMap((item) => (item.type === "text" ? [item.text] : []))
-                    .join("");
-
-                assert.equal(text.split("\n")[0], UTC_LINE);
-                assert.equal(text.split(UTC_LINE).length - 1, 1);
-                assert.equal(bounded.droppedBytes > 0, delta > 0);
-                assert.equal(bounded.content[0], image);
-                assert.equal(bounded.content[2], image);
-                assert.equal(bounded.content.length, delta > 0 ? 3 : 4);
-
-                if (delta <= 0) {
-                    assert.equal(text, `${UTC_LINE}\n${body}`);
-                }
-            }));
+test("the duplicate guard keeps an existing clock, also inside a forwarded brief or after a failure", () => {
+    for (const line of [UTC_LINE, NEW_YORK_LINE, FALLBACK]) {
+        for (const message of [
+            `${line}\nOriginal message.`,
+            `Forwarded brief:\n${line}\nOriginal message.`,
+        ]) {
+            assert.equal(withMessageTime(message, AT + 60_000, "UTC"), message);
+            assert.equal(withMessageTime(withMessageTime(message, AT, "UTC"), AT, "UTC"), message);
+        }
     }
-}
-
-test("the desk digest keeps exactly 1 clock line, in its existing header", () => {
-    const text = digestText([], { at: AT, timeZone: "UTC" });
 
     assert.equal(
-        text,
-        "[desk] digest: 0 new. Now 2026-11-16 17:34 UTC. Read each with desk read <id> before you act.",
+        withMessageTime("Current time: please check it.", AT, "UTC"),
+        `${UTC_LINE}\nCurrent time: please check it.`,
     );
-    assert.equal(text.split("\n").filter((line) => /Now |Current time/.test(line)).length, 1);
 });
 
-test("owned results begin with 1 fresh clock line, including errors and blocks, through the Pocket harness", async () => {
+const DIGEST = digestText([], { at: AT, timeZone: "UTC" });
+
+test("the desk digest keeps only its existing Now header", () => {
+    assert.equal(
+        DIGEST,
+        "[desk] digest: 0 new. Now 2026-11-16 17:34 UTC. Read each with desk read <id> before you act.",
+    );
+    assert.equal(withMessageTime(DIGEST, AT, "UTC"), DIGEST);
+    assert.doesNotMatch(DIGEST, /Current time/);
+});
+
+for (const [name, send] of [
+    ["Team", teamSend],
+    ["Desk", deskSend],
+    ["Shift", shiftSend],
+] as const) {
+    test(`${name} linkedSend stamps a fresh message once and preserves routing, key and follow-up delivery`, async () => {
+        const source = 42 as ConversationId;
+        const calls: {
+            source: ConversationId;
+            request: { to: string; message: string; steer?: boolean };
+            key: string;
+        }[] = [];
+        const host = {
+            linkedSessions: {
+                send: async (
+                    source: ConversationId,
+                    request: { to: string; message: string; steer?: boolean },
+                    key: string,
+                ) => {
+                    calls.push({ source, request, key });
+
+                    return { answers: true };
+                },
+            },
+        } as unknown as Host;
+        const original = { to: "session-worker", message: "First line.\nSecond line." };
+
+        assert.equal(await send(host, source, original, "fresh-message"), undefined);
+        const first = calls[0]!;
+
+        assert.equal(stampedBody(first.request.message), original.message);
+        assert.deepEqual(first, {
+            source,
+            request: { ...original, message: first.request.message, steer: false },
+            key: "fresh-message",
+        });
+        assert.equal(original.message, "First line.\nSecond line.");
+
+        for (const message of [
+            `${UTC_LINE}\nAlready stamped.`,
+            `${FALLBACK}\nUnavailable.`,
+            DIGEST,
+        ]) {
+            await send(host, source, { ...original, message }, "existing-clock");
+            assert.equal(calls.at(-1)?.request.message, message);
+        }
+    });
+}
+
+test("Team start briefs and team_message deliveries carry the clock, not tool results, through Pocket", async () => {
     const definitions = join(root, "clock-agents");
     const dropIns = join(root, "data", "extensions");
     const savedAgents = process.env.PI_POCKET_TEAM_AGENTS;
-    const savedDeskConfig = process.env.PI_POCKET_DESK_CONFIG;
 
     mkdirSync(definitions, { recursive: true });
     mkdirSync(dropIns, { recursive: true });
@@ -318,64 +196,64 @@ test("owned results begin with 1 fresh clock line, including errors and blocks, 
         join(definitions, "odrade.md"),
         "---\nrole: supervisor\n---\n# Odrade\nCoordinate the test team.",
     );
+    writeFileSync(join(definitions, "worker.md"), "# Worker\nDo the isolated test task.");
 
-    writeFileSync(
-        join(definitions, "private-test.md"),
-        "---\nprivate: true\n---\n# Private Test\n",
-    );
-
-    for (const file of [
-        "team.ts",
-        "desk.ts",
-        "_tool-time.ts",
-        "_desk-usage.ts",
-        "_desk-dashboard.ts",
-        "_desk-metrics.ts",
-        "_desk-board.ts",
-        "_desk-meter.ts",
-    ]) {
+    for (const file of ["team.ts", "_tool-time.ts"]) {
         cpSync(join(import.meta.dirname, file), join(dropIns, file));
     }
 
-    for (const folder of ["team-web", "desk-web"]) {
-        cpSync(join(import.meta.dirname, folder), join(dropIns, folder), { recursive: true });
-    }
-
+    cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
+    const incoming: string[] = [];
+    const results: string[] = [];
+    let address = "";
     const model = scriptedModel((request) => {
         const { role, text } = lastText(request as never);
 
         if (role === "toolResult") {
-            return fauxAssistantMessage([fauxText(`tool said: ${text}`)]);
+            results.push(text);
+
+            return fauxAssistantMessage([fauxText("Tool complete.")]);
         }
 
-        const call = text.endsWith("sessions")
-            ? fauxToolCall("team_sessions", {})
-            : text.endsWith("refusal")
-              ? fauxToolCall("desk", { action: "seed" })
-              : text.endsWith("invalid")
-                ? fauxToolCall("team_delegate", {})
-                : text.endsWith("unrelated")
-                  ? fauxToolCall("schedule", { action: 42 })
-                  : text.endsWith("blocked")
-                    ? fauxToolCall("team_work", { task: "Never start this task." })
-                    : fauxToolCall("desk", { action: "issues" });
+        if (text === "delegate clock test") {
+            return fauxAssistantMessage(
+                [
+                    fauxToolCall("team_delegate", {
+                        agent: "worker",
+                        task: "Read this clock brief.",
+                    }),
+                ],
+                { stopReason: "toolUse" },
+            );
+        }
 
-        return fauxAssistantMessage([call], { stopReason: "toolUse" });
+        if (text === "message clock test") {
+            return fauxAssistantMessage(
+                [
+                    fauxToolCall("team_message", {
+                        to: address,
+                        message: "Read this clock follow-up.",
+                    }),
+                ],
+                { stopReason: "toolUse" },
+            );
+        }
+
+        incoming.push(text);
+
+        return fauxAssistantMessage([fauxText("Message received.")]);
     });
 
     try {
         process.env.PI_POCKET_TEAM_AGENTS = definitions;
-        process.env.PI_POCKET_DESK_CONFIG = join(root, "clock-desk.json");
-        writeFileSync(process.env.PI_POCKET_DESK_CONFIG, "{}");
         const app = await openApp(model);
 
         try {
             await app.setExtensionEnabled(owner(app), "team.ts", true);
-            await app.setExtensionEnabled(owner(app), "desk.ts", true);
-            const session = await newSession(app);
+            const source = await newSession(app);
 
             await app.harness.commit(async (tx) => {
-                (await tx.doc(Identity, session)).persona = {
+                (await tx.doc(Identity, source)).persona = {
                     id: "odrade",
                     name: "Odrade",
                     role: "supervisor",
@@ -384,79 +262,47 @@ test("owned results begin with 1 fresh clock line, including errors and blocks, 
                     repositories: {},
                 };
             }, context);
+            await say(app, source, "delegate clock test");
+            await until(
+                () => incoming.some((text) => text.includes("Read this clock brief.")),
+                "the stamped first message",
+            );
+            const first = incoming.find((text) => text.includes("Read this clock brief."))!;
 
-            await withClock(async () => {
-                await say(app, session, "clock sessions");
-                const sessions = contentText((await modelTexts(app, session)).at(-1) ?? "[]");
+            assert.match(first, CLOCK_LINE);
+            assert.equal(first.split("\n").filter((line) => CLOCK_LINE.test(line)).length, 1);
+            assert.match(first, /# Worker\nDo the isolated test task\./);
+            assert.match(first, /Task from the source session:\nRead this clock brief\./);
+            assert(results.some((text) => text.includes("Assigned to Worker")));
+            assert(
+                results.every((text) => !text.includes("Current time")),
+                "tool results carry no clock",
+            );
 
-                assert.equal(sessions, `tool said: ${UTC_LINE}\nNo linked sessions.`);
-                process.env.TZ = "America/New_York";
-                await say(app, session, "clock issues");
-                const issues = contentText((await modelTexts(app, session)).at(-1) ?? "[]");
+            address = (await app.linkedSessions.list(source))[0]!.address;
 
-                assert.equal(issues.split("\n")[0], `tool said: ${NEW_YORK_LINE}`);
-                assert.equal(issues.split(NEW_YORK_LINE).length - 1, 1);
+            await say(app, source, "message clock test");
+            await until(
+                () => incoming.some((text) => text.includes("Read this clock follow-up.")),
+                "the stamped follow-up message",
+            );
+            const followUp = incoming.find((text) => text.includes("Read this clock follow-up."))!;
 
-                await say(app, session, "clock refusal");
-                const refused = contentText((await modelTexts(app, session)).at(-1) ?? "[]");
-
-                assert(refused.startsWith(`tool said: ${NEW_YORK_LINE}`));
-                assert.match(refused, /seed needs path/);
-                assert.equal(refused.split(NEW_YORK_LINE).length - 1, 1);
-                assert.match(refused, /\[error\]/);
-
-                await say(app, session, "clock invalid");
-                const invalid = contentText((await modelTexts(app, session)).at(-1) ?? "[]");
-
-                assert(invalid.startsWith(`tool said: ${NEW_YORK_LINE}`));
-                assert.match(invalid, /\[error\]/);
-                assert.equal(invalid.split(NEW_YORK_LINE).length - 1, 1);
-
-                await say(app, session, "clock unrelated");
-                const unrelated = contentText((await modelTexts(app, session)).at(-1) ?? "[]");
-
-                assert.doesNotMatch(unrelated, /Current time/);
-
-                const privateSession = await newSession(app);
-
-                await app.harness.commit(async (tx) => {
-                    (await tx.doc(Identity, privateSession)).persona = {
-                        id: "private-test",
-                        name: "Private Test",
-                        role: "agent",
-                        model: "",
-                        instructions: "Keep this isolated test private.",
-                        repositories: {},
-                    };
-                }, context);
-                const sessionCount = app.sessions().length;
-
-                await say(app, privateSession, "clock blocked");
-                const blocked = contentText((await modelTexts(app, privateSession)).at(-1) ?? "[]");
-
-                assert(blocked.startsWith(`tool said: ${NEW_YORK_LINE}`));
-                assert.equal(blocked.split(NEW_YORK_LINE).length - 1, 1);
-                assert.match(blocked, /Private Test is a private agent/);
-                assert.match(blocked, /\[error\]/);
-                assert.equal(
-                    app.sessions().length,
-                    sessionCount,
-                    "the blocked call starts no task",
-                );
-            });
+            assert.match(followUp, CLOCK_LINE);
+            assert.equal(followUp.split("\n").filter((line) => CLOCK_LINE.test(line)).length, 1);
+            assert.equal(results.length, 2, "both Team tools returned");
+            assert(
+                results.every((text) => !text.includes("Current time")),
+                "team_message results carry no clock",
+            );
         } finally {
             await app.close();
         }
     } finally {
-        for (const [name, value] of [
-            ["PI_POCKET_TEAM_AGENTS", savedAgents],
-            ["PI_POCKET_DESK_CONFIG", savedDeskConfig],
-        ]) {
-            if (value === undefined) {
-                delete process.env[name!];
-            } else {
-                process.env[name!] = value;
-            }
+        if (savedAgents === undefined) {
+            delete process.env.PI_POCKET_TEAM_AGENTS;
+        } else {
+            process.env.PI_POCKET_TEAM_AGENTS = savedAgents;
         }
     }
 });

@@ -21,7 +21,7 @@ Native clients receive the bound session id in the owner-only thread views, when
 
 ## The tools
 
-A session with a supervisor identity uses `desk`; another session is refused. `desk` and `plan` results begin their first text item with the server's current local date, 24-hour time and zone, including refusals and blocked calls. The clock comes first so Pocket's default output truncation keeps it. If the clock or zone is unavailable, that line says so and keeps the original text after it. Pocket can skip the result hook after repeated restart cutoffs; those terminal results may have no clock line. A digest already carries its time in its header, so it gets no second clock line.
+A session with a supervisor identity uses `desk`; another session is refused. Ordinary linked-session messages from Desk carry 1 clock line before their text: the server's current local date, 24-hour time and zone, read fresh for each new message. If the clock or zone is unavailable, the line says so. A message with an existing clock line keeps it, even when forwarded, so wrapping it again adds no second line. `desk` and `plan` results get no stamp. Digest deliveries keep only their existing `Now …` header.
 
 - `list` and `read`: one line for each open thread, or one thread in full with its agents, repository, sessions, PRs, the wake-ups not sent yet, asks, the last 10 events and the reports.
 - `sync`: sweep the threads now.

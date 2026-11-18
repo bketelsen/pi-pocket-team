@@ -408,9 +408,11 @@ test("linkedSend keeps follow-up delivery arguments", async () => {
     assert.equal(result, undefined);
     assert.deepEqual(call, {
         source,
-        request: { ...request, steer: false },
+        request: { ...request, message: call?.request.message, steer: false },
         key,
     });
+    assert.match(call?.request.message ?? "", /^Current time: [^\n]+\ncontinue$/);
+    assert.equal(request.message, "continue", "the caller's request is unchanged");
 });
 
 const empty = (): DeskState => ({ next: { T: 1, F: 1 }, threads: {}, grants: [], seen: {} });
@@ -30116,7 +30118,10 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 assert.equal(stub.sent.length, 1, "the same call sends once");
                 assert.equal(stub.sent[0]?.source, Number(source), "from the supervisor's session");
                 assert.equal(stub.sent[0]?.to, thread.address);
-                assert.equal(stub.sent[0]?.message, "a check");
+                assert.match(
+                    stub.sent[0]?.message ?? "",
+                    /^Current time: \d{4,}-\d{2}-\d{2} \d{2}:\d{2} [^\r\n]+ \([^\r\n]+\)\.\na check$/,
+                );
                 assert.equal(
                     (await deskState())?.threads[thread.id]?.events.filter((event) =>
                         event.key.startsWith("x.desk.send:"),

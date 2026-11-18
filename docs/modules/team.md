@@ -181,11 +181,13 @@ Pi Pocket sets the child's actual working directory before the first request: pr
 
 **Run-end answers before a desk-tracked start.** Since Pi Pocket 0.28.0, a linked session's run end goes to the session that started it, and starts a run there. Reports come by `team_message` to the desk, so before each desk-tracked start Team calls the desk's optional `reportsOff` for the supervisor, outside any commit: a delegated task, a shift, the Clerk, a plan start (from `team_delegate` and from the Desk page's New plan), and a plan consult. The desk turns the supervisor's run-end answers off once (Pocket's `linkedSessions.reports`, Pi Pocket 0.29.0 and later, and the fork's tags from 0.28.0-bk.1), and records it; see [Desk](desk.md#what-these-parts-do). A failure is 1 warning notice in the supervisor's session, and the start goes on. An older desk has no `reportsOff`: Team skips the call. `team_work` and the Team panel's **Start linked task** do not call it, so their lead keeps its answers, unless that lead is a desk supervisor: the switch is on the lead, so it holds for every session the lead started.
 
-## Tool clock
+## Message clock
 
-Results of Team's own tools (`team_delegate`, `team_work`, `team_message`, `team_memory` and `team_sessions`) begin their first text item with the server's current local date, 24-hour time and zone. Team reads the clock and default zone for each result, including a refusal, blocked call or another tool error. The clock comes before the original text so Pocket's default head-retain output limits keep it. If the clock or zone cannot be read, that line says that the current time is unavailable; the original result otherwise stays intact.
+Every Team-created first linked-session message carries 1 clock line before its brief: delegated tasks, shifts, the Clerk, plans, consults, `team_work` and Team panel starts. Ordinary `linkedSend` deliveries in Team, [Desk](desk.md#the-module-complete) and [Shift](shift.md#delegated-shifts) carry the same line. Tool results get no clock stamp.
 
-The clock uses Pocket's `afterTool` hook, including interruptions when the hook runs. Pocket can skip all such hooks after repeated restart cutoffs, so those terminal results may have no clock line. This does not stamp unrelated tools or desk digest messages.
+The line gives the server's current local date, 24-hour time and zone, such as `Current time: 2026-11-16 12:34 EST (America/New_York).` Each new message reads a fresh `Date.now()` and default zone, not the journal's zone or a cached formatter. The line says that the current time is unavailable if the clock or zone cannot be read. The original message stays intact after it.
+
+A duplicate guard keeps an existing clock line, even inside a forwarded brief, so repeated wrapping adds no second line. It also keeps a digest's existing `Now …` header. Desk digest deliveries remain unchanged. Pocket's stable start and send keys still prevent duplicate deliveries on replay. No date is added to the cached system prompt. The measurement hypothesis and audit source are in [Beacon](../beacon.md#message-clock-trial).
 
 ## Prototype boundaries
 

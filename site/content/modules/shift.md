@@ -2,7 +2,7 @@
 
 "Do X while I am away. Stop only when Y." Pi works in rounds, at any hour; after each round's answer the module decides whether to go on. When the goal stops, Pi writes a summary: what it did, what is left, and why it stopped.
 
-Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 route) and `night-shift-web/` (the status-line item and its sheet). There is no page: you type `/team-shift` in a conversation, and the status-line item under the message box opens the rounds.
+Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 route), `_tool-time.ts` (the shared message clock) and `night-shift-web/` (the status-line item and its sheet). There is no page: you type `/team-shift` in a conversation, and the status-line item under the message box opens the rounds.
 
 ## Use it
 
@@ -60,6 +60,8 @@ State is one document per conversation, `x.night-shift.goal`. It is stored data.
 ## Delegated shifts
 
 A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. Each round also gives the supervisor's address, from the linked session's first message, so Pi can ask a question before then with `team_message`. Its summary also writes 1 line `PRS:` with each PR the shift touched, as `owner/name#N`, or `PRS: none`: the desk puts each PR on the thread. The model-facing schema offers `shift` only. Before schema validation, a compatibility guard accepts the old `night_shift` name, with the same fields, when `shift` is absent. A call that gives both is refused before any session or desk work starts.
+
+Ordinary linked-session reports, including `/team-shift stop` reports, carry 1 clock line with the server's current local date, 24-hour time and zone. The clock and default zone are read fresh for each new message; a failure gives an unavailable line. An existing clock line is kept, even when forwarded, so wrapping it again adds no second line. Desk digests keep their existing `Now …` header instead. Round and summary prompts in the goal's own session stay unchanged.
 
 A shift from the tool takes no free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command itself from `pr`, `repo`, `checks` and `label`. Both modules must be on in **Menu → Extensions**.
 

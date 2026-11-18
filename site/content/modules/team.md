@@ -64,9 +64,9 @@ Pi Pocket's memory has 2 scopes: a project, and everywhere. Team adds a third la
 - **Review on the page.** In the Team panel each agent lists its lessons, waiting ones first, with Approve, Discard, Edit and Forget. A lesson the owner adds there counts at once.
 - **Rules.** A lesson is one line, at most 300 characters. An agent keeps at most 40 approved lessons, and one writer may have at most 20 waiting for each agent. A tool call that runs again after a restart finds the lesson it saved, so it never adds one twice.
 
-## Tool clock
+## Message clock
 
-Team tool results begin their first text item with the server's current local date, 24-hour time and zone, including refusals and blocked calls. The clock comes first so Pocket's default output truncation keeps it. If the clock or zone is unavailable, that line says so and keeps the original text after it. Pocket can skip the result hook after repeated restart cutoffs; those terminal results may have no clock line. Unrelated tools and desk digest messages get no extra stamp.
+Team-created first linked-session messages and ordinary messages sent by Team, Desk and Shift carry 1 clock line before their text. It gives the server's current local date, 24-hour time and zone, read fresh for each new message. If the clock or zone is unavailable, the line says so. A message with an existing clock line keeps it, even when forwarded, so wrapping it again adds no second line. Tool results get no stamp. Desk digests keep their existing `Now …` header and no second clock line. The cached system prompt gets no date.
 
 ## Limits and rules
 

@@ -101,7 +101,11 @@ export async function linkedSend(
     request: { to: string; message: string },
     key: string,
 ): Promise<void> {
-    const compatible = { ...request, steer: false };
+    const compatible = {
+        ...request,
+        message: toolTime.withMessageTime(request.message),
+        steer: false,
+    };
 
     await host.linkedSessions.send(source, compatible, key);
 }
@@ -37579,15 +37583,10 @@ export default function createDesk(host: Host, web: Web) {
         },
     });
 
-    const toolClock = hook(ToolTask, {
-        afterTool: (call, result) =>
-            toolTime.isClockTool("desk", call.name) ? toolTime.withToolTime(result) : undefined,
-    });
-
     return defineExtension({
         name: "desk",
         tools: [tool, planTool],
-        hooks: [consultGuard, noTeamReport, supervisorMessage, noClerkMerge, reminder, toolClock],
+        hooks: [consultGuard, noTeamReport, supervisorMessage, noClerkMerge, reminder],
         tasks: [
             Sweeper,
             NudgeTask,

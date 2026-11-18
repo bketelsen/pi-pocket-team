@@ -63,10 +63,12 @@ test("linkedSend keeps follow-up delivery arguments", async () => {
 
     const result = await linkedSend(host, source, request, key);
 
+    assert.match(call?.request.message ?? "", /^Current time: [^\n]+\ncontinue$/);
+    assert.equal(request.message, "continue", "the caller's request is unchanged");
     assert.equal(result, undefined);
     assert.deepEqual(call, {
         source,
-        request: { ...request, steer: false },
+        request: { ...request, message: call?.request.message, steer: false },
         key,
     });
 });

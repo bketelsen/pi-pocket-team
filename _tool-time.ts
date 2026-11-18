@@ -1,5 +1,4 @@
-/** Shared date formatting and a failure-safe clock line for Team and Desk tool results. */
-import type { ToolExecutionResult } from "@earendil-works/pi-durable";
+/** Shared date formatting and a failure-safe clock line for incoming agent-session messages. */
 
 /** The parts of a time in 1 zone, as `Intl` gives them. */
 function zoneParts(at: number, timeZone: string): Record<string, string> {
@@ -46,37 +45,20 @@ export function deskTime(at: number, timeZone: string): string {
     return `${journalDay(at, timeZone)} ${journalTime(at, timeZone)} ${name}`;
 }
 
-const CLOCK_TOOLS = {
-    team: new Set(["team_delegate", "team_work", "team_message", "team_memory", "team_sessions"]),
-    desk: new Set(["desk", "plan"]),
-};
+/** Recognize our clock even inside a forwarded brief, and a digest's existing timed header. */
+const MESSAGE_CLOCK =
+    /^Current time: \d{4,}-\d{2}-\d{2} \d{2}:\d{2} [^\r\n]+ \([^\r\n]+\)\.$|^Current time unavailable \(server clock or time zone could not be read\)\.$|^\[desk\] digest: \d+ new\. Now [^\r\n]+$/m;
 
-/** Match exact owned names so the 2 hooks cannot stamp each other's or unrelated nested tools. */
-export function isClockTool(owner: "team" | "desk", name: string): boolean {
-    return CLOCK_TOOLS[owner].has(name);
+/** Add at most 1 clock line per message. A repeated or forwarded stamp keeps its original time and text. */
+export function withMessageTime(message: string, at?: number, timeZone?: string): string {
+    return MESSAGE_CLOCK.test(message) ? message : `${toolTimeLine(at, timeZone)}\n${message}`;
 }
 
-/** Prefix the first text item so head-retain limits keep the clock; preserve all other fields and items. */
-export function withToolTime<T extends ToolExecutionResult>(result: T) {
-    const output = [...(result.output ?? [])];
-    const firstText = output.findIndex((item) => item.type === "text");
-    const line = toolTimeLine();
-    const item = output[firstText];
-
-    if (item?.type === "text") {
-        output[firstText] = { ...item, text: `${line}\n${item.text}` };
-    } else {
-        output.unshift({ type: "text", text: line });
-    }
-
-    return { ...result, output };
-}
-
-/** Read the clock and the server's zone for this result, never from the journal configuration or a cached formatter. */
-export function toolTimeLine(): string {
+/** Inject time and zone in tests; runtime reads a fresh clock and default zone, not the journal configuration. */
+export function toolTimeLine(at?: number, timeZone?: string): string {
     try {
-        const at = Date.now();
-        const timeZone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+        at ??= Date.now();
+        timeZone ??= new Intl.DateTimeFormat().resolvedOptions().timeZone;
 
         if (!Number.isFinite(at) || typeof timeZone !== "string" || timeZone.trim() === "") {
             throw new Error("The server clock or time zone is unavailable.");
