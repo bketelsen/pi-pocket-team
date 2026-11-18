@@ -2053,7 +2053,7 @@ describe("Clerk routine closure suppression", () => {
         assert.deepEqual(besideClose, { theirs: [report], ours: [] });
         assert.deepEqual(digestShown(besideClose.theirs), [report]);
         assert.deepEqual(digestText(besideClose.theirs).split("\n"), [
-            "[desk] digest: 1 new. Read each with desk read <id> before you act.",
+            "[desk] digest: 1 new. Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.",
             report.line,
         ]);
     });
@@ -14651,7 +14651,7 @@ describe("the digest's rules", () => {
         ]);
 
         assert.deepEqual(lines(text), [
-            "[desk] digest: 3 new. Read each with desk read <id> before you act.",
+            "[desk] digest: 3 new. Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.",
             "[desk] T12 frostyard/x · lucilla reported (420 chars) · desk read T12",
             "[desk] T36 frostyard/y · closed: done, nothing remains · 1 report · desk read T36",
             "[desk] T39a answered by Brian: yes",
@@ -14668,7 +14668,7 @@ describe("the digest's rules", () => {
                 ]),
             ),
             [
-                "[desk] digest: 2 new. Read each with desk read <id> before you act.",
+                "[desk] digest: 2 new. Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.",
                 "[desk] T1 · closed: done · 2 reports · desk read T1",
                 "[desk] T1a answered by Brian: ok",
             ],
@@ -14683,12 +14683,12 @@ describe("the digest's rules", () => {
         assert.equal(deskTime(at, "UTC"), "2026-10-29 19:20 UTC");
         assert.equal(
             lines(digestText(items, { at, timeZone: "America/New_York" }))[0],
-            "[desk] digest: 1 new. Now 2026-10-29 15:20 EDT. Read each with desk read <id> before you act.",
+            "[desk] digest: 1 new. Now 2026-10-29 15:20 EDT. Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.",
         );
         // Without a time, the header is as before.
         assert.equal(
             lines(digestText(items))[0],
-            "[desk] digest: 1 new. Read each with desk read <id> before you act.",
+            "[desk] digest: 1 new. Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.",
         );
     });
 
@@ -20797,6 +20797,11 @@ describe("the desk in a Pi Pocket", () => {
         assert.match(
             lastDeskSection,
             /Threads that wait on you are yours to act on now: do not wait for a message\./,
+        );
+        assert.match(
+            lastDeskSection,
+            /For routine reads, use desk read <id> with brief: true\. Use a full read only when you need its details to make a decision\./,
+            "the supervisor prompt saves full reads for decisions",
         );
 
         // A turn that names the thread touched it: no queue.

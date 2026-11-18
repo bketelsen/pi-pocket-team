@@ -7800,7 +7800,7 @@ export function digestText(
     const total = escalations.length + shown.length + more;
 
     return [
-        `[desk] digest: ${String(total)} new.${now === undefined ? "" : ` Now ${deskTime(now.at, now.timeZone)}.`} Read each with desk read <id> before you act.`,
+        `[desk] digest: ${String(total)} new.${now === undefined ? "" : ` Now ${deskTime(now.at, now.timeZone)}.`} Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.`,
         ...escalations.map((entry) => entry.line),
         ...shown.map((entry) => entry.line),
         ...(more === 0 ? [] : [`… and ${String(more)} more on the Desk page.`]),
@@ -38759,8 +38759,8 @@ export default function createDesk(host: Host, web: Web) {
                     "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer. Give choices with options when an ask is a pick-one decision.",
                     "A due watch (due: T13 <check>) is yours to send: send the check to the thread's agent, then record its result with desk result.",
                     digest.minutes > 0
-                        ? `Desk news arrives as 1 digest message every ${String(digest.minutes)} minutes (at once for urgent kinds): each line starts with [desk]. Read the full report with desk read <id> before you act.`
-                        : "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
+                        ? `Desk news arrives as 1 digest message every ${String(digest.minutes)} minutes (at once for urgent kinds): each line starts with [desk]. For routine reads, use desk read <id> with brief: true. Use a full read only when you need its details to make a decision.`
+                        : "Reports arrive as 1 line that starts with [desk]. For routine reads, use desk read <id> with brief: true. Use a full read only when you need its details to make a decision.",
                     "Keep each reply to Brian to 1 or 2 lines: the project and the urgency. The Desk holds the rest.",
                 ].join("\n");
             }),
