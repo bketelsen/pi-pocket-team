@@ -130,7 +130,7 @@ const DIGEST = digestText([], { at: AT, timeZone: "UTC" });
 test("the desk digest keeps only its existing Now header", () => {
     assert.equal(
         DIGEST,
-        "[desk] digest: 0 new. Now 2026-11-16 17:34 UTC. Read each with desk read <id> before you act.",
+        "[desk] digest: 0 new. Now 2026-11-16 17:34 UTC. Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.",
     );
     assert.equal(withMessageTime(DIGEST, AT, "UTC"), DIGEST);
     assert.doesNotMatch(DIGEST, /Current time/);
