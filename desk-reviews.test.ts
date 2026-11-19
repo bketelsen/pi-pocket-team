@@ -505,3 +505,82 @@ test("Ready is routine for the Clerk; negative verdicts are urgent by default; i
     assert.match(prompt, /Escalate Not-ready or unclear urgently/);
     assert.match(prompt, /stale Ready must not suppress them/);
 });
+
+test("a negative verdict stops blocking once its PR is merged or closed, and counts again when it reopens", () => {
+    for (const ended of ["MERGED", "CLOSED"] as const) {
+        const reviewer = thread();
+        const s = state(reviewer);
+        const reason = "a current review is not-ready or unclear";
+
+        recordReview(reviewer, verdict({ outcome: "not-ready" }));
+        assert.equal(reviewBlocks(reviewer, s.threads), true);
+        reviewer.prs[ref]!.state = ended;
+
+        const [view] = reviewViews(reviewer, s.threads);
+
+        assert.equal(view?.ended, true);
+        assert.equal(view?.current, false);
+        assert.match(reviewLine(reviewer, view!, s.threads), /PR merged or closed · not current/);
+        assert.equal(reviewBlocks(reviewer, s.threads), false, `${ended}: nothing can act on it`);
+        assert.notEqual(odradeReason(reviewer, s.threads), reason);
+        assert(
+            !closeCheck(reviewer, {
+                now: 40,
+                folders: new Set(),
+                threads: s.threads,
+            }).open.includes(reason),
+            `${ended}: the sweep may close the thread`,
+        );
+        reviewer.prs[ref]!.state = "OPEN";
+        assert.equal(reviewBlocks(reviewer, s.threads), true, "a reopened PR counts again");
+    }
+});
+
+test("a Ready of another open thread's PR names that thread for the Clerk's desk send", () => {
+    const reviewer = thread();
+
+    reviewer.prs = {};
+    const author = thread();
+
+    author.id = "T2";
+    const done = thread();
+
+    done.id = "T3";
+    done.state = "closed";
+    const other = thread();
+
+    other.id = "T4";
+    other.supervisor = 2;
+    const s = state(reviewer);
+
+    Object.assign(s.threads, { T2: author, T3: done, T4: other });
+    recordReview(reviewer, verdict({ kind: "owner-review" }));
+    const [ready] = reviewViews(reviewer, s.threads);
+
+    assert.equal(ready?.current, true);
+    assert.match(
+        reviewLine(reviewer, ready!, s.threads),
+        / · desk read T1 · PR thread T2: desk send this Ready there; no escalation$/,
+        "only the open thread of the same supervisor that holds the PR",
+    );
+
+    // The author's own Ready, and a negative verdict, keep their lines.
+    const own = thread();
+
+    recordReview(own, verdict());
+    assert.match(
+        reviewLine(own, reviewViews(own, state(own).threads)[0]!, state(own).threads),
+        / · no escalation for Ready alone$/,
+    );
+    recordReview(
+        reviewer,
+        verdict({ kind: "owner-review", outcome: "not-ready", key: "n", at: 30 }),
+    );
+    const negative = reviewViews(reviewer, s.threads).find((each) => each.key === "n")!;
+
+    assert.match(reviewLine(reviewer, negative, s.threads), / · urgent: review needs action$/);
+
+    const prompt = identityText({ id: "clerk", name: "Clerk", role: "clerk", repositories: {} });
+
+    assert.match(prompt, /names a PR thread, send the Ready to that thread's agent with desk send/);
+});

@@ -15830,7 +15830,11 @@ export function readText(
 
 // ─── Explicit review evidence ──────────────────────────────────────────────
 
-export type ReviewView = ReviewVerdict & { stale: boolean; current: boolean };
+/**
+ * `ended`: the newest observation of the reviewed PR says MERGED or CLOSED. Nothing on the PR can act on the verdict
+ * any more, so an ended verdict is history: it neither blocks nor wins. A reopened PR makes it count again.
+ */
+export type ReviewView = ReviewVerdict & { stale: boolean; current: boolean; ended: boolean };
 
 /** Validate at the module boundary too: API callers do not pass through the tool schema. */
 export function reviewProblem(review: Omit<ReviewVerdict, "at" | "key">): string | undefined {
@@ -15908,14 +15912,16 @@ export function reviewViews(
             (review.head === undefined ||
                 links[0]?.head !== review.head ||
                 links[0]?.state === "MISSING");
+        const ended = links[0]?.state === "MERGED" || links[0]?.state === "CLOSED";
 
-        return { ...review, stale, current: false };
+        return { ...review, stale, current: false, ended };
     });
     const newest = new Map<string, ReviewView>();
 
     for (const view of views) {
-        // Staleness invalidates Ready only. Negative evidence stays actionable until a newer eligible verdict wins.
-        if (view.stale && view.outcome === "ready") {
+        // Staleness invalidates Ready only. Negative evidence stays actionable until a newer eligible verdict wins, or
+        // until its PR merges or closes: then no one can act on it, and it must not hold the thread open forever.
+        if ((view.stale && view.outcome === "ready") || view.ended) {
             continue;
         }
 
@@ -15941,11 +15947,47 @@ export function reviewWords(review: ReviewView): string {
         .replaceAll("<", "\\u003c")
         .replaceAll(">", "\\u003e");
 
-    return `${review.kind}: ${review.outcome} · reviewer ${reviewer} · ${iso(review.at)}${review.ref === undefined ? " · no PR" : ` · ${review.ref}@${review.head ?? "unknown"}`}${review.stale ? " · stale (PR head differs or is unknown)" : ""} · ${review.current ? "current" : review.stale && review.outcome === "ready" ? "not current" : "superseded"}`;
+    return `${review.kind}: ${review.outcome} · reviewer ${reviewer} · ${iso(review.at)}${review.ref === undefined ? " · no PR" : ` · ${review.ref}@${review.head ?? "unknown"}`}${review.stale ? " · stale (PR head differs or is unknown)" : ""}${review.ended ? " · PR merged or closed" : ""} · ${review.current ? "current" : review.ended || (review.stale && review.outcome === "ready") ? "not current" : "superseded"}`;
 }
 
-export function reviewLine(thread: Thread, review: ReviewView): string {
-    return `[desk] ${thread.id} · ${reviewWords(review)} · desk read ${thread.id}${review.outcome === "ready" ? " · no escalation for Ready alone" : " · urgent: review needs action"}`;
+/** The other open threads of this supervisor that hold the reviewed PR: its author's thread, as a rule. */
+export function reviewPrThreads(
+    thread: Thread,
+    review: Pick<ReviewVerdict, "ref">,
+    threads: Readonly<Record<string, Thread>> = { [thread.id]: thread },
+): string[] {
+    const ref = review.ref?.toLowerCase();
+
+    return ref === undefined
+        ? []
+        : Object.values(threads)
+              .filter(
+                  (each) =>
+                      each.id !== thread.id &&
+                      each.supervisor === thread.supervisor &&
+                      each.state !== "closed" &&
+                      Object.keys(each.prs).some((key) => key.toLowerCase() === ref),
+              )
+              .map((each) => each.id)
+              .sort();
+}
+
+/**
+ * A Ready of another thread's PR goes to that thread's agent (the Clerk sends it with desk send), not to the
+ * supervisor: it starts the author's next step, for example the `ready-for-human` label after an owner review.
+ */
+export function reviewLine(
+    thread: Thread,
+    review: ReviewView,
+    threads?: Readonly<Record<string, Thread>>,
+): string {
+    const others = review.outcome === "ready" ? reviewPrThreads(thread, review, threads) : [];
+    const ready =
+        others.length === 0
+            ? " · no escalation for Ready alone"
+            : ` · PR thread ${others.join(", ")}: desk send this Ready there; no escalation`;
+
+    return `[desk] ${thread.id} · ${reviewWords(review)} · desk read ${thread.id}${review.outcome === "ready" ? ready : " · urgent: review needs action"}`;
 }
 
 /** A current negative verdict remains actionable until a newer matching verdict replaces it. */
@@ -15977,7 +16019,7 @@ export function refreshReviewItems(
             ...item,
             line:
                 index < 0
-                    ? reviewLine(thread, review)
+                    ? reviewLine(thread, review, state.threads)
                     : `[desk] ${thread.id} · ${reviewWords(review)}${item.line.slice(index)}`,
         };
     });
@@ -20781,6 +20823,7 @@ export function recordVerify(
                           reviewViews(planThread, state.threads).find(
                               (each) => each.key === review.key,
                           )!,
+                          state.threads,
                       ),
                       at: request.at,
                   },
@@ -26569,6 +26612,7 @@ export default function createDesk(host: Host, web: Web) {
                             reviewViews(thread, state.threads).find(
                                 (each) => each.key === known.key,
                             )!,
+                            state.threads,
                         ),
                         held: true,
                     };
@@ -26690,7 +26734,7 @@ export default function createDesk(host: Host, web: Web) {
                           text: request.text,
                           quote: host.text.quoted(request.text, 80),
                       })
-                    : `${reviewLine(thread, view)}${reviewUrgent && review?.outcome === "ready" ? " · urgent: another current review needs action" : ""}`;
+                    : `${reviewLine(thread, view, state.threads)}${reviewUrgent && review?.outcome === "ready" ? " · urgent: another current review needs action" : ""}`;
             let line =
                 filedAsks.length === 0 ? reported : `${reported} · asks ${filedAsks.join(", ")}`;
 

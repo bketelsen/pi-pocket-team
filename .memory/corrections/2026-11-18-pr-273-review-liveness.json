@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk review verdicts",
+  "correction": "A negative verdict on a PR that the Desk last saw MERGED or CLOSED is history: it neither blocks the thread nor wakes the supervisor, so a merged PR's thread can close. A current Ready of another open thread's PR names that thread in its digest line, and the Clerk relays it with desk send, so the author still takes its next step after the Clerk stops escalating Ready reviews. A merge from main must keep the PR's own documentation sections.",
+  "evidence": "https://github.com/bketelsen/pi-pocket-team/pull/273; owner review at head beb98bbf11cbfad646b54d9656ce2cb424c92a1a: blocking finding 1 (a Not-ready verdict held a thread open and on the supervisor's queue forever after its PR merged), blocking finding 2 (an owner-review Ready no longer reached the author's thread, which waits for it before ready-for-human), blocking finding 3 (the merge of main dropped the Structured review verdicts section that 5 links point to).",
+  "promoted_to": "desk-reviews.test.ts: a negative verdict stops blocking once its PR is merged or closed, and counts again when it reopens; a Ready of another open thread's PR names that thread for the Clerk's desk send"
+}

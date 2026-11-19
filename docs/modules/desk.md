@@ -30,7 +30,9 @@ observation is stale. The lookup includes other threads of the same supervisor. 
 bounded by the last GitHub read, not a live guarantee. A stale Ready cannot replace a current
 Not-ready or unclear verdict. Staleness silences only Ready: a negative verdict can be both stale and
 current when its head is old, unknown or unobserved. The newest eligible verdict per kind and PR wins;
-a newer Ready clears the negative only at the observed current head.
+a newer Ready clears the negative only at the observed current head. A verdict whose PR the Desk last saw
+`MERGED` or `CLOSED` is history (`PR merged or closed`, not current): nothing can act on it, so it neither
+blocks the thread, wakes the supervisor, nor clears another verdict. A reopened PR makes it count again.
 
 Full and brief `desk read`, `desk list`, the page and digest lines show reviewer, outcome,
 kind, time, optional PR/head, and current/stale/superseded state. Each exported thread file with evidence
@@ -38,6 +40,10 @@ also has a Reviews section. Reviewer labels are quoted data, with angle brackets
 Review lines remain visible
 beside a closed-thread digest line. Pending digest lines refresh against the latest known head.
 Ready alone needs no escalation; the Clerk must not turn review prose into a request for Brian.
+A Ready of a PR that another open thread of the same supervisor holds (as a rule, the author's thread)
+names that thread in its digest line: `PR thread T5: desk send this Ready there; no escalation`. The Clerk
+sends it there with `desk send`, so the author takes its next step (for example `ready-for-human` after an
+owner review), and the supervisor is not woken.
 Not-ready and unclear stay actionable and urgent (`review-blocked`), even when stale. Explicit
 asks and `status: blocked` still apply; structured reviews bypass the legacy prose parser.
 `desk escalate` stays Clerk-only, and the default interval stays 15 minutes.

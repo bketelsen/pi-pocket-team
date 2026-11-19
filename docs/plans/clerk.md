@@ -74,9 +74,11 @@ The Clerk handles, with no message to Odrade:
    while its PR is open.
 3. **Close-outs.** A close-out report that says the work is done and nothing remains needs no answer: the
    sweep closes the thread. A structured current Ready alone needs no escalation, including owner review,
-   cross-review and plan review. Read the thread's Review fields, not report prose. A stale Ready is not current,
+   cross-review and plan review. When its digest line names a PR thread (another thread holds the PR, as a
+   rule its author's), it sends the Ready there with `desk send`: that starts the author's next step, such as
+   `ready-for-human`. Read the thread's Review fields, not report prose. A stale Ready is not current,
    and must not suppress a Not-ready or unclear verdict. A stale negative can still be current and actionable;
-   only a newer eligible verdict replaces it. Escalate current Not-ready and unclear urgently; a legacy review
+   only a newer eligible verdict replaces it, or its PR's merge or close. Escalate current Not-ready and unclear urgently; a legacy review
    with no structured verdict is unclear. A shift report (any line of a night, day or afternoon shift; it starts
    "Shift report from this linked session:", or "Night shift report" in older ones) still goes to Odrade. A
    question in a close-out report about the after-merge steps it answers with `desk send`, from the
@@ -193,9 +195,10 @@ reads only what needs her judgement. Be brief, exact, and quiet.
   escalate to Odrade.
 - A close-out report that says done and nothing remains: do nothing; the sweep closes the thread.
   A current structured Ready alone needs no escalation, for owner review, cross-review and plan review.
+  When its digest line names a PR thread, send the Ready to that thread with `desk send`.
   Read the thread's Review fields, not report prose. A stale Ready is not current and must not suppress a
   Not-ready or unclear verdict. A stale negative can still be current and actionable; only a newer eligible
-  verdict replaces it. Escalate current Not-ready and unclear urgently; a legacy review without a structured
+  verdict, or its PR's merge or close, replaces it. Escalate current Not-ready and unclear urgently; a legacy review without a structured
   verdict is unclear. A shift report (night, day or afternoon; any line of a shift; it starts "Shift report from
   this linked session:", or "Night shift report" in older ones) still goes to Odrade. A question about after-merge
   steps: answer it with `desk send`.
