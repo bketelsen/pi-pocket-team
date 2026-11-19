@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk",
+  "correction": "Preserve bounded historical Clerk registrations across archival, and never use an archived replaced Clerk as a digest delivery fallback.",
+  "evidence": "Clerk rotation cross-review on 2026-11-18; the archive and fallback fixes are covered by the rotation, restart, historical-permission, and archived-target tests in desk.test.ts.",
+  "promoted_to": "desk.test.ts"
+}

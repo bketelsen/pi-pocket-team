@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk",
+  "correction": "Rotate a Clerk by a bounded digest count as well as the day boundary so daily-only rotation cannot leave the context near its compaction limit.",
+  "evidence": "bketelsen/pi-pocket-team#271, owner review of 206afe4; desk.test.ts covers six-digest rotation, replay, date boundaries, and persisted delivery.",
+  "promoted_to": "desk.test.ts"
+}

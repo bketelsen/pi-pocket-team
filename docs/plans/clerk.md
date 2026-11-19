@@ -18,15 +18,21 @@ wakes Odrade only for judgement.
 
 - A named agent with `role: clerk` in its profile (`~/.config/pi-pocket-team/agents/clerk.md`). Its
   `workspace` is Odrade's desk folder (`~/agents/odrade`).
-- 1 long-lived linked session of the supervisor. Odrade starts it once with
-  `team_delegate agent=clerk task="Run the desk."`. The start registers it as her Clerk on the desk. It
-  opens no desk thread and does not count toward the cap.
+- 1 bounded-context linked session of the supervisor. Odrade starts it once with
+  `team_delegate agent=clerk task="Run the desk."`. The start registers it as her Clerk on the desk. After 6 routine
+  Clerk digests, or at the first such digest of a later local day, the desk rotates it to a fresh session from the
+  current profile. It opens no desk thread and does not count toward the cap.
 - Its model is the profile's `model`. **The Clerk never falls back to the supervisor's model:** when the
   profile has no model, or the owner's allowed list for subagents does not hold it, `team_delegate` refuses
   the start and names the setting to fix. The model is `github-copilot/gpt-6-luna`.
-- 1 Clerk for each supervisor. A second start while the first one's session is there is refused with its
-  address. When the Clerk's session is archived, the sweep removes the registration, and desk news goes to
-  the supervisor again.
+- 1 active Clerk for each supervisor. A second manual start while the active session is there is refused with its
+  address. The active registration keeps earlier sessions in `history` for 14 days, so in-flight digests and
+  escalations can finish and the 7-day usage window stays attributed. Team archives each replaced session. A digest
+  that rotates records its target and fallback before delivery. A digest taken before midnight stays with its
+  recorded Clerk. Rotation failure keeps the prior Clerk and does not advance its counter or cycle, so a later digest
+  retries the same bounded key; delivery failure then goes to the supervisor. When the
+  active Clerk's session is archived, the sweep moves retained registrations to `retiredClerks`, and desk news goes to
+  the supervisor again; historical Clerk calls still map to that supervisor.
 
 ## 3. Routing
 
@@ -43,8 +49,9 @@ digest, the desk splits the items:
   `["report", "shift", "closed", "queue", "plan-decided"]` (`DIGEST_CLERK` in `desk.ts`). A kind in
   `digest.now` always goes to the supervisor. The default `digest.now` (`DIGEST_NOW` in `desk.ts`) is the
   list of the last row of the table above.
-- When the Clerk's session cannot take a message (it is gone, or held back), its items go to the
-  supervisor in the same digest, with 1 notice.
+- When the new Clerk's session cannot take a message (it is gone, or held back), the items go to the supervisor in
+  the same digest, with 1 notice. The replaced Clerk is archived and is not a delivery fallback. If rotation itself
+  failed, the still-active old Clerk remains the first target.
 - Escalations from the Clerk to Odrade go through `desk escalate` (since 2026-11-06; before, they were
   `team_message`s that woke her at once). The desk drops an escalation that repeats news she has (Section
   4), and puts every other one in her next digest as the kind `escalation`. An escalation with
@@ -134,9 +141,10 @@ the desk.
 
 ## 6. How Odrade hands it work
 
-1. Once: `team_delegate agent=clerk task="Run the desk."` The result gives the Clerk's address.
-2. Routine desk news then goes to the Clerk by itself (Section 3).
-3. Odrade can send it a task at any time with `team_message` to that address: "record T121 in decided.md",
+1. Once: `team_delegate agent=clerk task="Run the desk."` The result gives the active Clerk's address.
+2. Routine desk news then goes to the active Clerk by itself (Section 3). The desk rotates that session after 6
+   routine Clerk digests, or at the first such digest of a new local day, and then shows the new address.
+3. Odrade can send it a task at any time with `team_message` to the active address: "record T121 in decided.md",
    "send the after-merge check of T95 to Lucilla". The Clerk answers only when the task asks for a result.
 4. Odrade's desk section shows `Clerk: <address>` while one is registered.
 
@@ -208,10 +216,17 @@ does that. Write to Odrade in ASD-STE100.
 
 ## 8. Restart safety and stored data
 
-- `DeskState.clerks?: Record<supervisor id, { session: number; address: string; agent: string; at: number; key?: string }>`:
-  new and optional. The registration lands in the same commit as the Clerk's identity, and stores the
-  start's replay key (`key`): a replay of the same `team_delegate` call registers once and gives the same
-  reply, while a new call is refused when a live Clerk is there.
+- `DeskState.clerks?: Record<supervisor id, Clerk>` stores the active registration. `Clerk` has the original
+  `session`, `address`, `agent`, `at` and `key`, plus optional `cwd` and 14-day `history` registrations.
+  `DeskState.retiredClerks` keeps those registrations when the active session is archived.
+  The registration lands in the same commit as the Clerk's identity. A manual replay or delayed historical
+  registration cannot reactivate an old session; a replay key with the date and cycle returns its session from active
+  or history.
+  A new manual call is refused when a live active Clerk is there.
+- A digest target's optional `rotation` holds the date-and-cycle key and take time. The `deliver` phase resolves it through
+  Team, commits a fixed conversation and supervisor fallback, then submits. A restart submits with the same target,
+  text and request id. In-flight `escalate` calls retain access: historical Clerk sessions still map to the
+  supervisor and to the Clerk agent for permissions and usage accounting.
 - `team_delegate` refuses a `shift` (or its old name `night_shift`) or a `watch` for the Clerk: it has no desk thread.
 - The desk API has 2 new members: `clerk` (register) and `clerkOf` (the read before a start).
 - `desk send` uses the key `x.desk.send:<task>:<call>`: a replay sends once.
