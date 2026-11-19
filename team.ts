@@ -85,6 +85,20 @@ const TEAM_API = Symbol.for("pi-pocket-team.team");
  */
 export const IDENTITY_LISTENERS = Symbol.for("pi-pocket-team.identity-changed");
 
+/**
+ * MAI-Code (github-copilot/mai-code-2 and github-copilot/mai-code-2-flash) runs only worker subagents for code, never
+ * a session: the supervisor, a named agent, a linked task, a planning or consult session, the Clerk, or an events session.
+ */
+export const WORKER_ONLY_MODEL = /(^|\/)mai-code-[^/]*$/i;
+
+export function workerOnlyModel(model: string): boolean {
+    return WORKER_ONLY_MODEL.test(model.trim());
+}
+
+export function workerOnlyText(model: string): string {
+    return `${model} runs only worker subagents for code, never a session`;
+}
+
 /** The shared set of identity listeners, made on first use. */
 export function identityListeners(): Set<(session: number) => void> {
     const holder = globalThis as { [IDENTITY_LISTENERS]?: Set<(session: number) => void> };
@@ -2951,6 +2965,12 @@ export default function createTeam(host: Host, web: Web) {
             );
         }
 
+        if (workerOnlyModel(persona.model)) {
+            throw new Error(
+                `${workerOnlyText(persona.model)}. Brian sets the Clerk's model in its profile (${persona.id}.md), from the owner's allowed list for subagents. The Clerk never uses your model.`,
+            );
+        }
+
         if (!allowed.includes(persona.model)) {
             throw new Error(
                 `${persona.model} is not in the owner's allowed list for subagents. Brian sets the Clerk's model in its profile (${persona.id}.md), from the list: ${allowed.join(", ") || "none"}. The Clerk never uses your model.`,
@@ -3591,7 +3611,10 @@ export default function createTeam(host: Host, web: Web) {
                 role: agent.role,
                 repositories: agent.repositories,
                 ...(agent.home === undefined ? {} : { home: agent.home }),
-                ...(agent.model === "" ? {} : { model: agent.model }),
+                // A worker-only model never runs the agent's session.
+                ...(agent.model === "" || workerOnlyModel(agent.model)
+                    ? {}
+                    : { model: agent.model }),
                 ...(agent.private === true ? { private: true as const } : {}),
                 mcp: [...(agent.mcp ?? [])],
             })),
@@ -3609,6 +3632,12 @@ export default function createTeam(host: Host, web: Web) {
             if (identity.persona?.role !== "supervisor") {
                 throw new Error(
                     `Conversation ${String(request.supervisor)} is not a supervisor's: a plan starts from the supervisor's conversation.`,
+                );
+            }
+
+            if (request.model !== undefined && workerOnlyModel(request.model)) {
+                throw new Error(
+                    `${workerOnlyText(request.model)}: choose another model, or none for the lead's profile model.`,
                 );
             }
 
@@ -4101,6 +4130,13 @@ export default function createTeam(host: Host, web: Web) {
         async (req) => {
             const persona = await find(req.body.agent);
 
+            if (req.body.usePreferredModel === true && workerOnlyModel(persona.model)) {
+                throw web.error(
+                    400,
+                    `${workerOnlyText(persona.model)}: start without the preferred model.`,
+                );
+            }
+
             // A private agent's session is Brian's own: the panel opens an empty session in the agent's home, bound to
             // the person who asks, and linked to no other session. He types the first message there, so the panel sends
             // no message and needs no key: nothing here can act for the last writer of the source.
@@ -4334,12 +4370,18 @@ export default function createTeam(host: Host, web: Web) {
 
     // The profile model, only when the owner's allowed list for subagents has it.
     const allowedModel = (persona: Persona) =>
-        persona.model && host.subagentModels().includes(persona.model) ? persona.model : undefined;
+        persona.model &&
+        !workerOnlyModel(persona.model) &&
+        host.subagentModels().includes(persona.model)
+            ? persona.model
+            : undefined;
     const modelText = (persona: Persona) =>
-        allowedModel(persona) ??
-        (persona.model
-            ? `your model (${persona.model} is not allowed for subagents)`
-            : "your model (no profile model)");
+        workerOnlyModel(persona.model)
+            ? `your model (${workerOnlyText(persona.model)})`
+            : (allowedModel(persona) ??
+              (persona.model
+                  ? `your model (${persona.model} is not allowed for subagents)`
+                  : "your model (no profile model)"));
 
     /** What 1 plan start needs of its caller: the tool's session, or the desk page's request. */
     type PlanStartDeps = {
@@ -4436,6 +4478,12 @@ export default function createTeam(host: Host, web: Web) {
         if ((input.issue !== undefined || input.source === "page") && desk.planSources !== true) {
             throw new Error(
                 "The desk module is too old for a plan of an issue or of the page: Brian installs both modules from 1 checkout.",
+            );
+        }
+
+        if (input.model !== undefined && workerOnlyModel(input.model)) {
+            throw new Error(
+                `${workerOnlyText(input.model)}: choose another model, or none for the lead's profile model.`,
             );
         }
 
