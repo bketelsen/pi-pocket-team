@@ -2621,6 +2621,7 @@ type ReviewCall = {
     refs?: string[];
     bare?: number[];
     head?: string | null;
+    compat?: boolean;
 };
 
 type ReviewAnswer = {
@@ -3201,7 +3202,7 @@ test("Q1 rounds case 7: 2 reviewers of the same head of 1 PR are 1 reviewed head
 });
 
 // Case 8: a reviewer chain with no head at all: a spawn and 2 sends, with answers between.
-test("Q1 rounds case 8: a reviewer chain with no head is 1 round", () => {
+test("Q1 rounds case 8: a reviewer chain with no head is no round", () => {
     const t1 = thread("T1");
     const s = t1.session;
     const at = ago(DAY);
@@ -3219,20 +3220,9 @@ test("Q1 rounds case 8: a reviewer chain with no head is 1 round", () => {
         q1Ctx([]),
     );
 
-    assert.deepEqual(
-        result.metrics.rounds.prs.map((item: { rounds: number }) => item.rounds),
-        [1],
-    );
-    assert.deepEqual(
-        result.metrics.prRounds.prs.map(
-            (item: { rounds: number; heads: number; calls: number }) => [
-                item.rounds,
-                item.heads,
-                item.calls,
-            ],
-        ),
-        [[1, 0, 3]],
-    );
+    assert.deepEqual(result.metrics.rounds.prs, []);
+    assert.deepEqual(result.metrics.prRounds.prs, []);
+    assert.equal(result.metrics.prRounds.totals.unheaded, 1);
 });
 
 // Case 9: a real re-review message names the old head first; the new head counts.
@@ -3864,7 +3854,7 @@ test("Q1 prRounds: reviewed heads per PR from the session records; a send takes 
         named(sendTo(s, at + 2 * MINUTE, "reviewer"), [], [], HEAD_C),
         // A send with no head takes C: no new reviewed head, but 1 more call.
         named(sendTo(s, at + 150_000, "reviewer")),
-        // A bare number goes to the repository of the session's desk thread.
+        // A bare number in a review call is unattributed.
         named(reviewerSpawn(s, at + 3 * MINUTE, "rv5"), [], [5]),
         // A coder call names a PR and is no round.
         named(coderSpawn(s, at + 4 * MINUTE), ["acme/widgets#6"]),
@@ -3885,24 +3875,26 @@ test("Q1 prRounds: reviewed heads per PR from the session records; a send takes 
         method: "sessions",
         windowDays: 30,
         totals: {
-            prs: 2,
-            rounds: 4,
-            calls: 5,
-            mean: 2,
-            median: 2,
+            prs: 1,
+            rounds: 3,
+            calls: 4,
+            mean: 3,
+            median: 3,
             p90: 3,
             atLeast3: 1,
-            unattributed: 1,
+            unattributed: 2,
+            checks: 0,
+            unheaded: 0,
         },
         workers: {
             none: {
-                prs: 2,
-                rounds: 4,
-                mean: 2,
-                median: 2,
+                prs: 1,
+                rounds: 3,
+                mean: 3,
+                median: 3,
                 p90: 3,
                 weeks: {
-                    "2026-10-19": { prs: 2, rounds: 4, mean: 2, median: 2 },
+                    "2026-10-19": { prs: 1, rounds: 3, mean: 3, median: 3 },
                 },
             },
         },
@@ -3912,18 +3904,10 @@ test("Q1 prRounds: reviewed heads per PR from the session records; a send takes 
                 rounds: 3,
                 heads: 3,
                 calls: 4,
+                checks: 0,
+                headless: 0,
                 first: "2026-10-21T14:00Z",
                 last: "2026-10-21T14:02Z",
-                worker: "none",
-                models: [],
-            },
-            {
-                ref: "acme/widgets#5",
-                rounds: 1,
-                heads: 0,
-                calls: 1,
-                first: "2026-10-21T14:03Z",
-                last: "2026-10-21T14:03Z",
                 worker: "none",
                 models: [],
             },
@@ -3951,9 +3935,12 @@ test("Q1 prRounds: a multi-PR worker sequence attributes bare PRs and excludes r
             [],
             [5],
         ),
-        named({ ...reviewerSpawn(s, at + 2 * MINUTE, "review-agents-md"), model: worker }, [
-            "acme/widgets#16",
-        ]),
+        named(
+            { ...reviewerSpawn(s, at + 2 * MINUTE, "review-agents-md"), model: worker },
+            ["acme/widgets#16"],
+            [],
+            HEAD_A,
+        ),
         named({
             ...coderSpawn(s, at + 3 * MINUTE, "agents-symlink-fix"),
             model: worker,
@@ -3997,6 +3984,180 @@ test("Q1 prRounds: a multi-PR worker sequence attributes bare PRs and excludes r
             ["acme/widgets#5", "none", 1],
         ],
     );
+});
+
+test("Q1 prRounds: a PR with 0 reviews has no row and leaves totals unchanged", () => {
+    const t1 = thread("T1", { prs: { "acme/widgets#12": {} } });
+    const baseline = checkQ1(emptyData({ decided: todayEmpty }), q1Ctx([])).metrics.prRounds;
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [],
+            reviewAnswers: [],
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(result.metrics.prRounds.prs, []);
+    assert.deepEqual(result.metrics.rounds.prs, []);
+    assert.deepEqual(result.metrics.prRounds.totals, baseline.totals);
+    assert.equal(result.metrics.prRounds.totals.checks, 0);
+    assert.equal(result.metrics.prRounds.totals.unheaded, 0);
+});
+
+test("Q1 prRounds: a PR with 1 answered review has 1 reviewed head and no checks or headless calls", () => {
+    const t1 = thread("T1");
+    const at = ago(DAY);
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [named(reviewerSpawn(t1.session, at), ["acme/widgets#12"], [], HEAD_A)],
+            reviewAnswers: [answerOf(t1.session, at + MINUTE)],
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(
+        result.metrics.prRounds.prs.map(
+            (row: {
+                ref: string;
+                rounds: number;
+                heads: number;
+                calls: number;
+                checks: number;
+                headless: number;
+            }) => ({
+                ref: row.ref,
+                rounds: row.rounds,
+                heads: row.heads,
+                calls: row.calls,
+                checks: row.checks,
+                headless: row.headless,
+            }),
+        ),
+        [{ ref: "acme/widgets#12", rounds: 1, heads: 1, calls: 1, checks: 0, headless: 0 }],
+    );
+    assert.deepEqual(
+        result.metrics.rounds.prs.map((row: { ref: string; rounds: number }) => [
+            row.ref,
+            row.rounds,
+        ]),
+        [["acme/widgets#12", 1]],
+    );
+});
+
+test("Q1 prRounds: headless-only PRs have no row; a new headless chain does not inherit another chain's head", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(s, at, "rv-x"), ["acme/widgets#12"]),
+                named(reviewerSpawn(s, at, "rv-y"), ["acme/widgets#13"], [], HEAD_A),
+                named(reviewerSpawn(s, at + 2 * MINUTE, "rv-new"), ["acme/widgets#13"]),
+                named(sendTo(s, at + 3 * MINUTE, "rv-new"), ["acme/widgets#13"]),
+            ],
+            reviewAnswers: [
+                answerOf(s, at + MINUTE, "rv-x"),
+                answerOf(s, at + MINUTE, "rv-y"),
+                answerOf(s, at + 4 * MINUTE, "rv-new"),
+            ],
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(
+        result.metrics.prRounds.prs.map(
+            (row: { ref: string; rounds: number; heads: number; headless: number }) => [
+                row.ref,
+                row.rounds,
+                row.heads,
+                row.headless,
+            ],
+        ),
+        [["acme/widgets#13", 1, 1, 1]],
+    );
+    assert.equal(result.metrics.prRounds.totals.unheaded, 1);
+    assert.deepEqual(
+        result.metrics.rounds.prs.map((row: { ref: string; rounds: number }) => [
+            row.ref,
+            row.rounds,
+        ]),
+        [["acme/widgets#13", 1]],
+    );
+});
+
+test("Q1 prRounds: a merge-of-main compatibility check is separate from the 2 reviewed heads", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(s, at), ["acme/widgets#12"], [], HEAD_A),
+                named(sendTo(s, at + 2 * MINUTE, "reviewer"), [], [], HEAD_B),
+                named({ ...sendTo(s, at + 4 * MINUTE, "reviewer"), compat: true }, [], [], HEAD_C),
+            ],
+            reviewAnswers: [0, 1, 2].map((k) => answerOf(s, at + (2 * k + 1) * MINUTE)),
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(
+        result.metrics.prRounds.prs.map(
+            (row: {
+                ref: string;
+                rounds: number;
+                heads: number;
+                calls: number;
+                checks: number;
+                headless: number;
+            }) => [row.ref, row.rounds, row.heads, row.calls, row.checks, row.headless],
+        ),
+        [["acme/widgets#12", 2, 2, 3, 1, 0]],
+    );
+    assert.equal(result.metrics.prRounds.totals.checks, 1);
+    assert.equal(result.metrics.prRounds.totals.rounds, 2);
+    assert.deepEqual(
+        result.metrics.rounds.prs.map((row: { ref: string; rounds: number; at: string }) => [
+            row.ref,
+            row.rounds,
+            row.at,
+        ]),
+        [["acme/widgets#12", 2, new Date(at + 2 * MINUTE).toISOString().slice(0, 16) + "Z"]],
+    );
+});
+
+test("Q1 prRounds: bare list labels in a review brief do not attribute frostread PR 1", () => {
+    const t1 = thread("T1", { repo: "frostyard/frostread" });
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(
+                    { ...reviewerSpawn(t1.session, ago(DAY)), brief: "Review PR 1:, PR 2:, PR 3:" },
+                    [],
+                    [1, 2, 3],
+                    HEAD_A,
+                ),
+            ],
+            reviewAnswers: [answerOf(t1.session, ago(DAY) + MINUTE)],
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(result.metrics.prRounds.prs, []);
+    assert.deepEqual(result.metrics.rounds.prs, []);
+    assert.equal(result.metrics.prRounds.totals.unattributed, 1);
+    assert.equal(result.metrics.prRounds.totals.unheaded, 0);
 });
 
 test("Q1 prRounds: 2 distinct worker models give worker mixed", () => {

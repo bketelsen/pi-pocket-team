@@ -9,7 +9,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { checkQ1, isCrossReviewSpawn } from "./checks.mjs";
 import { guardCacheOf } from "./reviews.mjs";
-import { DAY, HOUR } from "./common.mjs";
+import { DAY, HOUR, MINUTE } from "./common.mjs";
 import { NOW } from "./fixtures/builders.mjs";
 import { SESSION_T1, SESSION_T2, SUPERVISOR, createFixtureDb } from "./fixtures/pocket-db.mjs";
 import {
@@ -1626,11 +1626,70 @@ test("loadReviewCalls gives spawn and send rows, and skips other actions and row
         refs: [],
         bare: [],
         head: null,
+        compat: false,
     });
     // The 20-day-old spawn is older than 10 days.
     assert.deepEqual(
         recent.map((call: { name: string }) => call.name),
         ["w", "audit", "audit"],
+    );
+});
+
+test("loadReviewCalls: compatibility-check spawns and sends have compat true; normal reviews have false", () => {
+    const { pocketDir } = setup();
+
+    addRows(pocketDir, (db) => {
+        insertEntry(db, 100, SUPERVISOR, NOW - MINUTE, [
+            {
+                type: "toolCall",
+                id: "compat-spawn",
+                name: "subagent",
+                arguments: {
+                    action: "spawn",
+                    name: "compat",
+                    tools: ["read", "bash"],
+                    message: "Compatibility check for PR acme/widgets#12 after a merge of main",
+                },
+            },
+            {
+                type: "toolCall",
+                id: "normal-spawn",
+                name: "subagent",
+                arguments: {
+                    action: "spawn",
+                    name: "normal",
+                    tools: ["read", "bash"],
+                    message: "Review acme/widgets#12 for blocking defects",
+                },
+            },
+            {
+                type: "toolCall",
+                id: "compat-send",
+                name: "subagent",
+                arguments: {
+                    action: "send",
+                    name: "compat",
+                    message: "Compatibility check for PR acme/widgets#12 after a merge of main",
+                },
+            },
+        ]);
+    });
+
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const calls = loadReviewCalls(db, NOW - MINUTE);
+
+    db.close();
+    assert.deepEqual(
+        calls.map((call: { action: string; name: string; compat: boolean }) => [
+            call.action,
+            call.name,
+            call.compat,
+        ]),
+        [
+            ["spawn", "compat", true],
+            ["spawn", "normal", false],
+            ["send", "compat", true],
+        ],
     );
 });
 
@@ -3729,6 +3788,8 @@ test("loadData and Q1: a spawn 60 days ago with a send and a blocking answer 29 
             rounds: 1,
             heads: 1,
             calls: 1,
+            checks: 0,
+            headless: 0,
             first: new Date(NOW - 29 * DAY).toISOString().slice(0, 16) + "Z",
             last: new Date(NOW - 29 * DAY).toISOString().slice(0, 16) + "Z",
             worker: "none",
