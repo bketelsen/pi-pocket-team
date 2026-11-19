@@ -536,6 +536,130 @@ test("a negative verdict stops blocking once its PR is merged or closed, and cou
     }
 });
 
+test("Ready relay routing is removed when a queued verdict becomes stale, ended or superseded", () => {
+    for (const change of ["head", "merged", "closed", "ready", "not-ready"] as const) {
+        const reviewer = thread();
+
+        reviewer.prs = {};
+        const author = thread();
+
+        author.id = "T2";
+        author.address = "session-author";
+        const s = state(reviewer);
+
+        s.threads[author.id] = author;
+        recordReview(reviewer, verdict());
+        const notes = " · asks T1a · explicit blocked status or refused ask: action needed";
+        const item = {
+            key: "report:review:1",
+            thread: reviewer.id,
+            reviewKey: "review:1",
+            kind: "report" as const,
+            at: 20,
+            line: reviewLine(reviewer, reviewViews(reviewer, s.threads)[0]!, s.threads) + notes,
+        };
+
+        assert.match(item.line, /PR thread T2: desk send this Ready there/);
+        assert.equal(refreshReviewItems([item], s)[0]!.line, item.line);
+
+        if (change === "head") {
+            author.prs[ref]!.head = oldHead;
+        } else if (change === "merged" || change === "closed") {
+            author.prs[ref]!.state = change === "merged" ? "MERGED" : "CLOSED";
+        } else {
+            recordReview(reviewer, verdict({ key: "newer", at: 30, outcome: change }));
+        }
+
+        const oldView = reviewViews(reviewer, s.threads).find(
+            (each) => each.key === item.reviewKey,
+        )!;
+        const refreshed = refreshReviewItems([item], s);
+        const line = refreshed[0]!.line;
+
+        assert.equal(oldView.current, false, change);
+        assert.match(
+            line,
+            change === "ready" || change === "not-ready" ? /superseded/ : /not current/,
+        );
+
+        if (change === "head") {
+            assert.match(line, /stale/);
+        }
+
+        assert.doesNotMatch(line, /PR thread|desk send this Ready/, change);
+        assert.doesNotMatch(
+            reviewLine(reviewer, oldView, s.threads),
+            /PR thread|desk send this Ready/,
+            change,
+        );
+        assert(line.endsWith(notes), "explicit asks and blocked status survive routing refresh");
+        assert.equal(refreshReviewItems(refreshed, s)[0]!.line, line, "refresh is idempotent");
+    }
+});
+
+test("Ready relay targets are only open addressed threads with non-window PR links", () => {
+    for (const mode of [
+        "seen",
+        "branch",
+        "attached",
+        "window",
+        "parked",
+        "starting",
+        "closed",
+        "unaddressed",
+        "empty-address",
+        "other-supervisor",
+        "no-supervisor",
+    ] as const) {
+        const reviewer = thread();
+
+        reviewer.prs = {};
+        const author = thread();
+
+        author.id = "T2";
+        author.address = "session-author";
+        const s = state(reviewer);
+
+        s.threads[author.id] = author;
+        recordReview(reviewer, verdict());
+        const item = {
+            key: "report:review:1",
+            thread: reviewer.id,
+            reviewKey: "review:1",
+            kind: "report" as const,
+            at: 20,
+            line: reviewLine(reviewer, reviewViews(reviewer, s.threads)[0]!, s.threads),
+        };
+
+        assert.match(item.line, /PR thread T2: desk send this Ready there/);
+
+        if (mode === "seen" || mode === "branch" || mode === "attached" || mode === "window") {
+            author.prs[ref]!.via = mode;
+        } else if (mode === "parked" || mode === "starting" || mode === "closed") {
+            author.state = mode;
+        } else if (mode === "unaddressed") {
+            delete author.address;
+        } else if (mode === "empty-address") {
+            author.address = "";
+        } else if (mode === "other-supervisor") {
+            author.supervisor = 2;
+        } else {
+            delete author.supervisor;
+            delete reviewer.supervisor;
+        }
+
+        const line = reviewLine(reviewer, reviewViews(reviewer, s.threads)[0]!, s.threads);
+
+        assert.equal(refreshReviewItems([item], s)[0]!.line, line, "relay targets refresh too");
+
+        if (mode === "seen" || mode === "branch" || mode === "attached") {
+            assert.match(line, /PR thread T2: desk send this Ready there/, mode);
+        } else {
+            assert.doesNotMatch(line, /PR thread|desk send this Ready/, mode);
+        }
+    }
+});
+
 test("a Ready of another open thread's PR names that thread for the Clerk's desk send", () => {
     const reviewer = thread();
 
@@ -543,6 +667,7 @@ test("a Ready of another open thread's PR names that thread for the Clerk's desk
     const author = thread();
 
     author.id = "T2";
+    author.address = "session-author";
     const done = thread();
 
     done.id = "T3";

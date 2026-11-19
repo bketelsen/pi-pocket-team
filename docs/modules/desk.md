@@ -40,10 +40,13 @@ also has a Reviews section. Reviewer labels are quoted data, with angle brackets
 Review lines remain visible
 beside a closed-thread digest line. Pending digest lines refresh against the latest known head.
 Ready alone needs no escalation; the Clerk must not turn review prose into a request for Brian.
-A Ready of a PR that another open thread of the same supervisor holds (as a rule, the author's thread)
-names that thread in its digest line: `PR thread T5: desk send this Ready there; no escalation`. The Clerk
+Only a current, non-stale Ready whose PR has not merged or closed can name a relay target.
+The target must be another open thread of the same supervisor with an agent address and a matching PR link
+that is not a copied `window` link (as a rule, the author's thread).
+Its digest line says `PR thread T5: desk send this Ready there; no escalation`. The Clerk
 sends it there with `desk send`, so the author takes its next step (for example `ready-for-human` after an
-owner review), and the supervisor is not woken.
+owner review), and the supervisor is not woken. Pending digest lines recompute relay routing at take:
+a stale, ended or superseded Ready loses its relay instruction, while explicit asks and blocked-status notes remain.
 Not-ready and unclear stay actionable and urgent (`review-blocked`), even when stale. Explicit
 asks and `status: blocked` still apply; structured reviews bypass the legacy prose parser.
 `desk escalate` stays Clerk-only, and the default interval stays 15 minutes.
