@@ -39,11 +39,11 @@ wakes Odrade only for judgement.
 The digest (`desk-digest.md`) decides **when** news goes. The Clerk changes **where** it goes. At each
 digest, the desk splits the items:
 
-| Kind                                                                                                                                             | With a Clerk            | Without a Clerk |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- | --------------- |
-| `report`, `shift`, `closed`, `queue`, `plan-decided`                                                                                             | the Clerk's digest      | the supervisor  |
-| `answer` (an acknowledgement from Brian)                                                                                                         | the supervisor's digest | the supervisor  |
-| `shift-blocked`, `answer-action`, `repair`, `issue-urgent`, `report-blocked`, `plan-approved`, `plan-verify`, `plan-revise`, `escalation-urgent` | the supervisor, at once | the supervisor  |
+| Kind                                                                                                                                                               | With a Clerk            | Without a Clerk |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- | --------------- |
+| `report`, `shift`, `closed`, `queue`, `plan-decided`                                                                                                               | the Clerk's digest      | the supervisor  |
+| `answer` (an acknowledgement from Brian)                                                                                                                           | the supervisor's digest | the supervisor  |
+| `shift-blocked`, `answer-action`, `repair`, `issue-urgent`, `report-blocked`, `plan-approved`, `plan-verify`, `plan-revise`, `escalation-urgent`, `review-blocked` | the supervisor, at once | the supervisor  |
 
 - The split is a setting: `digest.clerk` in `desk.json` lists the kinds the Clerk gets. Default
   `["report", "shift", "closed", "queue", "plan-decided"]` (`DIGEST_CLERK` in `desk.ts`). A kind in
@@ -73,9 +73,14 @@ The Clerk handles, with no message to Odrade:
    the agent's report, it records `desk result`. It never records a pass that closes a plan task's thread
    while its PR is open.
 3. **Close-outs.** A close-out report that says the work is done and nothing remains needs no answer: the
-   sweep closes the thread. Exceptions: an owner-review or review result, and a shift report (any line of
-   a night, day or afternoon shift; it starts "Shift report from this linked session:", or "Night shift
-   report" in older ones) always go to Odrade, also when they say done, because they start her next step. A
+   sweep closes the thread. A structured current Ready alone needs no escalation, including owner review,
+   cross-review and plan review. When its digest line names a PR thread (another thread holds the PR, as a
+   rule its author's), it sends the Ready there with `desk send`: that starts the author's next step, such as
+   `ready-for-human`. Read the thread's Review fields, not report prose. A stale Ready is not current,
+   and must not suppress a Not-ready or unclear verdict. A stale negative can still be current and actionable;
+   only a newer eligible verdict replaces it, or its PR's merge or close. Escalate current Not-ready and unclear urgently; a legacy review
+   with no structured verdict is unclear. A shift report (any line of a night, day or afternoon shift; it starts
+   "Shift report from this linked session:", or "Night shift report" in older ones) still goes to Odrade. A
    question in a close-out report about the after-merge steps it answers with `desk send`, from the
    thread's brief and `decided.md`.
 4. **Found PRs.** It attaches a found PR to the thread whose agent and repository match (`desk attach`).
@@ -93,14 +98,16 @@ It escalates to Odrade with `desk escalate` (1 call for each item: `thread`, `te
 - a conflict between agents, threads or decisions;
 - anything that needs a new ask to Brian (only Odrade files asks);
 - a report that is blocked, failed, or asks for a decision;
-- every review result (owner review, cross-review, re-review or plan review), with its PR and the
-  author's thread, or "unknown";
+- a Not-ready or unclear review, urgently, with its PR and the author's thread, or "unknown"; a legacy review
+  without a structured verdict is unclear; a current structured Ready alone needs no escalation;
 - every finished shift line (night, day or afternoon);
 - a found session or folder (attach or drop is a judgement);
 - a silent session whose last answer is not a report;
 - anything it is not sure of.
 
-It uses `urgent: true` for a blocked or failed report, a red check on a PR with `ready-for-human`, and a
+The [structured verdict contract](../modules/desk.md#structured-review-verdicts) defines replay, no-PR work and stale heads.
+
+It uses `urgent: true` for a Not-ready or unclear review, a blocked or failed report, a red check on a PR with `ready-for-human`, and a
 conflict.
 
 The drop rule (`escalationDrop` in `desk.ts`). The cause of an escalation is the time of the news that
@@ -153,8 +160,10 @@ the desk.
 
 ## 7. The Clerk's profile
 
-The live profile is `~/.config/pi-pocket-team/agents/clerk.md`. This copy matches it as of 2026-11-06,
-without the record ids and dates of its rules:
+The live profile is `~/.config/pi-pocket-team/agents/clerk.md`. The base copy matched it on 2026-11-06,
+without the record ids and dates of its rules. The structured-verdict rules below also live in Team's injected
+Clerk instructions and explicitly supersede the old profile rule to escalate every review. This change does not
+edit the live profile; use these rules when the profile is next synchronized:
 
 ```markdown
 ---
@@ -185,10 +194,14 @@ reads only what needs her judgement. Be brief, exact, and quiet.
   never copy the claim. Another state (a host, an app, the NAS): write it as the agent's claim, or
   escalate to Odrade.
 - A close-out report that says done and nothing remains: do nothing; the sweep closes the thread.
-  Exceptions: an owner-review or review result, and a shift report (night, day or afternoon; any line
-  of a shift; it starts "Shift report from this linked session:", or "Night shift report" in older ones),
-  always go to Odrade (see below), even when they say done: they start her next step. A question about
-  after-merge steps: answer it with `desk send`.
+  A current structured Ready alone needs no escalation, for owner review, cross-review and plan review.
+  When its digest line names a PR thread, send the Ready to that thread with `desk send`.
+  Read the thread's Review fields, not report prose. A stale Ready is not current and must not suppress a
+  Not-ready or unclear verdict. A stale negative can still be current and actionable; only a newer eligible
+  verdict, or its PR's merge or close, replaces it. Escalate current Not-ready and unclear urgently; a legacy review without a structured
+  verdict is unclear. A shift report (night, day or afternoon; any line of a shift; it starts "Shift report from
+  this linked session:", or "Night shift report" in older ones) still goes to Odrade. A question about after-merge
+  steps: answer it with `desk send`.
 - A found PR: attach it with `desk attach` to the thread of the same agent and repository.
 - After each batch, commit `decisions/` only in the desk folder, with a short message
   (`git commit -- decisions/`). Never commit `desk/`: the Desk module commits it itself (`exportCommit`),
@@ -203,11 +216,11 @@ the news that caused it; it records the drop on the thread. A reply "Not sent" i
 item with `team_message`. Use `team_message` to Odrade only to answer a task that she sent you.
 
 Escalate new plans, briefs and new work, the muster, conflicts, anything that needs an ask to Brian, a
-report that is blocked or failed or asks for a decision, every review result (owner review,
-cross-review, re-review or plan review; name its PR and the author's thread when known, else write
-"unknown": never wait to find them), every finished shift line (night, day or afternoon: the next line
+report that is blocked or failed or asks for a decision, a Not-ready or unclear review (a legacy review without
+a structured verdict is unclear; a current structured Ready alone needs no escalation; name its PR and the author's
+thread when known, else write "unknown": never wait to find them), every finished shift line (night, day or afternoon: the next line
 may wait for its slot), found sessions and folders, silent sessions, and anything you are not sure of.
-Use `urgent: true` for a blocked or failed report, a red check on a PR with `ready-for-human`, and a
+Use `urgent: true` for a Not-ready or unclear review, a blocked or failed report, a red check on a PR with `ready-for-human`, and a
 conflict. A thread that `desk read` shows as `Handled` needs no escalation for its reports. When nothing
 needs her, send nothing.
 

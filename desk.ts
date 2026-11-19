@@ -444,6 +444,17 @@ export type RouteFeatures = {
     testsBeside: boolean | null;
 };
 
+/** Explicit review evidence, stored on the reporting thread. Time and key come from the filing call. */
+export type ReviewVerdict = {
+    kind: "cross-review" | "owner-review" | "plan-review";
+    outcome: "ready" | "not-ready" | "unclear";
+    reviewer: string;
+    ref?: string;
+    head?: string;
+    at: number;
+    key: string;
+};
+
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
 export type Thread = {
     /** "T13" for a delegated, seeded, or asked thread; "F2" for a found one. */
@@ -455,6 +466,8 @@ export type Thread = {
     title: string;
     /** On a task thread: the plan thread and the task id it delivers. */
     planTask?: { plan: string; task: string };
+    /** Append-only review evidence. An older thread has none. A key records at most 1 verdict. */
+    reviews?: ReviewVerdict[];
     /** Roster ids. */
     agents: string[];
     /** A roster repository name, such as "frostyard/frostmail". */
@@ -624,7 +637,9 @@ export type DigestKind =
     /** A Clerk's `desk escalate` with `urgent: true`: it goes at once. */
     | "escalation-urgent"
     /** A text-only correction of an approved plan (`plan amend`), for the supervisor's digest. */
-    | "plan-amend";
+    | "plan-amend"
+    /** An explicit Not-ready or unclear review needs action. */
+    | "review-blocked";
 
 /** Every digest kind, in the design's order: new kinds go at the end. */
 export const DIGEST_KINDS: readonly DigestKind[] = [
@@ -648,6 +663,7 @@ export const DIGEST_KINDS: readonly DigestKind[] = [
     "escalation",
     "escalation-urgent",
     "plan-amend",
+    "review-blocked",
 ];
 
 /** One piece of desk news for the supervisor's digest. Stored data: never rename a field. */
@@ -657,6 +673,8 @@ export type DigestItem = {
     /** The thread id the news is about. */
     thread: string;
     kind: DigestKind;
+    /** The structured verdict's replay key, for a live stale check at take. Absent on legacy news. */
+    reviewKey?: string;
     /** The one line the digest shows: `shortLine`, `answeredText`, or a line of its own. */
     line: string;
     at: number;
@@ -1327,6 +1345,8 @@ export type StoredReport = {
     from: "team_message" | "night-shift";
     text: string;
     line: string;
+    /** The structured verdict filed with this report, when present. */
+    review?: ReviewVerdict;
     /** The report went into the digest: the caller sent nothing, and a replay of its call sends nothing again. */
     held?: boolean;
     /**
@@ -3399,7 +3419,7 @@ export function applyWatchDecision(
                 `watch waits for required checks (${String(attempts)}/${String(WATCH_CHECK_ATTEMPTS)})`,
                 now,
             );
-            thread.run.next = nextActor(thread);
+            thread.run.next = nextActor(thread, state.threads);
 
             return true;
         }
@@ -3409,6 +3429,11 @@ export function applyWatchDecision(
         );
     } else {
         decision = read.decision;
+    }
+
+    // A proved watch condition does not resolve a review blocker on the work itself.
+    if (decision.status === "pass" && reviewBlocks(thread, state.threads)) {
+        decision = watchUnknown("Pass refused: a current review is not-ready or unclear");
     }
 
     if (decision.status !== "unknown") {
@@ -3435,7 +3460,7 @@ export function applyWatchDecision(
 
     watch.machine = { ...decision, text: watchResultLine(decision.text), at: now, key };
     addEvent(thread, key, `watch machine ${decision.status}: ${watch.machine.text}`, now);
-    thread.run.next = nextActor(thread);
+    thread.run.next = nextActor(thread, state.threads);
 
     return true;
 }
@@ -3725,7 +3750,7 @@ export function setWatch(
 
     if (closed) {
         // The watch sleeps: the next actor is the one the sweep would give the reopened thread.
-        thread.run.next = nextActor(thread);
+        thread.run.next = nextActor(thread, state?.threads);
 
         return { changed: true, reopened: true };
     }
@@ -5228,6 +5253,8 @@ export type CloseFacts = {
     now: number;
     /** Folders that another open thread works in: the folder part does not count there. */
     folders: Set<string>;
+    /** Other threads can hold the PR reviewed by this thread. */
+    threads?: Readonly<Record<string, Thread>>;
     /**
      * By thread id: what the sweep's GitHub read did not read that the thread may need (`closeUnread`). Each line holds
      * the thread open until a read has it. Absent: nothing.
@@ -5308,6 +5335,10 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     // A quiet session after a supervisor's message is not silence that holds the thread: it met the rule before.
     if (session !== undefined && !(session === SILENT_WORDS && quietSilence(thread))) {
         open.push(session);
+    }
+
+    if (reviewBlocks(thread, facts.threads)) {
+        open.push("a current review is not-ready or unclear");
     }
 
     // A report that says the work is blocked, or asks for a decision, waits on Odrade: the thread is not done.
@@ -6491,7 +6522,12 @@ export function planRepairs(thread: Thread, now: number): number {
  * again, its links are read again, and the wake-up goes to Odrade, not to an agent whose thread was closed. True when
  * it reopened.
  */
-export function repairReopen(thread: Thread, github: GitHubFacts, now: number): boolean {
+export function repairReopen(
+    thread: Thread,
+    github: GitHubFacts,
+    now: number,
+    threads?: Readonly<Record<string, Thread>>,
+): boolean {
     if (thread.state !== "closed" || thread.closed?.why === "dropped") {
         return false;
     }
@@ -6532,7 +6568,7 @@ export function repairReopen(thread: Thread, github: GitHubFacts, now: number): 
     delete thread.run.quietReopen;
     delete thread.run.quietWake;
     recordRepair(thread, found.key, { to: "odrade", why: "closed" }, now);
-    thread.run.next = nextActor(thread);
+    thread.run.next = nextActor(thread, threads);
     addEvent(
         thread,
         `reopened:${String(now)}`,
@@ -7099,7 +7135,7 @@ export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
  * too, unless the thread has an open watch that is not due yet: the watch is the wait, and nobody is next until it is
  * due.
  */
-export function nextActor(thread: Thread): NextActor {
+export function nextActor(thread: Thread, threads?: Readonly<Record<string, Thread>>): NextActor {
     if (thread.state === "closed") {
         return "none";
     }
@@ -7110,6 +7146,10 @@ export function nextActor(thread: Thread): NextActor {
 
     // A failed run blocks the agent: Odrade looks at it, on a plan thread too. A session that works again is the agent's.
     if (runFailedOf(thread) !== undefined) {
+        return "odrade";
+    }
+
+    if (reviewBlocks(thread, threads)) {
         return "odrade";
     }
 
@@ -7223,16 +7263,20 @@ const SILENT_SESSION = "silent session";
 
 /**
  * Why a thread waits on Odrade now, in `nextActor`'s order, in words: a failed run (`run failed: <line>`, also for a plan
- * thread), a due watch, a found thread, a PR GitHub cannot find, a report that says blocked, else a silent session.
+ * thread), a current negative review (also when stale), a due watch, a found thread, a PR GitHub cannot find, a
+ * report that says blocked, else a silent session.
  * Undefined when Odrade is not next, for another plan thread, or when the thread is parked: a parked thread waits on
  * Brian, not on her.
  */
-export function odradeReason(thread: Thread): string | undefined {
+export function odradeReason(
+    thread: Thread,
+    threads?: Readonly<Record<string, Thread>>,
+): string | undefined {
     if (thread.state === "parked") {
         return undefined;
     }
 
-    if (nextActor(thread) !== "odrade") {
+    if (nextActor(thread, threads) !== "odrade") {
         return undefined;
     }
 
@@ -7240,6 +7284,10 @@ export function odradeReason(thread: Thread): string | undefined {
 
     if (failed !== undefined) {
         return `run failed: ${failed}`;
+    }
+
+    if (reviewBlocks(thread, threads)) {
+        return "a current review is not-ready or unclear";
     }
 
     if (thread.origin === "plan") {
@@ -7304,6 +7352,8 @@ export type WaitsFacts = {
      * Absent when the live list was not read: the text is then the one the stored facts give.
      */
     busy?: ReadonlySet<string>;
+    /** Full Desk map: a reviewed PR can belong to a thread outside the candidate list. */
+    threads?: Readonly<Record<string, Thread>>;
 };
 
 /**
@@ -7312,8 +7362,11 @@ export type WaitsFacts = {
  * session whose agent works now: its report comes, so it does not wait on Odrade. The other reasons stay.
  */
 export function waitsText(threads: Thread[], facts: WaitsFacts = {}): string {
+    const allThreads =
+        facts.threads ?? Object.fromEntries(threads.map((thread) => [thread.id, thread]));
+
     return threads
-        .map((thread) => ({ thread, reason: odradeReason(thread) }))
+        .map((thread) => ({ thread, reason: odradeReason(thread, allThreads) }))
         .filter((each): each is { thread: Thread; reason: string } => each.reason !== undefined)
         .filter(
             (each) =>
@@ -7329,9 +7382,15 @@ export function waitsText(threads: Thread[], facts: WaitsFacts = {}): string {
 }
 
 /** Whether `waitsText` needs the live session list for `threads`: 1 of them is a silent session with an address. */
-export function waitsNeedLive(threads: Thread[]): boolean {
+export function waitsNeedLive(
+    threads: Thread[],
+    allThreads: Readonly<Record<string, Thread>> = Object.fromEntries(
+        threads.map((thread) => [thread.id, thread]),
+    ),
+): boolean {
     return threads.some(
-        (thread) => thread.address !== undefined && odradeReason(thread) === SILENT_SESSION,
+        (thread) =>
+            thread.address !== undefined && odradeReason(thread, allThreads) === SILENT_SESSION,
     );
 }
 
@@ -7350,6 +7409,7 @@ export const DIGEST_NOW: readonly DigestKind[] = [
     "plan-verify",
     "plan-revise",
     "escalation-urgent",
+    "review-blocked",
 ];
 /** Urgent news never waits for the interval, even when `digest.now` omits its kind. */
 const DIGEST_URGENT: readonly DigestKind[] = [
@@ -7359,6 +7419,7 @@ const DIGEST_URGENT: readonly DigestKind[] = [
     "issue-urgent",
     "report-blocked",
     "escalation-urgent",
+    "review-blocked",
 ];
 
 /** The kinds the Clerk gets, by default: the routine news. The issue kinds go to the supervisor: she plans the shifts. */
@@ -7580,7 +7641,8 @@ function urgentDigest(item: DigestItem): boolean {
         reason !== undefined &&
         (reason.startsWith("run failed: ") ||
             reason === "report says blocked" ||
-            reason === "report asks Brian")
+            reason === "report asks Brian" ||
+            reason === "a current review is not-ready or unclear")
     );
 }
 
@@ -7641,12 +7703,19 @@ export function enqueueDigest(
  * a digest carried already. It records each reason in `box.queued`, and deletes the threads that stopped waiting. The
  * caller enqueues the items it gives; nothing is added to the box here.
  */
-export function queueNews(threads: readonly Thread[], box: DigestBox, now: number): DigestItem[] {
+export function queueNews(
+    threads: readonly Thread[],
+    box: DigestBox,
+    now: number,
+    allThreads: Readonly<Record<string, Thread>> = Object.fromEntries(
+        threads.map((thread) => [thread.id, thread]),
+    ),
+): DigestItem[] {
     const items: DigestItem[] = [];
     const waiting = new Set<string>();
 
     for (const thread of threads) {
-        const reason = odradeReason(thread);
+        const reason = odradeReason(thread, allThreads);
 
         if (reason === undefined) {
             continue;
@@ -7731,7 +7800,9 @@ function digestEntries(items: readonly DigestItem[]): {
             item.kind !== "answer" &&
             item.kind !== "answer-action" &&
             !ISSUE_KINDS.includes(item.kind) &&
-            !ESCALATION_KINDS.includes(item.kind)
+            !ESCALATION_KINDS.includes(item.kind) &&
+            item.kind !== "review-blocked" &&
+            item.reviewKey === undefined
         ) {
             folded.set(item.thread, [...(folded.get(item.thread) ?? []), item]);
             continue;
@@ -8379,6 +8450,7 @@ function routineDigestClose(item: DigestItem, state: Readonly<DeskState>): boole
         thread.closed.at !== item.at ||
         thread.lastEventAt > item.at ||
         hasOpenAsk(thread) ||
+        reviewBlocks(thread, state.threads) ||
         thread.run.busy === true ||
         shiftWorks(thread.run.shift) ||
         (numberOr(thread.run.dirty) ?? 0) > 0 ||
@@ -8559,7 +8631,7 @@ export function dropStaleQueue(
 
         const thread = state?.threads[parsed.id];
 
-        return thread !== undefined && odradeReason(thread) === parsed.reason;
+        return thread !== undefined && odradeReason(thread, state?.threads) === parsed.reason;
     });
 }
 
@@ -13012,7 +13084,11 @@ export function issueLine(
 }
 
 /** A thread's state in 1 or 2 words, for the queue. */
-export function threadWord(thread: Thread, now: number): string {
+export function threadWord(
+    thread: Thread,
+    now: number,
+    threads?: Readonly<Record<string, Thread>>,
+): string {
     if (thread.state === "closed") {
         return "closed";
     }
@@ -13034,7 +13110,7 @@ export function threadWord(thread: Thread, now: number): string {
         return "watching";
     }
 
-    const next = nextActor(thread);
+    const next = nextActor(thread, threads);
 
     return next === "agent"
         ? "working"
@@ -13114,7 +13190,7 @@ export function issuesText(
             const threads = item.threads
                 .map((id) => threadById(state, id))
                 .filter((thread): thread is Thread => thread !== undefined)
-                .map((thread) => `${thread.id} ${threadWord(thread, now)}`);
+                .map((thread) => `${thread.id} ${threadWord(thread, now, state?.threads)}`);
             const owner =
                 item.agent === undefined
                     ? "no owner"
@@ -13197,7 +13273,10 @@ export function issuesView(state: Readonly<DeskState> | undefined, now: number):
             threads: item.threads
                 .map((id) => threadById(state, id))
                 .filter((thread): thread is Thread => thread !== undefined)
-                .map((thread) => ({ id: thread.id, word: threadWord(thread, now) })),
+                .map((thread) => ({
+                    id: thread.id,
+                    word: threadWord(thread, now, state?.threads),
+                })),
             fixedBy: [...item.fixedBy],
             parts: item.partial?.length ?? 0,
             unverified: item.unverified === true,
@@ -13713,7 +13792,7 @@ export function addAsk(
         delete thread.closed;
         delete thread.run.quietReopen;
         delete thread.run.quietWake;
-        thread.run.next = nextActor(thread);
+        thread.run.next = nextActor(thread, state.threads);
     }
 
     const fromText = request.from === undefined ? "" : ` from ${request.from}`;
@@ -13844,7 +13923,7 @@ export function withdrawAsk(
 
     found.ask.resolved = { at: request.at, why, by: request.by };
     // Brian is next no more when this was his last open ask: the page shows it at once, not at the next sweep.
-    found.thread.run.next = nextActor(found.thread);
+    found.thread.run.next = nextActor(found.thread, state.threads);
     addEvent(
         found.thread,
         `withdrawn:${found.ask.id}:${String(request.at)}`,
@@ -14618,7 +14697,11 @@ function longestRun(text: string): number {
 const byId = (a: Thread, b: Thread) => idNumber(a.id) - idNumber(b.id) || a.id.localeCompare(b.id);
 
 /** The export's section for a thread: the page's groups, with closed threads last. */
-function sectionOf(thread: Thread, now: number): string {
+function sectionOf(
+    thread: Thread,
+    now: number,
+    threads?: Readonly<Record<string, Thread>>,
+): string {
     if (thread.state === "closed") {
         return "Closed in the last 7 days";
     }
@@ -14639,7 +14722,7 @@ function sectionOf(thread: Thread, now: number): string {
         return "Found";
     }
 
-    if (nextActor(thread) === "brian") {
+    if (nextActor(thread, threads) === "brian") {
         return "Needs Brian";
     }
 
@@ -14647,7 +14730,7 @@ function sectionOf(thread: Thread, now: number): string {
         return "Stale";
     }
 
-    if (nextActor(thread) === "reviewer") {
+    if (nextActor(thread, threads) === "reviewer") {
         return "Waiting on review";
     }
 
@@ -14660,6 +14743,7 @@ function threadFile(
     reports: readonly StoredReport[] | undefined,
     now: number,
     defangSummary: (text: string) => string = (text) => text,
+    threads?: Readonly<Record<string, Thread>>,
 ): string {
     const folder = folderOf(thread);
     const lines: string[] = [`# ${thread.id} · ${md(thread.title)}`, ""];
@@ -14701,6 +14785,17 @@ function threadFile(
                 `- ${label} · ${pr.state ?? "no state"}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`} · ${pr.next ?? prNext(pr)} · ${pr.via}${pr.title === undefined ? "" : ` · ${md(pr.title)}`}`,
             );
         }
+    }
+
+    const reviews = reviewViews(thread, threads);
+
+    if (reviews.length > 0) {
+        lines.push(
+            "",
+            "## Reviews",
+            "",
+            ...reviews.map((review) => `- ${md(reviewWords(review))}`),
+        );
     }
 
     lines.push("", "## Asks", "");
@@ -14883,7 +14978,9 @@ export function boardRowViews(
             ...(row.error === undefined ? {} : { error: row.error }),
             attempts: row.attempts,
             ...(row.held === undefined ? {} : { held: row.held }),
-            ...(thread === undefined ? {} : { next: nextActor(thread), threadState: thread.state }),
+            ...(thread === undefined
+                ? {}
+                : { next: nextActor(thread, state?.threads), threadState: thread.state }),
             ...(thread?.run.shift === "ended" ? { shiftEnded: true as const } : {}),
         };
     });
@@ -14921,7 +15018,7 @@ export function boardFile(state: Readonly<DeskState> | undefined): string {
                         utc,
                         thread === undefined
                             ? undefined
-                            : { id: thread.id, next: nextActor(thread) },
+                            : { id: thread.id, next: nextActor(thread, state?.threads) },
                     ),
                 )}`,
             );
@@ -14957,7 +15054,7 @@ export function exportFiles(
     const groups = new Map<string, Thread[]>(order.map((title) => [title, []]));
 
     for (const thread of threads) {
-        groups.get(sectionOf(thread, now))?.push(thread);
+        groups.get(sectionOf(thread, now, state?.threads))?.push(thread);
     }
 
     const lines = [
@@ -14979,7 +15076,7 @@ export function exportFiles(
 
         for (const thread of list) {
             lines.push(
-                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread)}${title === "Watching" && thread.watch !== undefined ? ` · watch: ${watchWhen(thread.watch)}${md(watchOnWords(thread.watch))}` : ""}`,
+                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread, state?.threads)}${title === "Watching" && thread.watch !== undefined ? ` · watch: ${watchWhen(thread.watch)}${md(watchOnWords(thread.watch))}` : ""}`,
             );
 
             for (const [ref, pr] of Object.entries(thread.prs).sort(([a], [b]) =>
@@ -15012,6 +15109,8 @@ export function exportFiles(
             thread,
             thread.session === undefined ? undefined : reports[thread.session],
             now,
+            undefined,
+            state?.threads,
         );
     }
 
@@ -15243,6 +15342,8 @@ export type ThreadView = {
     /** The queued issues it works on, by ref; and the issues that stay open after a PR of it merged. */
     issues?: string[];
     issuesOpen?: string[];
+    /** Structured evidence with live head and newest-matching status, for the page. */
+    reviews?: ReviewView[];
 };
 
 /** The folders that threads other than `thread` work in. */
@@ -15270,8 +15371,8 @@ export function threadView(
     thread: Thread,
     now: number,
 ): ThreadView {
-    const next = nextActor(thread);
-    const check = closeCheck(thread, { now, folders: otherFolders(threads, thread) });
+    const next = nextActor(thread, threads);
+    const check = closeCheck(thread, { now, folders: otherFolders(threads, thread), threads });
     const queued = queuedWakes(thread);
 
     return {
@@ -15298,6 +15399,7 @@ export function threadView(
             ...(pr.level === undefined ? {} : { level: pr.level }),
         })),
         ...(queued.length === 0 ? {} : { queued }),
+        ...((thread.reviews?.length ?? 0) === 0 ? {} : { reviews: reviewViews(thread, threads) }),
         asks: thread.asks
             .filter((ask) => askIsOpen(ask))
             .map((ask) => ({
@@ -15481,7 +15583,7 @@ export function threadsView(
         }
 
         counts.open += 1;
-        counts[nextActor(thread)] += 1;
+        counts[nextActor(thread, threads)] += 1;
 
         if (asleep(thread, now)) {
             counts.watching += 1;
@@ -15625,7 +15727,7 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
                 return [
                     thread.id,
                     thread.state,
-                    `next: ${nextActor(thread)}`,
+                    `next: ${nextActor(thread, state?.threads)}`,
                     ...(isStale(thread, now) ? ["stale"] : []),
                     ...(asleep(thread, now)
                         ? [
@@ -15636,6 +15738,7 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
                     thread.agents.join(", ") || "nobody",
                     ...(prs === 0 ? [] : [counted(prs, "PR")]),
                     ...(asks.length === 0 ? [] : [asks.join(", ")]),
+                    ...reviewViews(thread, state?.threads).map(reviewWords),
                     thread.title,
                 ].join(" · ");
             }),
@@ -15678,7 +15781,7 @@ export function readText(
 
     return [
         `${thread.id} · ${thread.state} · ${thread.title}`,
-        ...(brief ? [`Next: ${nextActor(thread)}`] : [`Origin: ${thread.origin}`]),
+        ...(brief ? [`Next: ${nextActor(thread, state?.threads)}`] : [`Origin: ${thread.origin}`]),
         `Agents: ${thread.agents.join(", ") || "nobody"}`,
         `Repo: ${thread.repo ?? "none"}`,
         ...(brief
@@ -15701,6 +15804,7 @@ export function readText(
                   `Closed: ${iso(thread.closed.at)} · ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by}`,
               ]),
         ...(handledLine === undefined ? [] : [handledLine]),
+        ...reviewViews(thread, state?.threads).map((review) => `Review: ${reviewWords(review)}`),
         prs.length === 0
             ? "PRs: none"
             : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
@@ -15722,6 +15826,203 @@ export function readText(
             ? "Events: none"
             : `Events:\n${events.map((event) => `  ${iso(event.at)} · ${brief && hideBoundSession && event.key === "bound" ? "session bound" : event.text}`).join("\n")}`,
     ].join("\n");
+}
+
+// ─── Explicit review evidence ──────────────────────────────────────────────
+
+/**
+ * `ended`: the newest observation of the reviewed PR says MERGED or CLOSED. Nothing on the PR can act on the verdict
+ * any more, so an ended verdict is history: it neither blocks nor wins. A reopened PR makes it count again.
+ */
+export type ReviewView = ReviewVerdict & { stale: boolean; current: boolean; ended: boolean };
+
+/** Validate at the module boundary too: API callers do not pass through the tool schema. */
+export function reviewProblem(review: Omit<ReviewVerdict, "at" | "key">): string | undefined {
+    if (
+        !["cross-review", "owner-review", "plan-review"].includes(review.kind) ||
+        !["ready", "not-ready", "unclear"].includes(review.outcome)
+    ) {
+        return "review needs kind cross-review, owner-review or plan-review and outcome ready, not-ready or unclear.";
+    }
+
+    if (
+        typeof review.reviewer !== "string" ||
+        review.reviewer.trim() === "" ||
+        review.reviewer.length > 100 ||
+        /[\r\n]/.test(review.reviewer)
+    ) {
+        return "review needs reviewer: 1 to 100 characters on 1 line.";
+    }
+
+    if (
+        (review.ref === undefined) !== (review.head === undefined) ||
+        (review.ref !== undefined &&
+            (!/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*#[1-9][0-9]*$/.test(
+                review.ref,
+            ) ||
+                !/^[0-9a-f]{40}$/.test(review.head ?? "")))
+    ) {
+        return "A PR review needs both ref (owner/name#N) and head (40 lowercase hex characters), or neither for no-PR work.";
+    }
+
+    return undefined;
+}
+
+/** Append once, even after the report log's 10-record window or a restart. Never replace historical evidence. */
+export function recordReview(thread: Thread, review: ReviewVerdict): ReviewVerdict {
+    const problem = reviewProblem(review);
+
+    if (problem !== undefined) {
+        throw new Error(problem);
+    }
+
+    const known = thread.reviews?.find((each) => each.key === review.key);
+
+    if (known !== undefined) {
+        return known;
+    }
+
+    const stored = { ...review };
+
+    thread.reviews ??= [];
+    thread.reviews.push(stored);
+
+    return stored;
+}
+
+/** The newest matching verdict per kind and PR (or no-PR scope) wins. A stale Ready wins nothing. */
+export function reviewViews(
+    thread: Thread,
+    threads: Readonly<Record<string, Thread>> = { [thread.id]: thread },
+): ReviewView[] {
+    const views = (thread.reviews ?? []).map((review): ReviewView => {
+        const links =
+            review.ref === undefined
+                ? []
+                : Object.values(threads)
+                      .filter((each) => each.supervisor === thread.supervisor)
+                      .flatMap((each) =>
+                          Object.entries(each.prs)
+                              .filter(([ref]) => ref.toLowerCase() === review.ref!.toLowerCase())
+                              .map(([, link]) => link),
+                      )
+                      .sort((a, b) => (b.readAt ?? 0) - (a.readAt ?? 0));
+        const stale =
+            review.ref !== undefined &&
+            (review.head === undefined ||
+                links[0]?.head !== review.head ||
+                links[0]?.state === "MISSING");
+        const ended = links[0]?.state === "MERGED" || links[0]?.state === "CLOSED";
+
+        return { ...review, stale, current: false, ended };
+    });
+    const newest = new Map<string, ReviewView>();
+
+    for (const view of views) {
+        // Staleness invalidates Ready only. Negative evidence stays actionable until a newer eligible verdict wins, or
+        // until its PR merges or closes: then no one can act on it, and it must not hold the thread open forever.
+        if ((view.stale && view.outcome === "ready") || view.ended) {
+            continue;
+        }
+
+        const scope = `${view.kind}:${view.ref?.toLowerCase() ?? ""}`;
+        const previous = newest.get(scope);
+
+        // Equal times use append order, not an arbitrary lexical key order.
+        if (previous === undefined || view.at >= previous.at) {
+            newest.set(scope, view);
+        }
+    }
+
+    for (const view of newest.values()) {
+        view.current = true;
+    }
+
+    return views;
+}
+
+/** Verdict fields only: reviewer labels are quoted data, never report prose or markup. */
+export function reviewWords(review: ReviewView): string {
+    const reviewer = JSON.stringify(review.reviewer)
+        .replaceAll("<", "\\u003c")
+        .replaceAll(">", "\\u003e");
+
+    return `${review.kind}: ${review.outcome} · reviewer ${reviewer} · ${iso(review.at)}${review.ref === undefined ? " · no PR" : ` · ${review.ref}@${review.head ?? "unknown"}`}${review.stale ? " · stale (PR head differs or is unknown)" : ""}${review.ended ? " · PR merged or closed" : ""} · ${review.current ? "current" : review.ended || (review.stale && review.outcome === "ready") ? "not current" : "superseded"}`;
+}
+
+/** The other open threads of this supervisor that hold the reviewed PR: its author's thread, as a rule. */
+export function reviewPrThreads(
+    thread: Thread,
+    review: Pick<ReviewVerdict, "ref">,
+    threads: Readonly<Record<string, Thread>> = { [thread.id]: thread },
+): string[] {
+    const ref = review.ref?.toLowerCase();
+
+    return ref === undefined
+        ? []
+        : Object.values(threads)
+              .filter(
+                  (each) =>
+                      each.id !== thread.id &&
+                      each.supervisor === thread.supervisor &&
+                      each.state !== "closed" &&
+                      Object.keys(each.prs).some((key) => key.toLowerCase() === ref),
+              )
+              .map((each) => each.id)
+              .sort();
+}
+
+/**
+ * A Ready of another thread's PR goes to that thread's agent (the Clerk sends it with desk send), not to the
+ * supervisor: it starts the author's next step, for example the `ready-for-human` label after an owner review.
+ */
+export function reviewLine(
+    thread: Thread,
+    review: ReviewView,
+    threads?: Readonly<Record<string, Thread>>,
+): string {
+    const others = review.outcome === "ready" ? reviewPrThreads(thread, review, threads) : [];
+    const ready =
+        others.length === 0
+            ? " · no escalation for Ready alone"
+            : ` · PR thread ${others.join(", ")}: desk send this Ready there; no escalation`;
+
+    return `[desk] ${thread.id} · ${reviewWords(review)} · desk read ${thread.id}${review.outcome === "ready" ? ready : " · urgent: review needs action"}`;
+}
+
+/** A current negative verdict remains actionable until a newer matching verdict replaces it. */
+export function reviewBlocks(thread: Thread, threads?: Readonly<Record<string, Thread>>): boolean {
+    return reviewViews(thread, threads).some((each) => each.current && each.outcome !== "ready");
+}
+
+/** Refresh pending verdict lines at digest take: a push can make Ready stale while it waits. */
+export function refreshReviewItems(
+    items: readonly DigestItem[],
+    state: Readonly<DeskState>,
+): DigestItem[] {
+    return items.map((item) => {
+        const thread = state.threads[item.thread];
+        const review =
+            thread === undefined
+                ? undefined
+                : reviewViews(thread, state.threads).find((each) => each.key === item.reviewKey);
+
+        if (review === undefined || thread === undefined) {
+            return item;
+        }
+
+        // Preserve explicit asks and blocked-status notes after the fixed read marker, not a parsed prose verdict.
+        const marker = ` · desk read ${thread.id}`;
+        const index = item.line.lastIndexOf(marker);
+
+        return {
+            ...item,
+            line:
+                index < 0
+                    ? reviewLine(thread, review, state.threads)
+                    : `[desk] ${thread.id} · ${reviewWords(review)}${item.line.slice(index)}`,
+        };
+    });
 }
 
 // ─── Reports ───────────────────────────────────────────────────────────────
@@ -20498,6 +20799,35 @@ export function recordVerify(
         thread: request.thread,
     });
 
+    const review =
+        planThread === undefined
+            ? undefined
+            : recordReview(planThread, {
+                  kind: "plan-review",
+                  outcome: pass ? "ready" : "not-ready",
+                  reviewer: flatLine(reviewer),
+                  at: request.at,
+                  key: request.key,
+              });
+    const reviewItems: DigestItem[] =
+        review === undefined || planThread === undefined
+            ? []
+            : [
+                  {
+                      key: `review:${request.key}`,
+                      thread: planThread.id,
+                      reviewKey: request.key,
+                      kind: pass ? "report" : "review-blocked",
+                      line: reviewLine(
+                          planThread,
+                          reviewViews(planThread, state.threads).find(
+                              (each) => each.key === review.key,
+                          )!,
+                          state.threads,
+                      ),
+                      at: request.at,
+                  },
+              ];
     const failed = results.filter((each) => !each.pass).map((each) => each.task);
     const asks: string[] = [];
 
@@ -20545,7 +20875,7 @@ export function recordVerify(
         return {
             replay: false,
             pass,
-            items: [],
+            items: reviewItems,
             asks,
             ...(planThread === undefined ? {} : { closed: planThread }),
         };
@@ -20595,15 +20925,16 @@ export function recordVerify(
             ["Stop and revise", "Drop the plan"],
         );
 
-        return { replay: false, pass, items: [], asks };
+        return { replay: false, pass, items: reviewItems, asks };
     }
 
     return {
         replay: false,
         pass,
         // The item names only the repairs that can start now; the others follow when their deps are done.
-        items:
-            repairs.length === 0
+        items: [
+            ...reviewItems,
+            ...(repairs.length === 0
                 ? []
                 : [
                       planTasksItem(
@@ -20613,7 +20944,8 @@ export function recordVerify(
                           "repairs after a failed whole-plan check",
                           request.at,
                       ),
-                  ],
+                  ]),
+        ],
         asks,
     };
 }
@@ -23798,6 +24130,8 @@ export type FileRequest = {
      * one. An `ASKS FOR BRIAN:` block with items in the text still counts: the text is read then, as without it.
      */
     asksNone?: true;
+    /** Explicit reviewer evidence; the Desk supplies the report's time and replay key. */
+    review?: Omit<ReviewVerdict, "at" | "key">;
     /** The agent's name: the asks are filed by it. */
     by?: string;
     /**
@@ -23827,6 +24161,8 @@ export type PlanCommitApi = {
  */
 export type DeskApi = {
     version: 1;
+    /** Feature detection: an older Desk must not silently discard an explicit verdict. */
+    reviewVerdicts?: true;
     open: (
         tx: Tx,
         request: OpenRequest,
@@ -25941,6 +26277,7 @@ export default function createDesk(host: Host, web: Web) {
     };
 
     const published: DeskApi = {
+        reviewVerdicts: true,
         version: 1,
         open: async (tx, request) => {
             const state = await tx.doc(DeskThreads);
@@ -26251,6 +26588,37 @@ export default function createDesk(host: Host, web: Web) {
                 };
             }
 
+            if (request.review !== undefined) {
+                const problem = reviewProblem(request.review);
+
+                if (problem !== undefined) {
+                    throw new Error(problem);
+                }
+
+                if (thread.planTask?.task === "verify" && request.review.kind === "plan-review") {
+                    throw new Error(
+                        "Record a whole-plan verdict with plan verify, not team_message.review.",
+                    );
+                }
+
+                // Verdict keys outlive the bounded report log. A late replay must not announce old evidence again.
+                const known = thread.reviews?.find((each) => each.key === request.key);
+
+                if (known !== undefined) {
+                    return {
+                        thread: copyThread(thread),
+                        line: reviewLine(
+                            thread,
+                            reviewViews(thread, state.threads).find(
+                                (each) => each.key === known.key,
+                            )!,
+                            state.threads,
+                        ),
+                        held: true,
+                    };
+                }
+            }
+
             // The report's asks go on the thread in this commit: Brian sees them at once, and Odrade may rewrite, merge or
             // withdraw them. Each has its own key under the report's, so a replay files none twice. A refused ask is an
             // event, and holds the thread as a blocked report does: the decision is in the text only.
@@ -26287,7 +26655,7 @@ export default function createDesk(host: Host, web: Web) {
 
             // The page and the list show Brian as next at once, not at the next sweep.
             if (filedAsks.length > 0) {
-                thread.run.next = nextActor(thread);
+                thread.run.next = nextActor(thread, state.threads);
             }
 
             // The PRs the agent reported go on its thread in the report's commit: a PR the desk may not attach, and a
@@ -26341,12 +26709,33 @@ export default function createDesk(host: Host, web: Web) {
                 reopened = true;
             }
 
-            const reported = shortLine(thread, {
-                from: request.from,
-                text: request.text,
-                quote: host.text.quoted(request.text, 80),
-            });
-            const line =
+            const review =
+                request.review === undefined
+                    ? undefined
+                    : recordReview(thread, {
+                          ...request.review,
+                          at: request.at,
+                          key: request.key,
+                      });
+            const view =
+                review === undefined
+                    ? undefined
+                    : reviewViews(thread, state.threads).find((each) => each.key === review.key)!;
+            const reviewUrgent =
+                review !== undefined &&
+                (review.outcome !== "ready" ||
+                    reviewViews(thread, state.threads).some(
+                        (each) => each.current && each.outcome !== "ready",
+                    ));
+            const reported =
+                view === undefined
+                    ? shortLine(thread, {
+                          from: request.from,
+                          text: request.text,
+                          quote: host.text.quoted(request.text, 80),
+                      })
+                    : `${reviewLine(thread, view, state.threads)}${reviewUrgent && review?.outcome === "ready" ? " · urgent: another current review needs action" : ""}`;
+            let line =
                 filedAsks.length === 0 ? reported : `${reported} · asks ${filedAsks.join(", ")}`;
 
             // A later report replaces these: only the newest report counts. `false` is not absent: an absent flag is a
@@ -26356,6 +26745,7 @@ export default function createDesk(host: Host, web: Web) {
             // An explicit `asks: []` decides as filed asks do: the status and the asks are the agent's word, and the
             // prose is not read, unless its text has an `ASKS FOR BRIAN:` block with items that says otherwise.
             const read =
+                request.review === undefined &&
                 filedAsks.length === 0 &&
                 !(request.asksNone === true && (asksForBrian(request.text)?.length ?? 0) === 0);
             const reportAsks = refused || (read && reportAsksBrian(request.text));
@@ -26363,6 +26753,10 @@ export default function createDesk(host: Host, web: Web) {
                 request.status === "blocked" ||
                 refused ||
                 (read && reportBlocks(request.text, request.reason));
+
+            if (review !== undefined && blocked) {
+                line += " · explicit blocked status or refused ask: action needed";
+            }
 
             // The session's newest user entry, read before this commit writes a task: a transaction cannot read tables
             // after its first table write.
@@ -26377,21 +26771,23 @@ export default function createDesk(host: Host, web: Web) {
                 const { digest } = await deskConfig();
 
                 if (digest.minutes > 0) {
-                    const kind: DigestKind =
-                        request.from === "night-shift" &&
-                        (request.reason === "blocked" || request.reason === "failed")
-                            ? "shift-blocked"
-                            : blocked
-                              ? "report-blocked"
-                              : request.from === "team_message"
-                                ? "report"
-                                : "shift";
+                    const kind: DigestKind = reviewUrgent
+                        ? "review-blocked"
+                        : request.from === "night-shift" &&
+                            (request.reason === "blocked" || request.reason === "failed")
+                          ? "shift-blocked"
+                          : blocked
+                            ? "report-blocked"
+                            : request.from === "team_message"
+                              ? "report"
+                              : "shift";
                     const due = enqueueDigest(
                         state,
                         thread.supervisor,
                         {
                             key: `report:${request.key}`,
                             thread: thread.id,
+                            ...(review === undefined ? {} : { reviewKey: review.key }),
                             kind,
                             line,
                             at: request.at,
@@ -26414,6 +26810,7 @@ export default function createDesk(host: Host, web: Web) {
                 from: request.from,
                 text: request.text,
                 line,
+                ...(review === undefined ? {} : { review }),
                 ...(held ? { held: true } : {}),
                 // What its PRs did is part of the report: a replay reads it and attaches nothing.
                 ...(prsOutcome === undefined ? {} : { prs: prsOutcome }),
@@ -28874,8 +29271,9 @@ export default function createDesk(host: Host, web: Web) {
     const busyNow = async (
         threads: Thread[],
         supervisor: ConversationId,
+        allThreads?: Readonly<Record<string, Thread>>,
     ): Promise<ReadonlySet<string> | undefined> => {
-        if (!waitsNeedLive(threads)) {
+        if (!waitsNeedLive(threads, allThreads)) {
             return undefined;
         }
 
@@ -30105,7 +30503,7 @@ export default function createDesk(host: Host, web: Web) {
             delete thread.run.quietReopen;
             delete thread.run.quietWake;
 
-            thread.run.next = nextActor(thread);
+            thread.run.next = nextActor(thread, state.threads);
 
             if (addEvent(thread, `reopened:${String(now)}`, `reopened: ${reason}`, now)) {
                 events += 1;
@@ -30121,7 +30519,7 @@ export default function createDesk(host: Host, web: Web) {
         if (facts.github !== undefined) {
             for (const thread of mine) {
                 // Also a closed task thread of a plan: a PR that conflicts or fails needs its repair.
-                if (repairReopen(thread, facts.github, now)) {
+                if (repairReopen(thread, facts.github, now, state.threads)) {
                     events += 1;
                 }
             }
@@ -30187,7 +30585,7 @@ export default function createDesk(host: Host, web: Web) {
                 }
             }
 
-            thread.run.next = nextActor(thread);
+            thread.run.next = nextActor(thread, state.threads);
 
             const elsewhere = new Set(
                 open
@@ -30195,7 +30593,12 @@ export default function createDesk(host: Host, web: Web) {
                     .map((other) => folderOf(other))
                     .filter((folder): folder is string => folder !== undefined),
             );
-            const check = closeCheck(thread, { now, folders: elsewhere, unread });
+            const check = closeCheck(thread, {
+                now,
+                folders: elsewhere,
+                unread,
+                threads: state.threads,
+            });
 
             if (!check.close) {
                 continue;
@@ -30521,7 +30924,7 @@ export default function createDesk(host: Host, web: Web) {
             const mine = Object.values(state.threads).filter(
                 (thread) => thread.supervisor === supervisor,
             );
-            const news = queueNews(mine, box, now);
+            const news = queueNews(mine, box, now, state.threads);
 
             // The reasons a digest carried go in before the items: a box's contents persist in 1 set.
             setDigestBox(state, supervisor, box);
@@ -32086,8 +32489,13 @@ export default function createDesk(host: Host, web: Web) {
                     const config = await deskConfig();
                     const { digest, journal } = config;
                     const clerk = clerkOf(state, supervisor);
-                    // Route by `clerk` and `now`, independently of urgency; omit only a proven routine close.
-                    const split = splitDigest(items, clerk !== undefined, digest, state);
+                    // Route independently of urgency; refresh review heads before the routine-close filter.
+                    const split = splitDigest(
+                        refreshReviewItems(items, state),
+                        clerk !== undefined,
+                        digest,
+                        state,
+                    );
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);
                     // The journal's zone, or the server's. The checkpoint keeps the text, so a replay says the same time.
@@ -34748,7 +35156,8 @@ export default function createDesk(host: Host, web: Web) {
                 );
                 // A silent session whose agent works now reports soon: it is not in the queue.
                 const waits = waitsText(candidates, {
-                    busy: await busyNow(candidates, api.conversationId),
+                    busy: await busyNow(candidates, api.conversationId, state?.threads),
+                    threads: state?.threads,
                 });
 
                 if (waits === "") {
@@ -35421,7 +35830,9 @@ export default function createDesk(host: Host, web: Web) {
             return boardRules.rowLine(
                 row,
                 boardLabel,
-                thread === undefined ? undefined : { id: thread.id, next: nextActor(thread) },
+                thread === undefined
+                    ? undefined
+                    : { id: thread.id, next: nextActor(thread, state?.threads) },
             );
         });
 
@@ -35529,7 +35940,7 @@ export default function createDesk(host: Host, web: Web) {
                         boardLabel,
                         thread === undefined
                             ? undefined
-                            : { id: thread.id, next: nextActor(thread) },
+                            : { id: thread.id, next: nextActor(thread, state.threads) },
                     );
                 }),
             ].join("\n");
@@ -36563,6 +36974,7 @@ export default function createDesk(host: Host, web: Web) {
                                           args.report === undefined
                                               ? undefined
                                               : (value) => host.text.defang(value),
+                                          state?.threads,
                                       ),
                             ].join("\n"),
                         );
@@ -38666,7 +39078,7 @@ export default function createDesk(host: Host, web: Web) {
                 };
 
                 for (const thread of open) {
-                    counts[nextActor(thread)] += 1;
+                    counts[nextActor(thread, threads)] += 1;
                 }
 
                 const byActor = (["brian", "agent", "odrade", "reviewer", "none"] as const)
@@ -38693,7 +39105,8 @@ export default function createDesk(host: Host, web: Web) {
                     .map((pr) => pr.ref);
                 // The section and the queue say the same thing: a silent session that works now is left out of both.
                 const waits = waitsText(open, {
-                    busy: await busyNow(open, input.conversationId),
+                    busy: await busyNow(open, input.conversationId, threads),
+                    threads,
                 });
                 const { cap, digest } = await deskConfig();
                 const capped = capView(state, cap, now);
@@ -38743,7 +39156,7 @@ export default function createDesk(host: Host, web: Web) {
                         (thread) =>
                             thread.origin === "found" &&
                             thread.key.startsWith("found:pr:") &&
-                            odradeReason(thread) !== undefined,
+                            odradeReason(thread, threads) !== undefined,
                     )
                         ? [
                               "A found PR that Brian opened himself is his own: mark it with desk own <id>. A PR you take off with desk detach stays off.",

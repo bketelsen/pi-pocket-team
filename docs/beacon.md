@@ -115,6 +115,31 @@ The review needs at least 100 `desk` results and 20 report lines in each role. I
 minimum, extend rather than claim a result. Keep unless the quality guard fails; undo if it fails; record the
 numbers and the keep, undo or extend decision here.
 
+## Structured review verdicts (pre-registered 2026-11-18)
+
+**Hypothesis.** With explicit review verdicts ([PR #273](https://github.com/bketelsen/pi-pocket-team/pull/273)),
+the Clerk stops escalating a current Ready to the supervisor. It sends a Ready of another thread's PR to that
+thread with `desk send`, and escalates only Not-ready and unclear verdicts. This should cut the supervisor's
+digest turns that only relay a passed review, with no slower path from a passed review to `ready-for-human`.
+
+**Metric and baseline.** For `2026-11-11` through `2026-11-18`, the supervisor's digests carried about 450 Clerk
+escalation lines. About 141 named a review, and about 89 of those reported a pass (a text match on the digest
+lines, so these counts are approximate). After install, count the same lines by the same match, the Clerk's
+`desk send` calls that relay a Ready, and the structured verdicts by kind and outcome.
+
+**Threshold and quality guard.** Keep when review escalations that report a pass fall by at least 50% and the
+guard holds. The guard fails when a thread with a current structured Ready of its PR waits more than 24 hours
+for its next step (no `ready-for-human`, merge or new commit) in more than 2 cases in the window, or when the
+supervisor misses a current Not-ready or unclear verdict.
+
+**Confounders.** Brief desk reads (#272), Clerk rotation (#271), the digest interval (config #74), traffic
+volume and the share of agents that file structured verdicts.
+
+**Minimum sample and review.** At least 30 structured verdicts in the window. Review after 1 complete 7-day
+window, on **2026-11-26** if the change installs on 2026-11-19. Extend the review date while the sample is short.
+Undo the Clerk rules (Team's Clerk text) when the guard fails; record the numbers and the keep, undo or extend
+decision here.
+
 ## 1. Collect
 
 **Principle.** Record as much as possible at the moment it happens: cheaply, durably, and in a store that exists.
@@ -164,9 +189,11 @@ Gaps:
   only.
 - **Wall time and rounds are partial.** A goal keeps only its newest 30 rounds (`KEPT_ROUNDS`), and a new goal in the
   same session writes over the old one. A thread keeps only its newest 50 events.
-- **Cross-review verdict.** Partly closed: the audit parses each reviewer answer for its verdict and its blocking
-  items (`loadReviewAnswers`). The parse reads free text: an answer in a format it does not know gives no item (Q1
-  counts a `Not ready` answer with no item as `unparsed`), and no module records the verdict as a field.
+- **Cross-review verdict.** Collection is explicit through `team_message.review`: the Desk records cross-review,
+  owner-review and plan-review evidence in `Thread.reviews` and `StoredReport.review`; `plan verify` records the
+  whole-plan verdict with its round. See [the contract](modules/desk.md#structured-review-verdicts).
+  The audit reads none of these fields yet. It still parses reviewer answers (`loadReviewAnswers`), so an unknown
+  format gives no item (Q1 counts a `Not ready` answer with no item as `unparsed`).
 - **Tool errors.** The audit reads errors of the team tools and the `plan` tool only (`loadToolErrors`), not of every
   tool.
 - **Outcome after merge.** Reverts are found by PR title and body (Q1). Nothing links a later fix PR to the PR it
