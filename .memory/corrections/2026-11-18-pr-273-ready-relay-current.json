@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk review verdicts",
+  "correction": "Emit a cross-thread Ready relay instruction only for that specific current, non-stale, non-ended Ready verdict. Refresh pending digest routing from current structured evidence instead of preserving the old routing suffix; retain explicit asks and blocked-status notes. Relay only to another open addressed thread of the same supervisor with a non-window PR link.",
+  "evidence": "https://github.com/bketelsen/pi-pocket-team/pull/273; authorized extra cross-review at dac40ac68fcb967ef05ebbcc9529599f798cf57f: blocking finding that stale, ended or superseded Ready verdicts retained cross-thread relay instructions in reviewLine and refreshReviewItems.",
+  "promoted_to": "desk-reviews.test.ts: Ready relay routing is removed when a queued verdict becomes stale, ended or superseded; Ready relay targets are only open addressed threads with non-window PR links"
+}

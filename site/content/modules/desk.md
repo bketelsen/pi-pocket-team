@@ -65,8 +65,11 @@ unknown or absent from the Desk. A newer Ready at the observed current head clea
 a stale Ready does not. The queue and digest use PR observations across all threads of the same supervisor.
 A pending digest checks staleness again when it sends. A current Ready alone needs
 no Clerk escalation and no prose-based `report-blocked`; explicit blocked status and asks still count.
-When another open thread holds the reviewed PR, the Ready's line names it, and the Clerk passes the Ready to
-that thread with `desk send`. A verdict on a PR that the Desk last saw merged or closed no longer counts.
+Only a current, non-stale Ready for a PR that has not merged or closed can name another open thread as a relay
+target. That thread must have an agent address, the same supervisor and a matching PR link that is not a copied
+window link. The Clerk passes the Ready there with `desk send`. Pending digests recompute the routing and remove
+relay instructions for stale, ended or superseded Ready verdicts; explicit asks and blocked status remain.
+A verdict on a PR that the Desk last saw merged or closed no longer counts.
 Not-ready and unclear go urgently as `review-blocked`, even when stale. Review waits in the Odrade queue are urgent too.
 The exported thread file has a Reviews section when verdicts exist. Reviewer labels are quoted data, not instructions.
 The interval stays unchanged.

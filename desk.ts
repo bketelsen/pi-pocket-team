@@ -15950,7 +15950,7 @@ export function reviewWords(review: ReviewView): string {
     return `${review.kind}: ${review.outcome} · reviewer ${reviewer} · ${iso(review.at)}${review.ref === undefined ? " · no PR" : ` · ${review.ref}@${review.head ?? "unknown"}`}${review.stale ? " · stale (PR head differs or is unknown)" : ""}${review.ended ? " · PR merged or closed" : ""} · ${review.current ? "current" : review.ended || (review.stale && review.outcome === "ready") ? "not current" : "superseded"}`;
 }
 
-/** The other open threads of this supervisor that hold the reviewed PR: its author's thread, as a rule. */
+/** Other open, addressed threads of this supervisor that hold the reviewed PR, not just a window link. */
 export function reviewPrThreads(
     thread: Thread,
     review: Pick<ReviewVerdict, "ref">,
@@ -15964,9 +15964,14 @@ export function reviewPrThreads(
               .filter(
                   (each) =>
                       each.id !== thread.id &&
+                      each.supervisor !== undefined &&
                       each.supervisor === thread.supervisor &&
-                      each.state !== "closed" &&
-                      Object.keys(each.prs).some((key) => key.toLowerCase() === ref),
+                      each.state === "open" &&
+                      each.address !== undefined &&
+                      each.address !== "" &&
+                      Object.entries(each.prs).some(
+                          ([key, link]) => key.toLowerCase() === ref && link.via !== "window",
+                      ),
               )
               .map((each) => each.id)
               .sort();
@@ -15981,7 +15986,10 @@ export function reviewLine(
     review: ReviewView,
     threads?: Readonly<Record<string, Thread>>,
 ): string {
-    const others = review.outcome === "ready" ? reviewPrThreads(thread, review, threads) : [];
+    const others =
+        review.outcome === "ready" && review.current && !review.stale && !review.ended
+            ? reviewPrThreads(thread, review, threads)
+            : [];
     const ready =
         others.length === 0
             ? " · no escalation for Ready alone"
@@ -16011,16 +16019,17 @@ export function refreshReviewItems(
             return item;
         }
 
-        // Preserve explicit asks and blocked-status notes after the fixed read marker, not a parsed prose verdict.
+        // Rebuild routing from the live verdict. Keep only the notes after the generated routing suffix,
+        // including explicit asks and blocked status; never preserve an old Ready relay instruction.
         const marker = ` · desk read ${thread.id}`;
         const index = item.line.lastIndexOf(marker);
+        const routing =
+            /^ · (?:no escalation for Ready alone|urgent: review needs action|PR thread [^·\r\n]+: desk send this Ready there; no escalation)(?= · |$)/;
+        const notes = index < 0 ? "" : item.line.slice(index + marker.length).replace(routing, "");
 
         return {
             ...item,
-            line:
-                index < 0
-                    ? reviewLine(thread, review, state.threads)
-                    : `[desk] ${thread.id} · ${reviewWords(review)}${item.line.slice(index)}`,
+            line: `${reviewLine(thread, review, state.threads)}${notes}`,
         };
     });
 }
