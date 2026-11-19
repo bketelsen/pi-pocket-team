@@ -2,7 +2,7 @@
 
 Team gives Pi Pocket named people. An identity is a Markdown profile: a name, a model, the repositories that person owns, and a home folder. In a session that carries the identity, Pi becomes that person. A supervisor delegates self-contained tasks into the agents' repositories, and each agent keeps its own lessons across every repository it tends.
 
-Files: `team.ts`, `_tool-time.ts` and `team-web/`. The module also adds 2 prompt sections, the `team_delegate`, `team_work`, `team_message`, `team_memory` and `team_sessions` tools, and the "Your team" rail page.
+Files: `team.ts`, `_tool-time.ts` and `team-web/`. The module also adds 2 prompt sections, the `team_delegate`, `team_work`, `team_message`, `team_wait_for_ci`, `team_memory` and `team_sessions` tools, and the "Your team" rail page.
 
 ## Turn it on, and use it
 
@@ -49,6 +49,20 @@ A folder that is not there is refused before the session starts, and before any 
 Before each desk-tracked start (a task, a shift, the Clerk, a plan, a plan consult), Team asks the desk to turn off the supervisor's run-end answers (Pi Pocket 0.29.0 and later, and the fork's tags from 0.28.0-bk.1): the reports come by `team_message`, so a linked session's run end does not wake the supervisor. `team_work` and the Team panel's start do not ask, so their lead keeps its answers, unless that lead is a desk supervisor.
 
 The Desk's goal board starts its shift rows through Team too, with `startShift`: the same start as `team_delegate` with `shift`, from the supervisor's session, under the board's key, with the row's end as the shift's absolute stop (`until_at`): a wait before round 1 never moves it. A model's `team_delegate` cannot set `until_at`. A replay of the key starts nothing again. The board's start never takes the desk's last free slots or Brian's OKs, and a start whose result is unknown (Pocket's start threw) is never tried again by itself.
+
+## Wait for CI
+
+`team_wait_for_ci` returns a PR's CI result in the same call, without later watch messages. It is available in ordinary sessions and always supplied to subagents with a tool list when Team is enabled there. Only that tool call waits; other sessions keep running.
+
+It runs in the current session folder. Optional inputs are `pr` (a number, HTTPS PR URL or `owner/name#12`; default: the current branch's PR) and `timeout_minutes` (1–60 whole minutes, default 30). It uses required checks. The all-checks fallback needs both `gh`'s explicit no-required-checks stderr message and a successful effective branch-rules read with no required context names. Missing required checks keep waiting; they never mean none are required.
+
+Before `PASS`, every required context from the base branch's effective rules must exist and have passed or skipped. Effective rules are paginated so a required check on a later page is not omitted. No workflow for the head may be queued, pending, waiting, requested or in progress (case-insensitive). The workflow read is capped at 1000 runs; a full cap is not trusted and returns `ERROR`, even if every listed run completed. Failed or malformed rules or workflow reads also return `ERROR`. A final head/base confirmation prevents a stale pass; workflow conclusions leave failure decisions to the checks.
+
+Polling waits are 30 seconds, 60 seconds, then 90 seconds thereafter, shortened by the remaining timeout. Empty or pending checks never pass; failed or cancelled checks return `FAIL`. `NO CHECKS` requires 5 minutes of empty observations on the same confirmed head with no active head workflow, unless the original timeout expires first. Each empty observation reads the head workflows; an active workflow resets the timer and keeps waiting, even if a required aggregator has not appeared for more than 5 minutes. Checks appearing or a head/base change also reset that timer; a head/base change restarts observations without resetting the backoff or deadline. `NO CHECKS` does not prove that no checks are required.
+
+Results start with `PASS`, `FAIL`, `TIMEOUT`, `NO PR`, `NO CHECKS`, `ERROR` or `INTERRUPTED`. Failure details include at most 3 checks, 3000 tail characters per job log and 8000 characters total. Disposing or reloading Team aborts active calls with `INTERRUPTED`, ends polling waits and kills active `gh` children. The tool API exposes no stop signal, so a person stopping a session cannot directly cancel an already running tool call.
+
+Unlike this blocking, read-only tool, Pocket's `watch_pr` starts an asynchronous event watch and gives no CI success result. See the [full CI wait reference](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#wait-for-ci).
 
 ## MCP servers
 

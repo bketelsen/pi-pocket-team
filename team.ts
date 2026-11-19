@@ -2,7 +2,7 @@
  * Brian's named agents: select a session identity, delegate to named teammates, and keep lessons for each agent.
  * Reads souls and model preferences from ~/.config/pi-pocket-team/agents; no stomp history, notebooks, or credentials.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, readFile, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -25,7 +25,7 @@ import {
     type JsonObject,
     type Tx,
 } from "@earendil-works/pi-durable";
-import type { Host, Web } from "./_pocket.d.ts";
+import type { Host, ToolOptions, Web } from "./_pocket.d.ts";
 import type * as ToolTimeModule from "./_tool-time.ts";
 
 /** Load the shared formatter with this module's reload key, as Desk does for its helpers. */
@@ -237,6 +237,669 @@ const runGit = promisify(execFile);
 /** One git command, with a timeout: a git that hangs must not hold a delegation. */
 const git = (folder: string, args: string[], timeout = 10_000) =>
     runGit("git", ["-C", folder, ...args], { timeout, encoding: "utf8" });
+
+/** The bounded result of a read-only gh command. A truncated JSON result must never be used. */
+export type CiCommandResult = {
+    code: number | null;
+    stdout: string;
+    stderr: string;
+    truncated?: boolean;
+};
+
+type CiRunOptions = { cwd: string; timeoutMs: number; tail?: boolean; signal?: AbortSignal };
+export type CiRunner = (args: string[], options: CiRunOptions) => Promise<CiCommandResult>;
+
+/** Schedule a cancellable timer; tests supply one that does not use real time. */
+type CiTimer = (callback: () => void, ms: number) => () => void;
+
+const ciTimer: CiTimer = (callback, ms) => {
+    const timer = setTimeout(callback, ms);
+
+    return () => clearTimeout(timer);
+};
+
+/** An abortable polling wait. Disposal must not leave its timer running. */
+export function waitForCiPoll(
+    ms: number,
+    signal?: AbortSignal,
+    timer: CiTimer = ciTimer,
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        signal?.throwIfAborted();
+        const cancel = timer(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+        }, ms);
+
+        const abort = () => {
+            cancel();
+            signal?.removeEventListener("abort", abort);
+            reject(signal?.reason ?? new Error("CI wait aborted"));
+        };
+
+        signal?.addEventListener("abort", abort, { once: true });
+
+        if (signal?.aborted === true) {
+            abort();
+        }
+    });
+}
+
+/** Run gh without a shell. Bound its output and kill it on timeout or module disposal. */
+export function runCiGh(
+    args: string[],
+    { cwd, timeoutMs, tail = false, signal }: CiRunOptions,
+    runtime: { spawn: typeof spawn; timer: CiTimer } = { spawn, timer: ciTimer },
+): Promise<CiCommandResult> {
+    return new Promise((resolve, reject) => {
+        signal?.throwIfAborted();
+        const child = runtime.spawn("gh", args, {
+            cwd,
+            shell: false,
+            stdio: ["ignore", "pipe", "pipe"],
+            env: { ...process.env, GH_PROMPT_DISABLED: "1", GH_PAGER: "cat", NO_COLOR: "1" },
+        });
+        const limit = tail ? 3000 : 256_000;
+        let stdout = "";
+        let stderr = "";
+        let truncated = false;
+        let timedOut = false;
+        const cancel = runtime.timer(() => {
+            timedOut = true;
+            child.kill("SIGKILL");
+        }, timeoutMs);
+
+        const cleanup = () => {
+            cancel();
+            signal?.removeEventListener("abort", abort);
+        };
+
+        const abort = () => {
+            child.kill("SIGKILL");
+            cleanup();
+            reject(signal?.reason ?? new Error("CI command aborted"));
+        };
+
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (text: string) => {
+            if (tail) {
+                stdout = (stdout + text).slice(-limit);
+            } else {
+                truncated ||= stdout.length + text.length > limit;
+                stdout = (stdout + text).slice(0, limit);
+            }
+        });
+        child.stderr.on("data", (text: string) => {
+            stderr = (stderr + text).slice(-3000);
+        });
+        child.on("error", (error) => {
+            cleanup();
+            reject(error);
+        });
+        child.on("close", (code) => {
+            cleanup();
+
+            if (signal?.aborted === true) {
+                reject(signal.reason ?? new Error("CI command aborted"));
+
+                return;
+            }
+
+            resolve({
+                code,
+                stdout,
+                stderr: timedOut ? "gh command timed out" : stderr,
+                truncated,
+            });
+        });
+        signal?.addEventListener("abort", abort, { once: true });
+
+        if (signal?.aborted === true) {
+            abort();
+        }
+    });
+}
+
+export type CiWaitDependencies = {
+    run: CiRunner;
+    now: () => number;
+    wait: (ms: number, signal?: AbortSignal) => Promise<void>;
+    signal?: AbortSignal;
+};
+
+const ciWaitDefaults: CiWaitDependencies = {
+    run: runCiGh,
+    now: () => performance.now(),
+    wait: waitForCiPoll,
+};
+
+/** A canonical PR address identifies the base repository, not a contributor's head repository. */
+function ciPrAddress(value: string): {
+    repo: string;
+    host: string;
+    repoPath: string;
+    number: string;
+    url: string;
+} {
+    if (value.length > 2048) {
+        throw new Error("The PR URL is longer than 2048 characters.");
+    }
+
+    const url = new URL(value);
+    const match = /^\/([^/]+)\/([^/]+)\/pull\/([1-9][0-9]*)\/?$/.exec(url.pathname);
+
+    if (
+        url.protocol !== "https:" ||
+        url.username !== "" ||
+        url.password !== "" ||
+        url.port !== "" ||
+        match === null ||
+        !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(
+            `${match[1]}/${match[2]}`,
+        ) ||
+        !Number.isSafeInteger(Number(match[3]))
+    ) {
+        throw new Error("Use a PR number, owner/name#12, or an HTTPS pull request URL.");
+    }
+
+    return {
+        repo: `${url.host}/${match[1]}/${match[2]}`,
+        host: url.host,
+        repoPath: `${match[1]}/${match[2]}`,
+        number: match[3]!,
+        url: `${url.origin}/${match[1]}/${match[2]}/pull/${match[3]}`,
+    };
+}
+
+/** Validate the selector before gh sees it: no flags, branch expressions or shell syntax. */
+function ciPrSelector(pr: number | string | undefined): string[] {
+    if (pr === undefined) {
+        return [];
+    }
+
+    const value = String(pr).trim();
+
+    if (/^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value))) {
+        return [value];
+    }
+
+    const ref = /^([A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)$/.exec(
+        value,
+    );
+
+    if (ref !== null && Number.isSafeInteger(Number(ref[2]))) {
+        return [ref[2]!, "--repo", ref[1]!];
+    }
+
+    const address = ciPrAddress(value);
+
+    return [address.number, "--repo", address.repo];
+}
+
+/** Effective rules can repeat a required context across rulesets. Missing or malformed rules never mean none. */
+function ciRequiredContexts(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+        throw new Error("gh returned malformed effective branch rules");
+    }
+
+    const contexts = new Set<string>();
+
+    for (const rule of value) {
+        if (rule === null || typeof rule !== "object" || typeof rule.type !== "string") {
+            throw new Error("gh returned a malformed branch rule");
+        }
+
+        if (rule.type !== "required_status_checks") {
+            continue;
+        }
+
+        const checks: unknown = rule.parameters?.required_status_checks;
+
+        if (!Array.isArray(checks)) {
+            throw new Error("gh returned malformed required status check rules");
+        }
+
+        for (const check of checks) {
+            if (
+                check === null ||
+                typeof check !== "object" ||
+                typeof check.context !== "string" ||
+                check.context.trim() === ""
+            ) {
+                throw new Error("gh returned a malformed required status check context");
+            }
+
+            contexts.add(check.context);
+        }
+    }
+
+    return [...contexts];
+}
+
+const ciWorkflowRunLimit = 1000;
+
+/** Active head workflows prevent PASS and NO CHECKS; check buckets still decide failure. */
+function ciWorkflowsPending(value: unknown): boolean {
+    if (!Array.isArray(value)) {
+        throw new Error("gh returned malformed workflow runs");
+    }
+
+    if (value.length >= ciWorkflowRunLimit) {
+        throw new Error(
+            `gh workflow run list reached the ${String(ciWorkflowRunLimit)}-run cap and may be truncated`,
+        );
+    }
+
+    const active = new Set(["queued", "pending", "waiting", "requested", "in_progress"]);
+    let pending = false;
+
+    for (const run of value) {
+        if (
+            run === null ||
+            typeof run !== "object" ||
+            typeof run.status !== "string" ||
+            (typeof run.conclusion !== "string" && run.conclusion !== null)
+        ) {
+            throw new Error("gh returned a malformed workflow run");
+        }
+
+        const status = run.status.toLowerCase();
+
+        if (active.has(status)) {
+            pending = true;
+        } else if (status !== "completed") {
+            throw new Error("gh returned an unknown workflow status");
+        }
+    }
+
+    return pending;
+}
+
+type CiCheck = { name: string; bucket: string; link: string };
+const ciLine = (text: string, max = 200): string => text.replace(/\s+/g, " ").trim().slice(0, max);
+
+/**
+ * Wait in this call. Effective branch rules name checks that gh pr checks can omit before an aggregator exists.
+ * A pass needs every required context, no active head workflow and a final same-head/base confirmation. Empty and
+ * unknown buckets never pass. The deadline covers resolution, polling and logs; a new head discards the observation,
+ * without extending that deadline. NO CHECKS needs 5 minutes of empty checks with no active head workflow. Polling backs off
+ * 30s, 60s, then 90s thereafter to protect the shared GitHub budget. Dependencies inject time and cancellation.
+ */
+export async function waitForCi(
+    cwd: string,
+    args: { pr?: number | string; timeout_minutes?: number },
+    dependencies: CiWaitDependencies = ciWaitDefaults,
+): Promise<string> {
+    const minutes = args.timeout_minutes ?? 30;
+
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+        return "ERROR: timeout_minutes must be a whole number from 1 to 60.";
+    }
+
+    const { run, now, wait, signal } = dependencies;
+    const deadline = now() + minutes * 60_000;
+    let label = "CI";
+    const timeout = () => `TIMEOUT: ${label}; CI did not finish within ${String(minutes)} minutes.`;
+
+    const command = async (argv: string[], tail = false) => {
+        signal?.throwIfAborted();
+        const remaining = deadline - now();
+
+        if (remaining <= 0) {
+            throw new Error("CI wait deadline reached");
+        }
+
+        const result = await run(argv, {
+            cwd,
+            timeoutMs: Math.min(30_000, remaining),
+            tail,
+            signal,
+        });
+
+        signal?.throwIfAborted();
+
+        if (now() >= deadline) {
+            throw new Error("CI wait deadline reached");
+        }
+
+        return result;
+    };
+
+    const json = (result: CiCommandResult): unknown => {
+        if (result.truncated === true) {
+            throw new Error("gh output exceeded the bounded JSON limit");
+        }
+
+        return JSON.parse(result.stdout);
+    };
+
+    const reason = (result: CiCommandResult) => ciLine(result.stderr || "gh could not read CI");
+
+    try {
+        const resolved = await command([
+            "pr",
+            "view",
+            ...ciPrSelector(args.pr),
+            "--json",
+            "number,url,headRefOid,baseRefName",
+        ]);
+
+        if (resolved.code !== 0) {
+            return /no pull requests? found|could not resolve to a pull\s?request/i.test(
+                resolved.stderr,
+            )
+                ? "NO PR: No pull request was found for this branch or selector."
+                : `ERROR: Cannot resolve the PR: ${reason(resolved)}`;
+        }
+
+        const pr = json(resolved) as {
+            number?: unknown;
+            url?: unknown;
+            headRefOid?: unknown;
+            baseRefName?: unknown;
+        };
+
+        if (
+            typeof pr.url !== "string" ||
+            typeof pr.headRefOid !== "string" ||
+            pr.headRefOid === "" ||
+            typeof pr.baseRefName !== "string" ||
+            pr.baseRefName === ""
+        ) {
+            throw new Error("gh returned no PR address, head SHA or base branch");
+        }
+
+        const address = ciPrAddress(pr.url);
+
+        if (pr.number !== Number(address.number)) {
+            throw new Error("gh returned inconsistent PR identity");
+        }
+
+        label = `${address.repo}#${address.number}`;
+        const where = [address.number, "--repo", address.repo];
+        let head = pr.headRefOid;
+        let base = pr.baseRefName;
+
+        const readRules = async () => {
+            const rules = await command([
+                "api",
+                `repos/${address.repoPath}/rules/branches/${encodeURIComponent(base)}`,
+                "--paginate",
+                "--slurp",
+                ...(address.host === "github.com" ? [] : ["--hostname", address.host]),
+            ]);
+
+            if (rules.code !== 0) {
+                throw new Error(`Cannot read effective branch rules: ${reason(rules)}`);
+            }
+
+            // Slurp keeps each page as an array, instead of concatenating separate JSON documents.
+            const pages = json(rules);
+
+            if (!Array.isArray(pages)) {
+                throw new Error("gh returned malformed effective branch rule pages");
+            }
+
+            return [...new Set(pages.flatMap(ciRequiredContexts))];
+        };
+
+        const workflowsPending = async (): Promise<boolean> => {
+            const runs = await command([
+                "run",
+                "list",
+                "--repo",
+                address.repo,
+                "--commit",
+                head,
+                "--limit",
+                String(ciWorkflowRunLimit),
+                "--json",
+                "status,conclusion",
+            ]);
+
+            if (runs.code !== 0) {
+                throw new Error(`Cannot read head workflow runs: ${reason(runs)}`);
+            }
+
+            return ciWorkflowsPending(json(runs));
+        };
+
+        const confirm = async (): Promise<boolean> => {
+            const confirmation = await command([
+                "pr",
+                "view",
+                ...where,
+                "--json",
+                "headRefOid,baseRefName",
+            ]);
+
+            if (confirmation.code !== 0) {
+                throw new Error(reason(confirmation));
+            }
+
+            const current = json(confirmation) as { headRefOid?: unknown; baseRefName?: unknown };
+
+            if (
+                typeof current.headRefOid !== "string" ||
+                current.headRefOid === "" ||
+                typeof current.baseRefName !== "string" ||
+                current.baseRefName === ""
+            ) {
+                throw new Error("gh returned no head SHA or base branch for confirmation");
+            }
+
+            if (current.headRefOid !== head || current.baseRefName !== base) {
+                head = current.headRefOid;
+                base = current.baseRefName;
+
+                return false;
+            }
+
+            return true;
+        };
+
+        let noChecksSince: number | undefined;
+        let pause = 30_000;
+
+        while (now() < deadline) {
+            let all = false;
+            let result = await command([
+                "pr",
+                "checks",
+                ...where,
+                "--required",
+                "--json",
+                "name,bucket,link",
+            ]);
+
+            const noRequired =
+                result.code === 1 &&
+                result.stderr
+                    .split("\n")
+                    .some((line) =>
+                        /^no required checks reported on the .* branch$/.test(line.trim()),
+                    );
+            let required: string[] | undefined;
+
+            if (noRequired) {
+                required = await readRules();
+
+                // gh's message describes existing check runs, not the rules: a missing aggregator is still required.
+                if (required.length === 0) {
+                    all = true;
+                    result = await command([
+                        "pr",
+                        "checks",
+                        ...where,
+                        "--json",
+                        "name,bucket,link",
+                    ]);
+                }
+            }
+
+            const noChecks =
+                (noRequired && !all) ||
+                (result.code === 1 &&
+                    /^no checks reported on the .* branch\s*$/.test(result.stderr.trim()));
+
+            if (!noChecks && ![0, 1, 8].includes(result.code ?? -1)) {
+                throw new Error(reason(result));
+            }
+
+            if (result.code === 1 && !noChecks && result.stdout.trim() === "") {
+                throw new Error(reason(result));
+            }
+
+            const rows = noChecks || result.stdout.trim() === "" ? [] : json(result);
+
+            if (
+                !Array.isArray(rows) ||
+                !rows.every((row: unknown) => {
+                    const check = row as CiCheck | null;
+
+                    return (
+                        check !== null &&
+                        typeof check === "object" &&
+                        typeof check.name === "string" &&
+                        typeof check.bucket === "string" &&
+                        typeof check.link === "string"
+                    );
+                })
+            ) {
+                throw new Error("gh returned malformed check rows");
+            }
+
+            const observedAt = now();
+
+            // Read after the check observation, including failures: an old head's result is never this head's result.
+            if (!(await confirm())) {
+                noChecksSince = undefined;
+                continue;
+            }
+
+            if (rows.length === 0) {
+                if (await workflowsPending()) {
+                    // A matrix can run for minutes before its required aggregator check exists.
+                    noChecksSince = undefined;
+                } else {
+                    noChecksSince ??= observedAt;
+
+                    if (observedAt - noChecksSince >= 5 * 60_000) {
+                        if (!(await confirm())) {
+                            noChecksSince = undefined;
+                            continue;
+                        }
+
+                        return `NO CHECKS: ${label} (${head.slice(0, 12)}); no checks reported for at least 5 minutes on this head, with no active head workflow.`;
+                    }
+                }
+            } else {
+                noChecksSince = undefined;
+            }
+
+            const failed = (rows as CiCheck[]).filter(
+                (row) => row.bucket === "fail" || row.bucket === "cancel",
+            );
+
+            if (failed.length > 0) {
+                let text = `FAIL: ${label} (${head.slice(0, 12)}); ${String(failed.length)} failed/cancelled checks.`;
+
+                for (const check of failed.slice(0, 3)) {
+                    text += `\n- ${ciLine(check.name)} (${check.bucket})`;
+                    let log = "Log unavailable: not an Actions run/job link.";
+
+                    try {
+                        const link = check.link === "" ? undefined : new URL(check.link);
+                        const ids =
+                            /^\/([^/]+)\/([^/]+)\/actions\/runs\/([0-9]+)\/jobs?\/([0-9]+)\/?$/.exec(
+                                link?.pathname ?? "",
+                            );
+
+                        if (
+                            link?.protocol === "https:" &&
+                            ids !== null &&
+                            `${link.host}/${ids[1]}/${ids[2]}`.toLowerCase() ===
+                                address.repo.toLowerCase()
+                        ) {
+                            const logs = await command(
+                                [
+                                    "run",
+                                    "view",
+                                    ids[3]!,
+                                    "--repo",
+                                    address.repo,
+                                    "--job",
+                                    ids[4]!,
+                                    "--log",
+                                ],
+                                true,
+                            );
+
+                            log =
+                                logs.code === 0
+                                    ? logs.stdout.slice(-3000) ||
+                                      "Log unavailable: job has no log yet."
+                                    : `Log unavailable: ${reason(logs)}`;
+                        }
+                    } catch (error) {
+                        if (signal?.aborted === true) {
+                            throw error;
+                        }
+
+                        log = "Log unavailable: the link is invalid or the log request failed.";
+                    }
+
+                    // Reserve room for the next check's name. Keep the end, not the start, of every job log.
+                    const budget = Math.min(3000, Math.max(0, 8000 - text.length - 500));
+
+                    text += `\n${budget === 0 ? "" : log.slice(-budget)}`;
+                }
+
+                return text.slice(0, 8000);
+            }
+
+            if (
+                result.code === 0 &&
+                rows.length > 0 &&
+                rows.every((row: CiCheck) => row.bucket === "pass" || row.bucket === "skipping")
+            ) {
+                required ??= await readRules();
+                const present = required.every((context) =>
+                    rows.some(
+                        (row: CiCheck) =>
+                            row.name === context &&
+                            (row.bucket === "pass" || row.bucket === "skipping"),
+                    ),
+                );
+
+                if (present && !(await workflowsPending())) {
+                    // Rules and workflow reads can take time. Recheck the head and base after both gates.
+                    if (!(await confirm())) {
+                        noChecksSince = undefined;
+                        continue;
+                    }
+
+                    return `PASS: ${label} (${head.slice(0, 12)}); all ${all ? "checks (none required)" : "required checks"} passed or skipped.`;
+                }
+            }
+
+            await wait(Math.min(pause, Math.max(0, deadline - now())), signal);
+            signal?.throwIfAborted();
+            pause = Math.min(pause * 2, 90_000);
+        }
+
+        return timeout();
+    } catch (error) {
+        if (signal?.aborted === true) {
+            return `INTERRUPTED: ${label}; CI wait was aborted.`;
+        }
+
+        return now() >= deadline
+            ? timeout()
+            : `ERROR: ${label}; ${ciLine(String((error as Error).message ?? error))}`;
+    }
+}
 
 /** The first non-empty line of git's error, on one line, at most 200 characters. */
 function gitReason(error: unknown): string {
@@ -5197,6 +5860,63 @@ export default function createTeam(host: Host, web: Web) {
         { annotations: { readOnlyHint: true } },
     );
 
+    // Tool context has no abort signal. Disposal owns every active call in this module instance.
+    const ciCalls = new Set<AbortController>();
+
+    web.onDispose(() => {
+        for (const controller of ciCalls) {
+            controller.abort();
+        }
+
+        ciCalls.clear();
+    });
+
+    const waitForCiTool = Object.assign(
+        defineTool({
+            name: "team_wait_for_ci",
+            description:
+                "Wait here for a PR's CI. Returns PASS, FAIL with bounded job-log tails, TIMEOUT, NO PR, NO CHECKS after 5 minutes on one head with no active workflow, ERROR, or INTERRUPTED on module disposal. Verifies effective required check names and waits for head workflows to finish; uses all checks only when none are required. Default: this folder's current branch PR; timeout 30 minutes. Read-only; does not watch or send later messages.",
+            parameters: Type.Object({
+                pr: Type.Optional(
+                    Type.Union([
+                        Type.Integer({ minimum: 1 }),
+                        Type.String({
+                            minLength: 1,
+                            maxLength: 2048,
+                            description: "PR number, HTTPS URL, or owner/name#12.",
+                        }),
+                    ]),
+                ),
+                timeout_minutes: Type.Optional(
+                    Type.Integer({ minimum: 1, maximum: 60, default: 30 }),
+                ),
+            }),
+            replay: "safe",
+            execute: async (args, api, context) => {
+                const controller = new AbortController();
+
+                ciCalls.add(controller);
+
+                try {
+                    const cwd = (await api.agent(context)).cwd;
+
+                    return reply(
+                        cwd === undefined
+                            ? "ERROR: This session has no current folder."
+                            : await waitForCi(cwd, args, {
+                                  ...ciWaitDefaults,
+                                  signal: controller.signal,
+                              }),
+                    );
+                } finally {
+                    ciCalls.delete(controller);
+                }
+            },
+        }),
+        { annotations: { readOnlyHint: true } },
+        { subagents: "always" } satisfies ToolOptions,
+    );
+
     /**
      * A home session must not change a repository: the repository's AGENTS.md, skills and memory never load there, so
      * the change would go out without its rules. `edit` and `write` are blocked into any roster repository, or a
@@ -5350,7 +6070,7 @@ export default function createTeam(host: Host, web: Web) {
 
     return defineExtension({
         name: "named-team",
-        tools: [delegateTool, work, message, list, teamMemory],
+        tools: [delegateTool, work, message, list, teamMemory, waitForCiTool],
         hooks: [homeGuard, mcpGuard, privateGuard],
         sections: [
             section("named_team", async (input, context) => {
