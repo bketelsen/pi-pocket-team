@@ -704,7 +704,7 @@ export type DigestBox = {
     sentAt?: number;
 };
 
-/** One registered Clerk: the supervisor's long-lived desk session. Stored data: never rename a field. */
+/** One registered Clerk: the supervisor's bounded-context desk session. Stored data: never rename a field. */
 export type Clerk = {
     /** The Clerk session's conversation id. */
     session: number;
@@ -715,7 +715,69 @@ export type Clerk = {
     at: number;
     /** The start's replay key, so its replay finds the Clerk it made: `x.team.delegate:<task>:<call>`. */
     key?: string;
+    /** The workspace selected at start. Absent in older registrations. */
+    cwd?: string;
+    /** Clerk digest batches taken in this session. Absent in registrations from before the counter. */
+    digests?: number;
+    /** The monotonic rotation generation. Absent in registrations from before bounded rotation. */
+    cycle?: number;
+    /** Previous registrations, oldest first. In-flight work can still use these sessions. */
+    history?: Omit<Clerk, "history">[];
 };
+
+/** Rotate after this many routine Clerk digests, before the context reaches another compaction cycle. */
+export const CLERK_DIGEST_LIMIT = 6;
+
+/** Keep enough Clerk history for the 7-day usage window plus a safe margin. Old sessions may still call the desk. */
+export const CLERK_HISTORY_KEEP_MS = 14 * 24 * 3600_000;
+
+/** One Clerk registration, without its history. */
+type ClerkPast = Omit<Clerk, "history">;
+
+/** Active and retained registrations: the active Clerk, its prior batches, and archived registrations. */
+export function clerkRegistrations(
+    state: Readonly<DeskState> | undefined,
+    supervisor?: number,
+): ClerkPast[] {
+    const keys =
+        supervisor === undefined
+            ? [
+                  ...new Set([
+                      ...Object.keys(state?.clerks ?? {}),
+                      ...Object.keys(state?.retiredClerks ?? {}),
+                  ]),
+              ]
+            : [String(supervisor)];
+    const found: ClerkPast[] = [];
+
+    for (const key of keys) {
+        const clerk = state?.clerks?.[key];
+
+        if (clerk !== undefined) {
+            const { history, ...current } = clerk;
+
+            found.push(current, ...(history ?? []));
+        }
+
+        found.push(...(state?.retiredClerks?.[key] ?? []));
+    }
+
+    return [...new Map(found.map((each) => [each.session, each])).values()];
+}
+
+/** Retain a bounded history: newest first by time, with each session once. */
+function retainedClerkHistory(entries: readonly ClerkPast[], at: number): ClerkPast[] {
+    const newest = [...entries].sort((a, b) => b.at - a.at || b.session - a.session);
+    const unique = new Map<number, ClerkPast>();
+
+    for (const each of newest) {
+        if (at - each.at <= CLERK_HISTORY_KEEP_MS && !unique.has(each.session)) {
+            unique.set(each.session, each);
+        }
+    }
+
+    return [...unique.values()].reverse();
+}
 
 /** What makes an issue queued: the label `agent-queue`, the label `agent-urgent`, the assignment, or the label
  * `needs-plan`. */
@@ -835,8 +897,10 @@ export type DeskState = {
     >;
     /** Each supervisor's waiting digest news, by conversation id. */
     digests?: Record<string, DigestBox>;
-    /** Each supervisor's Clerk, by supervisor id. */
+    /** Each supervisor's active Clerk, by supervisor id. */
     clerks?: Record<string, Clerk>;
+    /** Clerk registrations whose active session was archived. They retain permissions and usage attribution briefly. */
+    retiredClerks?: Record<string, ClerkPast[]>;
     /** The issues Brian queued on GitHub, from the last read. Absent until a read ran. */
     issues?: IssueQueue;
     /**
@@ -1712,8 +1776,13 @@ export function supervisorOfClerk(
     state: Readonly<DeskState> | undefined,
     session: number,
 ): number | undefined {
-    for (const [supervisor, clerk] of Object.entries(state?.clerks ?? {})) {
-        if (clerk.session === session) {
+    for (const supervisor of new Set([
+        ...Object.keys(state?.clerks ?? {}),
+        ...Object.keys(state?.retiredClerks ?? {}),
+    ])) {
+        if (
+            clerkRegistrations(state, Number(supervisor)).some((each) => each.session === session)
+        ) {
             return Number(supervisor);
         }
     }
@@ -5558,7 +5627,7 @@ export function archiveBindings(
             typeof thread.supervisor === "number" ? [thread.supervisor] : [],
         ),
     );
-    const clerks = new Set(Object.values(state?.clerks ?? {}).map((clerk) => clerk.session));
+    const clerks = new Set(clerkRegistrations(state).map((clerk) => clerk.session));
 
     type Bound = {
         threads: Thread[];
@@ -8459,7 +8528,29 @@ export function splitDigest(
 }
 
 /** One message a digest task sends: the supervisor's, or the Clerk's. */
-export type DigestMessage = { conversation: number; text: string; requestId: string };
+export type DigestMessage = {
+    conversation: number;
+    text: string;
+    requestId: string;
+    /** Fixed at take, never recomputed at delivery (including after midnight). */
+    rotation?: { key: string; at: number };
+};
+
+/** A replay-stable start key at a day boundary, or after `CLERK_DIGEST_LIMIT` routine Clerk digests. */
+export function clerkRotationKey(
+    clerk: Clerk,
+    supervisor: number,
+    at: number,
+    timeZone: string,
+): string | undefined {
+    const day = journalDay(at, timeZone);
+    const rotate =
+        day > journalDay(clerk.at, timeZone) || (clerk.digests ?? 0) >= CLERK_DIGEST_LIMIT;
+
+    return rotate
+        ? `x.desk.clerk:${String(supervisor)}:${day}:${String((clerk.cycle ?? 0) + 1)}`
+        : undefined;
+}
 
 /**
  * The messages a digest checkpoint holds: the list, or the 1 message of a task stored before the Clerk split (`text`
@@ -23770,7 +23861,7 @@ export function deskAgentSessions(state: DeskState | undefined): Map<number, str
         }
     }
 
-    for (const clerk of Object.values(state?.clerks ?? {})) {
+    for (const clerk of clerkRegistrations(state)) {
         claim(clerk.session, clerk.agent);
     }
 
@@ -24709,6 +24800,15 @@ type TeamApi = {
         context: Context,
     ) => Promise<TeamMember | undefined>;
     roster: () => Promise<TeamMember[]>;
+    /** Rotate the registered Clerk under a date-and-cycle key. An older Team has none: keep the recorded Clerk. */
+    rotateClerk?: (request: {
+        supervisor: number;
+        read: Pick<DocumentReader, "snapshot">;
+        commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+        context: Context;
+        key: string;
+        at: number;
+    }) => Promise<{ session: number; address: string }>;
     /** Start a plan from the page, as the person who taps (`team.ts`'s `TeamStartPlanRequest`). An older Team has none. */
     startPlan?: (request: {
         supervisor: number;
@@ -26719,6 +26819,29 @@ export default function createDesk(host: Host, web: Web) {
                 return;
             }
 
+            // A delayed replay must not make a historical session active again.
+            if (
+                clerkRegistrations(state, request.supervisor).some(
+                    (each) => each.session === request.session,
+                ) &&
+                existing?.session !== request.session
+            ) {
+                return;
+            }
+
+            const history = [
+                ...(state.retiredClerks?.[String(request.supervisor)] ?? []),
+                ...(existing?.history ?? []),
+            ];
+
+            if (existing !== undefined) {
+                const { history: _history, ...previous } = existing;
+
+                history.push(previous);
+            }
+
+            const keptHistory = retainedClerkHistory(history, request.at);
+
             state.clerks = {
                 ...(state.clerks ?? {}),
                 [String(request.supervisor)]: {
@@ -26726,9 +26849,20 @@ export default function createDesk(host: Host, web: Web) {
                     address: request.address,
                     agent: request.agent,
                     at: request.at,
+                    ...(request.digests === undefined ? {} : { digests: request.digests }),
+                    ...(request.cycle === undefined ? {} : { cycle: request.cycle }),
                     ...(request.key === undefined ? {} : { key: request.key }),
+                    ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+                    ...(keptHistory.length === 0 ? {} : { history: keptHistory }),
                 },
             };
+
+            if (state.retiredClerks?.[String(request.supervisor)] !== undefined) {
+                const retired = { ...state.retiredClerks };
+
+                delete retired[String(request.supervisor)];
+                state.retiredClerks = Object.keys(retired).length === 0 ? undefined : retired;
+            }
         },
         asks: reportAsksOf,
         prs: prsLineOf,
@@ -29780,12 +29914,25 @@ export default function createDesk(host: Host, web: Web) {
 
         if (archivedClerks.length > 0) {
             const left = { ...(state.clerks ?? {}) };
+            const retired = { ...(state.retiredClerks ?? {}) };
 
             for (const supervisorId of archivedClerks) {
+                const clerk = left[supervisorId];
+
+                if (clerk !== undefined) {
+                    const { history, ...current } = clerk;
+
+                    retired[supervisorId] = retainedClerkHistory(
+                        [...(retired[supervisorId] ?? []), ...(history ?? []), current],
+                        now,
+                    );
+                }
+
                 delete left[supervisorId];
             }
 
             state.clerks = left;
+            state.retiredClerks = retired;
         }
 
         state.github = {
@@ -30551,8 +30698,8 @@ export default function createDesk(host: Host, web: Web) {
                 .filter((address): address is string => typeof address === "string"),
         );
 
-        // A Clerk's session is known work: it never becomes a found thread.
-        for (const clerk of Object.values(state.clerks ?? {})) {
+        // A Clerk's active, historical and retired sessions are known work: none becomes a found thread.
+        for (const clerk of clerkRegistrations(state)) {
             addresses.add(clerk.address);
         }
 
@@ -32367,10 +32514,17 @@ export default function createDesk(host: Host, web: Web) {
                     const withFooter = (text: string): string => [text, ...footer].join("\n");
 
                     if (theirs.length > 0 && clerk !== undefined) {
+                        const key = clerkRotationKey(clerk, supervisor, now.at, now.timeZone);
+
+                        if (key === undefined) {
+                            clerk.digests = (clerk.digests ?? 0) + 1;
+                        }
+
                         messages.push({
                             conversation: clerk.session,
                             text: withFooter(digestText(theirs, now)),
                             requestId: `${base}:clerk`,
+                            ...(key === undefined ? {} : { rotation: { key, at: now.at } }),
                         });
                     }
 
@@ -32400,6 +32554,69 @@ export default function createDesk(host: Host, web: Web) {
                 const supervisor = task.input.supervisor as ConversationId;
                 // A task stored before the split has 1 message: `text` and `requestId` on the checkpoint.
                 const messages = digestMessages(task.input.supervisor, task.state.checkpoint);
+
+                // Persist the rotation result before any submit. A replay keeps both the target and request id.
+                if (messages.some((message) => message.rotation !== undefined)) {
+                    const resolved: DigestMessage[] = [];
+                    const rotatedSessions: number[] = [];
+
+                    for (const message of messages) {
+                        const { rotation, ...fixed } = message;
+
+                        if (rotation !== undefined) {
+                            try {
+                                const started = await teamApi()?.rotateClerk?.({
+                                    supervisor: task.input.supervisor,
+                                    read: runtime,
+                                    commit: async <T>(
+                                        change: (tx: Tx) => T | Promise<T>,
+                                    ): Promise<T> => {
+                                        let out: T | undefined;
+
+                                        await runtime.commit(async (tx) => {
+                                            out = await change(tx);
+
+                                            return undefined;
+                                        }, context);
+
+                                        return out as T;
+                                    },
+                                    context,
+                                    ...rotation,
+                                });
+
+                                if (started !== undefined) {
+                                    fixed.conversation = started.session;
+                                    rotatedSessions.push(started.session);
+                                }
+                            } catch (error) {
+                                host.notice(
+                                    "warning",
+                                    `The Clerk rotation failed: ${(error as Error).message}. Keeping the recorded Clerk.`,
+                                    supervisor,
+                                );
+                            }
+                        }
+
+                        resolved.push(fixed);
+                    }
+
+                    await runtime.commit(async (tx) => {
+                        const state = await tx.doc(DeskThreads);
+                        const active = clerkOf(state, task.input.supervisor);
+
+                        if (active !== undefined && rotatedSessions.includes(active.session)) {
+                            active.digests = (active.digests ?? 0) + 1;
+                        }
+
+                        return {
+                            status: "running",
+                            checkpoint: { phase: "deliver", messages: resolved },
+                        };
+                    }, context);
+
+                    return;
+                }
 
                 /** Submit 1 message; give back why it did not go, or nothing. */
                 const send = async (
@@ -32431,31 +32648,55 @@ export default function createDesk(host: Host, web: Web) {
                     }
                 };
 
-                for (const message of messages) {
-                    const toClerk = message.conversation !== task.input.supervisor;
-                    let reason = await send(message.conversation, message.text, message.requestId);
+                for (let index = 0; index < messages.length; index += 1) {
+                    const message = messages[index]!;
+                    const reason = await send(
+                        message.conversation,
+                        message.text,
+                        message.requestId,
+                    );
 
-                    // A Clerk that cannot take its news: the supervisor gets it in this same digest, with 1 notice.
-                    if (toClerk && reason !== undefined) {
+                    if (reason === undefined) {
+                        continue;
+                    }
+
+                    const fallback =
+                        message.conversation !== task.input.supervisor
+                            ? task.input.supervisor
+                            : undefined;
+
+                    if (fallback !== undefined) {
                         host.notice(
                             "warning",
                             `The Clerk did not get the desk digest: ${reason}. The supervisor got it instead.`,
                             supervisor,
                         );
-                        reason = await send(
-                            task.input.supervisor,
-                            message.text,
-                            `${message.requestId}:fallback`,
+
+                        const redirected = [...messages];
+
+                        redirected[index] = {
+                            conversation: fallback,
+                            text: message.text,
+                            requestId: `${message.requestId}:fallback:${String(fallback)}`,
+                        };
+                        // Persist the recipient before sending there. A crash cannot send to both targets, and retries
+                        // of an unavailable target cannot make a later-available new Clerk receive an old fallback.
+                        await runtime.commit(
+                            () => ({
+                                status: "running",
+                                checkpoint: { phase: "deliver", messages: redirected },
+                            }),
+                            context,
                         );
+
+                        return;
                     }
 
-                    if (reason !== undefined) {
-                        host.notice(
-                            "warning",
-                            `The desk digest did not reach its session: ${reason}.`,
-                            supervisor,
-                        );
-                    }
+                    host.notice(
+                        "warning",
+                        `The desk digest did not reach its session: ${reason}.`,
+                        supervisor,
+                    );
                 }
 
                 // The messages are in, or they never will be: no wait for the answer, and no retry for ever.

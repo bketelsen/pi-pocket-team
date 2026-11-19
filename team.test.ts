@@ -16,6 +16,8 @@ import {
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -23,7 +25,10 @@ import { after, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import type { Host } from "./_pocket.d.ts";
+import createTeam, * as teamModule from "./team.ts";
 import {
+    type CiCommandResult,
+    type CiRunner,
     delegationWorktree,
     FRONT_DOOR_DESK_OFF,
     Identity,
@@ -35,6 +40,1037 @@ import {
     teamMessageProblems,
     linkedSend,
 } from "./team.ts";
+
+/** A reverted Team module must fail an assertion about the blocking CI wait, not fail module loading. */
+async function waitForCi(...args: Parameters<typeof teamModule.waitForCi>): Promise<string> {
+    assert.equal(
+        typeof teamModule.waitForCi,
+        "function",
+        "Team must provide the blocking CI wait through waitForCi.",
+    );
+
+    return await teamModule.waitForCi(...args);
+}
+
+const ciUrl = "https://github.com/example/repo/pull/12";
+const ciRepo = "github.com/example/repo";
+const ciWhere = ["12", "--repo", ciRepo];
+const ciView = ["pr", "view", "--json", "number,url,headRefOid,baseRefName"];
+const ciConfirm = ["pr", "view", ...ciWhere, "--json", "headRefOid,baseRefName"];
+const ciRules = ["api", "repos/example/repo/rules/branches/main", "--paginate", "--slurp"];
+const ciRuns = (head = "head-a") => [
+    "run",
+    "list",
+    "--repo",
+    ciRepo,
+    "--commit",
+    head,
+    "--limit",
+    "1000",
+    "--json",
+    "status,conclusion",
+];
+const ciChecks = ["pr", "checks", ...ciWhere, "--required", "--json", "name,bucket,link"];
+const ciAllChecks = ["pr", "checks", ...ciWhere, "--json", "name,bucket,link"];
+const ciJson = (value: unknown, code = 0): CiCommandResult => ({
+    code,
+    stdout: JSON.stringify(value),
+    stderr: "",
+});
+const ciPr = (head = "head-a", base = "main") =>
+    ciJson({ number: 12, url: ciUrl, headRefOid: head, baseRefName: base });
+const ciHead = (head = "head-a", base = "main") => ciJson({ headRefOid: head, baseRefName: base });
+const ciCheck = (bucket: string, name = "Test", link = "") => ({ name, bucket, link });
+
+const ciRulesPages = (...pages: unknown[]) => ciJson(pages);
+const ciRuleNames = (...contexts: string[]) =>
+    ciRulesPages([
+        {
+            type: "required_status_checks",
+            parameters: { required_status_checks: contexts.map((context) => ({ context })) },
+        },
+    ]);
+const ciPassGates = (head = "head-a", readRules = true) => [
+    ...(readRules ? [{ args: ciRules, result: ciRuleNames("Test") }] : []),
+    { args: ciRuns(head), result: ciJson([{ status: "completed", conclusion: "success" }]) },
+    { args: ciConfirm, result: ciHead(head) },
+];
+
+/** Exact command scripts and an injected monotonic clock: no GitHub calls and no timer sleeps. */
+function ciFixture(
+    steps: { args: string[]; result: CiCommandResult; elapsed?: number; tail?: boolean }[],
+    signal?: AbortSignal,
+) {
+    let time = 0;
+    let calls = 0;
+    const waits: number[] = [];
+    const observed: {
+        args: string[];
+        cwd: string;
+        timeoutMs: number;
+        tail?: boolean;
+        signal?: AbortSignal;
+    }[] = [];
+
+    const run: CiRunner = async (args, options) => {
+        const step = steps[calls++];
+
+        observed.push({ args, ...options });
+        assert(step, `Unexpected gh call: ${JSON.stringify(args)}`);
+        time += step.elapsed ?? 0;
+
+        return step.result;
+    };
+
+    return {
+        deps: {
+            run,
+            signal,
+            now: () => time,
+            wait: async (ms: number) => {
+                waits.push(ms);
+                time += ms;
+            },
+        },
+        waits,
+        done: () => {
+            // Check outside waitForCi: its ERROR result must not hide a failed fixture assertion.
+            assert.equal(calls, steps.length, "Every scripted command ran exactly once");
+            assert.deepEqual(
+                observed.map((call) => call.args),
+                steps.map((step) => step.args),
+            );
+
+            for (const [index, call] of observed.entries()) {
+                assert.equal(call.cwd, "/session/current-folder");
+                assert.equal(call.tail, steps[index]!.tail ?? false);
+                assert.equal(call.signal, signal);
+                assert(call.timeoutMs > 0 && call.timeoutMs <= 30_000);
+            }
+        },
+    };
+}
+
+test("CI wait: no checks and pending checks wait; pass/skipping need same-head confirmation", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson([]) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciRuns(), result: ciJson([]) },
+        { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciChecks, result: ciJson([ciCheck("pass"), ciCheck("skipping", "Optional")]) },
+        { args: ciConfirm, result: ciHead() },
+        ...ciPassGates(),
+    ]);
+    const result = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+    assert.match(
+        result,
+        /^PASS: github.com\/example\/repo#12 \(head-a\); all required checks passed or skipped\.$/,
+    );
+    assert.deepEqual(fixture.waits, [30_000, 60_000]);
+    fixture.done();
+});
+
+test("CI wait: no rows, no checks yet, and unknown buckets time out, never pass", async () => {
+    for (const result of [
+        ciJson([]),
+        { code: 0, stdout: "", stderr: "" },
+        { code: 1, stdout: "", stderr: "no checks reported on the 'feature' branch\n" },
+        ciJson([ciCheck("pending")], 8),
+        ciJson([ciCheck("unknown")]),
+    ]) {
+        const empty = result.stdout === "" || result.stdout === "[]";
+        const observations = Array.from({ length: 2 }, () => [
+            { args: ciChecks, result },
+            { args: ciConfirm, result: ciHead() },
+            ...(empty ? [{ args: ciRuns(), result: ciJson([]) }] : []),
+        ]).flat();
+        const fixture = ciFixture([{ args: ciView, result: ciPr() }, ...observations]);
+        const text = await waitForCi(
+            "/session/current-folder",
+            { timeout_minutes: 1 },
+            fixture.deps,
+        );
+
+        assert.match(text, /^TIMEOUT:/);
+        assert.doesNotMatch(text, /PASS/);
+        assert.deepEqual(fixture.waits, [30_000, 30_000]);
+        fixture.done();
+    }
+});
+
+test("CI wait: polling backs off exactly 30s, 60s, then 90s and stays at 90s", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 6 }, () => [
+            { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+            { args: ciConfirm, result: ciHead() },
+        ]).flat(),
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+        ...ciPassGates(),
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+    assert.deepEqual(fixture.waits, [30_000, 60_000, 90_000, 90_000, 90_000, 90_000]);
+    fixture.done();
+});
+
+test("CI wait: same-head no checks return NO CHECKS after 5 minutes, including the all-checks fallback", async () => {
+    const noRequired = {
+        code: 1,
+        stdout: "",
+        stderr: "no required checks reported on the 'main' branch\n",
+    };
+    const fixture = ciFixture([
+        // PR resolution time is not time spent observing an empty check set.
+        { args: ciView, result: ciPr(), elapsed: 200_000 },
+        ...Array.from({ length: 6 }, () => [
+            { args: ciChecks, result: noRequired },
+            { args: ciRules, result: ciRulesPages([]) },
+            { args: ciAllChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRuns(), result: ciJson([]) },
+        ]).flat(),
+        { args: ciConfirm, result: ciHead() },
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^NO CHECKS:.*\(head-a\)/,
+    );
+    assert.deepEqual(fixture.waits, [30_000, 60_000, 90_000, 90_000, 90_000]);
+    fixture.done();
+});
+
+test("CI wait: checks that pass before 5 minutes still pass after empty observations", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 4 }, () => [
+            { args: ciChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRuns(), result: ciJson([]) },
+        ]).flat(),
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+        ...ciPassGates(),
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+    assert.deepEqual(fixture.waits, [30_000, 60_000, 90_000, 90_000]);
+    fixture.done();
+});
+
+test("CI wait: a head change resets the first no-checks observation timestamp", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 5 }, (_, index) => [
+            { args: ciChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead(index === 4 ? "head-b" : "head-a") },
+            ...(index === 4 ? [] : [{ args: ciRuns(), result: ciJson([]) }]),
+        ]).flat(),
+        ...Array.from({ length: 5 }, () => [
+            { args: ciChecks, result: ciJson([]) },
+            { args: ciConfirm, result: ciHead("head-b") },
+            { args: ciRuns("head-b"), result: ciJson([]) },
+        ]).flat(),
+        { args: ciConfirm, result: ciHead("head-b") },
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^NO CHECKS:.*\(head-b\)/,
+    );
+    assert.deepEqual(
+        fixture.waits,
+        [30_000, 60_000, 90_000, 90_000, 90_000, 90_000, 90_000, 90_000],
+    );
+    fixture.done();
+});
+
+test("CI wait: an active head workflow resets the no-checks timer before another 5 idle minutes", async () => {
+    const idle = [
+        { args: ciChecks, result: ciJson([]) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciRuns(), result: ciJson([]) },
+    ];
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 4 }, () => idle).flat(),
+        { args: ciChecks, result: ciJson([]) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciRuns(), result: ciJson([{ status: "waiting", conclusion: null }]) },
+        ...Array.from({ length: 5 }, () => idle).flat(),
+        { args: ciConfirm, result: ciHead() },
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^NO CHECKS:/);
+    assert.deepEqual(
+        fixture.waits,
+        [30_000, 60_000, 90_000, 90_000, 90_000, 90_000, 90_000, 90_000, 90_000],
+    );
+    fixture.done();
+});
+
+test("CI wait: abort ends an active polling wait without a real timer or a PASS result", async () => {
+    assert.equal(typeof teamModule.waitForCiPoll, "function");
+    const controller = new AbortController();
+    const waiting = Promise.withResolvers<void>();
+    let cancellations = 0;
+    const fixture = ciFixture(
+        [
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+            { args: ciConfirm, result: ciHead() },
+        ],
+        controller.signal,
+    );
+    const result = waitForCi(
+        "/session/current-folder",
+        {},
+        {
+            ...fixture.deps,
+            wait: (ms, signal) =>
+                teamModule.waitForCiPoll(ms, signal, (_callback, interval) => {
+                    assert.equal(signal, controller.signal);
+                    assert.equal(interval, 30_000);
+                    waiting.resolve();
+
+                    return () => {
+                        cancellations++;
+                    };
+                }),
+        },
+    );
+
+    await waiting.promise;
+    controller.abort();
+    assert.match(await result, /^INTERRUPTED:/);
+    assert.equal(cancellations, 1);
+    fixture.done();
+});
+
+test("CI wait: abort kills and ends an active gh child without timers or network", async () => {
+    assert.equal(typeof teamModule.runCiGh, "function");
+    const controller = new AbortController();
+    const kills: unknown[] = [];
+    let cancellations = 0;
+    let starts = 0;
+    const child = Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        kill: (signal: unknown) => {
+            kills.push(signal);
+
+            return true;
+        },
+    });
+    const runtime = {
+        spawn: ((command: string, args: string[], options: { shell: boolean; cwd: string }) => {
+            starts++;
+            assert.equal(command, "gh");
+            assert.deepEqual(args, ciChecks);
+            assert.equal(options.shell, false);
+            assert.equal(options.cwd, "/session/current-folder");
+
+            return child;
+        }) as unknown as typeof import("node:child_process").spawn,
+        timer: (_callback: () => void, ms: number) => {
+            assert.equal(ms, 30_000);
+
+            return () => {
+                cancellations++;
+            };
+        },
+    };
+    const result = teamModule.runCiGh(
+        ciChecks,
+        {
+            cwd: "/session/current-folder",
+            timeoutMs: 30_000,
+            signal: controller.signal,
+        },
+        runtime,
+    );
+    const ended = assert.rejects(result, { name: "AbortError" });
+
+    controller.abort();
+    await ended;
+    assert.deepEqual(kills, ["SIGKILL"]);
+    assert.equal(cancellations, 1);
+    assert.equal(starts, 1);
+    // A previously aborted call must not start a replacement child.
+    await assert.rejects(
+        teamModule.runCiGh(
+            ciChecks,
+            {
+                cwd: "/session/current-folder",
+                timeoutMs: 30_000,
+                signal: controller.signal,
+            },
+            runtime,
+        ),
+        { name: "AbortError" },
+    );
+    assert.equal(starts, 1);
+});
+
+test("CI wait: a cancelled check fails at once, even when another check is pending", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        {
+            args: ciChecks,
+            result: ciJson([ciCheck("pending"), ciCheck("cancel", "Cancelled test")], 1),
+        },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+    const result = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+    assert.match(result, /^FAIL:/);
+    assert.match(result, /Cancelled test \(cancel\)/);
+    assert.match(result, /Log unavailable: not an Actions run\/job link/);
+    assert.deepEqual(fixture.waits, []);
+    fixture.done();
+});
+
+test("CI wait: failing jobs include only 3 bounded log tails, with an 8000-character total", async () => {
+    const failed = Array.from({ length: 4 }, (_, index) =>
+        ciCheck(
+            "fail",
+            `job-${String(index + 1)}`,
+            `https://github.com/example/repo/actions/runs/99/${index === 1 ? "job" : "jobs"}/${String(index + 1)}`,
+        ),
+    );
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson(failed, 1) },
+        { args: ciConfirm, result: ciHead() },
+        ...failed.slice(0, 3).map((_check, index) => ({
+            args: ["run", "view", "99", "--repo", ciRepo, "--job", String(index + 1), "--log"],
+            result: {
+                code: 0,
+                stdout: `OMITTED-${String(index)}${"x".repeat(10_000)}TAIL-${String(index)}`,
+                stderr: "",
+            },
+            tail: true,
+        })),
+    ]);
+    const result = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+    assert.match(result, /^FAIL:/);
+    assert(result.length <= 8000);
+
+    for (let index = 0; index < 3; index++) {
+        assert(result.includes(`TAIL-${String(index)}`));
+        const section = result
+            .split(`- job-${String(index + 1)} (fail)\n`)[1]!
+            .split("\n- job-")[0]!;
+
+        assert(section.length <= 3000);
+    }
+
+    assert.doesNotMatch(result, /OMITTED|job-4/);
+    assert.deepEqual(fixture.waits, []);
+    fixture.done();
+});
+
+test("CI wait: external, run-only and unrelated job links never become Actions job ids", async () => {
+    for (const link of [
+        "https://ci.example/jobs/1",
+        "https://github.com/example/repo/actions/runs/99",
+        "https://github.com/other/repo/actions/runs/99/jobs/1",
+        "https://ci.example/example/repo/actions/runs/99/jobs/1",
+        "not a URL",
+    ]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("fail", "Test", link)], 1) },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", {}, fixture.deps),
+            /^FAIL:.*\n- Test \(fail\)\nLog unavailable:/,
+        );
+        fixture.done();
+    }
+});
+
+test("CI wait: no PR is explicit and an auth error is not no PR", async () => {
+    for (const [stderr, prefix] of [
+        ["no pull requests found for branch feature", "NO PR:"],
+        ["GraphQL: Could not resolve to a PullRequest", "NO PR:"],
+        ["HTTP 401: Bad credentials", "ERROR:"],
+    ]) {
+        const fixture = ciFixture([
+            { args: ciView, result: { code: 1, stdout: "", stderr: stderr! } },
+        ]);
+        const text = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+        assert(text.startsWith(prefix!));
+        assert.doesNotMatch(text, /PASS/);
+        fixture.done();
+    }
+});
+
+test("CI wait: only stderr's no-required-checks message enables the all-checks fallback", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        {
+            args: ciChecks,
+            result: {
+                code: 1,
+                stdout: "",
+                stderr: "no required checks reported on the 'main' branch\n",
+            },
+        },
+        { args: ciRules, result: ciRulesPages([]) },
+        { args: ciAllChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+        ...ciPassGates("head-a", false),
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^PASS:.*all checks \(none required\)/,
+    );
+    fixture.done();
+
+    const failed = ciFixture([
+        { args: ciView, result: ciPr() },
+        {
+            args: ciChecks,
+            result: ciJson(
+                [ciCheck("fail", "no required checks reported on the 'main' branch")],
+                1,
+            ),
+        },
+        { args: ciConfirm, result: ciHead() },
+    ]);
+
+    assert.match(await waitForCi("/session/current-folder", {}, failed.deps), /^FAIL:/);
+    failed.done();
+});
+
+test("CI wait: aggregator gap requires every effective context and completed head workflows before PASS", async () => {
+    const rules = ciRulesPages(
+        [
+            { type: "pull_request", parameters: {} },
+            {
+                type: "required_status_checks",
+                parameters: { required_status_checks: [{ context: "Visible" }] },
+            },
+        ],
+        [
+            {
+                type: "required_status_checks",
+                parameters: { required_status_checks: [{ context: "Test" }, { context: "Test" }] },
+            },
+        ],
+    );
+
+    for (const terminal of ["pass", "skipping"]) {
+        const passed = ciJson([ciCheck("pass", "Visible"), ciCheck(terminal, "Test")]);
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass", "Visible")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: rules },
+            { args: ciChecks, result: passed },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: rules },
+            { args: ciRuns(), result: ciJson([{ status: "in_progress", conclusion: "" }]) },
+            { args: ciChecks, result: passed },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: rules },
+            { args: ciRuns(), result: ciJson([{ status: "completed", conclusion: "success" }]) },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+        assert.deepEqual(fixture.waits, [30_000, 60_000]);
+        fixture.done();
+    }
+});
+
+test("CI wait: active matrix workflows longer than 5 minutes wait for required Test and return PASS", async () => {
+    for (const empty of [
+        { code: 1, stdout: "", stderr: "no required checks reported on the 'main' branch\n" },
+        ciJson([]),
+    ]) {
+        const reportsNoRequired = empty.code === 1;
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            ...Array.from({ length: 7 }, () => [
+                { args: ciChecks, result: empty },
+                ...(reportsNoRequired ? [{ args: ciRules, result: ciRuleNames("Test") }] : []),
+                { args: ciConfirm, result: ciHead() },
+                { args: ciRuns(), result: ciJson([{ status: "in_progress", conclusion: "" }]) },
+            ]).flat(),
+            { args: ciChecks, result: ciJson([ciCheck("pass", "Test")]) },
+            { args: ciConfirm, result: ciHead() },
+            ...ciPassGates(),
+        ]);
+
+        const text = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+        assert.match(text, /^PASS:/);
+        assert.doesNotMatch(text, /NO CHECKS/);
+        assert.deepEqual(fixture.waits, [30_000, 60_000, 90_000, 90_000, 90_000, 90_000, 90_000]);
+        assert(fixture.waits.reduce((sum, ms) => sum + ms, 0) > 5 * 60_000);
+        fixture.done();
+    }
+});
+
+test("CI wait: a required context on a later rules page prevents the all-checks fallback", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        ...Array.from({ length: 2 }, () => [
+            {
+                args: ciChecks,
+                result: {
+                    code: 1,
+                    stdout: "",
+                    stderr: "no required checks reported on the 'main' branch\n",
+                },
+            },
+            {
+                args: ["api", "repos/example/repo/rules/branches/main", "--paginate", "--slurp"],
+                result: ciRulesPages(
+                    [],
+                    [
+                        {
+                            type: "required_status_checks",
+                            parameters: { required_status_checks: [{ context: "Test" }] },
+                        },
+                    ],
+                ),
+            },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRuns(), result: ciJson([]) },
+        ]).flat(),
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", { timeout_minutes: 1 }, fixture.deps),
+        /^TIMEOUT:/,
+    );
+    assert.deepEqual(fixture.waits, [30_000, 30_000]);
+    fixture.done();
+});
+
+test("CI wait: unreadable or malformed effective rules are ERROR, never a safe fallback", async () => {
+    for (const rules of [
+        { code: 1, stdout: "", stderr: "HTTP 403: denied" },
+        { ...ciRulesPages([]), truncated: true },
+        ciJson({}),
+        ciRulesPages([null]),
+        ciRulesPages([{ type: "pull_request" }], {}),
+        ciRulesPages([{ type: "required_status_checks" }]),
+        ciRulesPages([
+            { type: "required_status_checks", parameters: { required_status_checks: {} } },
+        ]),
+        ciRulesPages([
+            {
+                type: "required_status_checks",
+                parameters: { required_status_checks: [{ context: "" }] },
+            },
+        ]),
+        ciRulesPages([
+            { type: "required_status_checks", parameters: { required_status_checks: [{}] } },
+        ]),
+        { code: 0, stdout: "{", stderr: "" },
+    ]) {
+        for (const noRequired of [false, true]) {
+            const fixture = ciFixture([
+                { args: ciView, result: ciPr() },
+                {
+                    args: ciChecks,
+                    result: noRequired
+                        ? {
+                              code: 1,
+                              stdout: "",
+                              stderr: "no required checks reported on the 'main' branch\n",
+                          }
+                        : ciJson([ciCheck("pass")]),
+                },
+                ...(noRequired ? [] : [{ args: ciConfirm, result: ciHead() }]),
+                { args: ciRules, result: rules },
+            ]);
+
+            assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^ERROR:/);
+            fixture.done();
+        }
+    }
+});
+
+test("CI wait: head workflow active statuses are case-insensitive and completed conclusions belong to checks", async () => {
+    for (const status of ["QUEUED", "Pending", "waiting", "Requested", "IN_PROGRESS"]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: ciRuleNames("Test") },
+            {
+                args: ciRuns(),
+                result: ciJson([
+                    { status: "completed", conclusion: "success" },
+                    { status, conclusion: null },
+                ]),
+            },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: ciRuleNames("Test") },
+            {
+                args: ciRuns(),
+                result: ciJson([
+                    { status: "COMPLETED", conclusion: "failure" },
+                    { status: "completed", conclusion: "cancelled" },
+                ]),
+            },
+            { args: ciConfirm, result: ciHead() },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+        assert.deepEqual(fixture.waits, [30_000]);
+        fixture.done();
+    }
+});
+
+test("CI wait: failed, malformed or capped head workflow reads are ERROR, not PASS or NO CHECKS", async () => {
+    for (const runs of [
+        { code: 1, stdout: "", stderr: "HTTP 502" },
+        { ...ciJson([]), truncated: true },
+        ciJson({}),
+        ciJson([null]),
+        ciJson([{ conclusion: "success" }]),
+        ciJson([{ status: "completed" }]),
+        ciJson([{ status: "unknown", conclusion: "" }]),
+        ciJson(
+            Array.from({ length: 1000 }, () => ({ status: "completed", conclusion: "success" })),
+        ),
+        { code: 0, stdout: "{", stderr: "" },
+    ]) {
+        for (const empty of [false, true]) {
+            const fixture = ciFixture([
+                { args: ciView, result: ciPr() },
+                { args: ciChecks, result: ciJson(empty ? [] : [ciCheck("pass")]) },
+                { args: ciConfirm, result: ciHead() },
+                ...(empty ? [] : [{ args: ciRules, result: ciRuleNames("Test") }]),
+                { args: ciRuns(), result: runs },
+            ]);
+
+            assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^ERROR:/);
+            fixture.done();
+        }
+    }
+});
+
+test("CI wait: 1000 completed workflow rows are ERROR because a full cap may hide active runs", async () => {
+    for (const { count, status } of [
+        { count: 999, status: "completed" },
+        { count: 1000, status: "completed" },
+        { count: 1000, status: "pending" },
+    ]) {
+        const full = count === 1000;
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            { args: ciRules, result: ciRuleNames("Test") },
+            {
+                args: ciRuns(),
+                result: ciJson(
+                    Array.from({ length: count }, () => ({
+                        status,
+                        conclusion: status === "completed" ? "success" : "",
+                    })),
+                ),
+            },
+            ...(full ? [] : [{ args: ciConfirm, result: ciHead() }]),
+        ]);
+        const text = await waitForCi("/session/current-folder", {}, fixture.deps);
+
+        assert.match(text, full ? /^ERROR:.*1000-run cap.*truncated/ : /^PASS:/);
+        assert.deepEqual(fixture.waits, []);
+        fixture.done();
+    }
+});
+
+test("CI wait: effective rule reads paginate and preserve the encoded base and host", async () => {
+    const base = "release/1.0";
+
+    for (const host of ["github.com", "github.example.com"]) {
+        const repo = `${host}/example/repo`;
+        const where = ["12", "--repo", repo];
+        const confirm = ["pr", "view", ...where, "--json", "headRefOid,baseRefName"];
+        const fixture = ciFixture([
+            {
+                args: ciView,
+                result: ciJson({
+                    number: 12,
+                    url: `https://${repo}/pull/12`,
+                    headRefOid: "head-a",
+                    baseRefName: base,
+                }),
+            },
+            {
+                args: ["pr", "checks", ...where, "--required", "--json", "name,bucket,link"],
+                result: ciJson([ciCheck("pass")]),
+            },
+            { args: confirm, result: ciHead("head-a", base) },
+            {
+                args: [
+                    "api",
+                    "repos/example/repo/rules/branches/release%2F1.0",
+                    "--paginate",
+                    "--slurp",
+                    ...(host === "github.com" ? [] : ["--hostname", host]),
+                ],
+                result: ciRuleNames("Test"),
+            },
+            {
+                args: [
+                    "run",
+                    "list",
+                    "--repo",
+                    repo,
+                    "--commit",
+                    "head-a",
+                    "--limit",
+                    "1000",
+                    "--json",
+                    "status,conclusion",
+                ],
+                result: ciJson([]),
+            },
+            { args: confirm, result: ciHead("head-a", base) },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^PASS:/);
+        fixture.done();
+    }
+});
+
+test("CI wait: a head change after rule and workflow gates cannot return a stale PASS", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead() },
+        { args: ciRules, result: ciRuleNames("Test") },
+        { args: ciRuns(), result: ciJson([]) },
+        { args: ciConfirm, result: ciHead("head-b") },
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead("head-b") },
+        ...ciPassGates("head-b"),
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", {}, fixture.deps),
+        /^PASS:.*\(head-b\)/,
+    );
+    fixture.done();
+});
+
+test("CI wait: a new head discards green and failed observations and starts checking again", async () => {
+    for (const bucket of ["pass", "fail"]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck(bucket)], bucket === "fail" ? 1 : 0) },
+            { args: ciConfirm, result: ciHead("head-b") },
+            { args: ciChecks, result: ciJson([ciCheck("pending")], 8) },
+            { args: ciConfirm, result: ciHead("head-b") },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead("head-b") },
+            ...ciPassGates("head-b"),
+        ]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", {}, fixture.deps),
+            /^PASS:.*\(head-b\)/,
+        );
+        assert.deepEqual(fixture.waits, [30_000]);
+        fixture.done();
+    }
+});
+
+test("CI wait: numeric, URL and repository selectors resolve first, then use the canonical base repository", async () => {
+    for (const [pr, selector] of [
+        [12, ["12"]],
+        ["12", ["12"]],
+        [ciUrl, ["12", "--repo", ciRepo]],
+        ["example/repo#12", ["12", "--repo", "example/repo"]],
+    ] as const) {
+        const fixture = ciFixture([
+            {
+                args: ["pr", "view", ...selector, "--json", "number,url,headRefOid,baseRefName"],
+                result: ciPr(),
+            },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            ...ciPassGates(),
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", { pr }, fixture.deps), /^PASS:/);
+        fixture.done();
+    }
+});
+
+test("CI wait: timeout includes command time and never returns a late pass", async () => {
+    const fixture = ciFixture([
+        { args: ciView, result: ciPr() },
+        { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+        { args: ciConfirm, result: ciHead(), elapsed: 60_000 },
+    ]);
+
+    assert.match(
+        await waitForCi("/session/current-folder", { timeout_minutes: 1 }, fixture.deps),
+        /^TIMEOUT:/,
+    );
+    fixture.done();
+});
+
+test("CI wait: bounded/malformed output and command errors cannot pass or fall back", async () => {
+    for (const result of [
+        { ...ciJson([ciCheck("pass")]), truncated: true },
+        ciJson({ bucket: "pass" }),
+        ciJson([{ bucket: "pass" }]),
+        { code: 0, stdout: "{", stderr: "" },
+        { code: 1, stdout: "", stderr: "HTTP 403: denied" },
+        { code: null, stdout: "", stderr: "gh command timed out" },
+    ]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result },
+        ]);
+
+        assert.match(await waitForCi("/session/current-folder", {}, fixture.deps), /^ERROR:/);
+        fixture.done();
+    }
+});
+
+test("CI wait: bad inputs do not start a child process, and timeout accepts 1 through 60 only", async () => {
+    for (const pr of [
+        0,
+        -1,
+        1.5,
+        "--help",
+        "12; echo bad",
+        "",
+        "https://github.com/example/repo/issues/12",
+    ]) {
+        const fixture = ciFixture([]);
+
+        assert.match(await waitForCi("/session/current-folder", { pr }, fixture.deps), /^ERROR:/);
+        fixture.done();
+    }
+
+    for (const timeout_minutes of [0, 61, 1.5, NaN]) {
+        const fixture = ciFixture([]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", { timeout_minutes }, fixture.deps),
+            /^ERROR: timeout_minutes/,
+        );
+        fixture.done();
+    }
+
+    for (const timeout_minutes of [1, 60]) {
+        const fixture = ciFixture([
+            { args: ciView, result: ciPr() },
+            { args: ciChecks, result: ciJson([ciCheck("pass")]) },
+            { args: ciConfirm, result: ciHead() },
+            ...ciPassGates(),
+        ]);
+
+        assert.match(
+            await waitForCi("/session/current-folder", { timeout_minutes }, fixture.deps),
+            /^PASS:/,
+        );
+        fixture.done();
+    }
+});
+
+test("team_wait_for_ci is an ordinary, read-only, replay-safe tool and is always available to subagents", async () => {
+    const symbol = Symbol.for("pi-pocket-team.team");
+    const holder = globalThis as unknown as Record<symbol, unknown>;
+    const previous = holder[symbol];
+    const disposers: (() => void)[] = [];
+
+    try {
+        const extension = createTeam(
+            { text: { defang: (text: string) => text }, linkedSessions: {} } as never,
+            {
+                conversationRoute() {},
+                route() {},
+                client() {},
+                command() {},
+                send() {},
+                onDispose(dispose: () => void) {
+                    disposers.push(dispose);
+                },
+            } as never,
+        ) as unknown as {
+            tools: {
+                name: string;
+                subagents?: string;
+                deferred?: boolean;
+                replay?: string;
+                annotations?: { readOnlyHint?: boolean };
+                execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+            }[];
+        };
+        const tool = extension.tools.find((each) => each.name === "team_wait_for_ci");
+
+        assert(tool);
+        assert.equal(tool.subagents, "always");
+        assert.equal(tool.annotations?.readOnlyHint, true);
+        assert.equal(tool.replay, "safe");
+        assert.notEqual(tool.deferred, true);
+        // The tool reads the caller's folder through api.agent, without requiring a named identity.
+        let reads = 0;
+        const result = await tool.execute(
+            {},
+            {
+                agent: async () => {
+                    reads++;
+
+                    return {};
+                },
+            },
+            context,
+        );
+
+        assert.equal(reads, 1);
+        assert.match(JSON.stringify(result), /This session has no current folder/);
+
+        // Hold both calls before their first gh command, then dispose the module. Neither may reach the network.
+        const folder = Promise.withResolvers<{ cwd: string }>();
+        const active = [
+            tool.execute({}, { agent: () => folder.promise }, context),
+            tool.execute({}, { agent: () => folder.promise }, context),
+        ];
+
+        for (const dispose of disposers) {
+            dispose();
+        }
+
+        folder.resolve({ cwd: "/session/current-folder" });
+
+        for (const interrupted of await Promise.all(active)) {
+            assert.match(JSON.stringify(interrupted), /INTERRUPTED:/);
+            assert.doesNotMatch(JSON.stringify(interrupted), /PASS/);
+        }
+    } finally {
+        if (previous === undefined) {
+            delete holder[symbol];
+        } else {
+            holder[symbol] = previous;
+        }
+    }
+});
 
 test("linkedSend keeps follow-up delivery arguments", async () => {
     const source = 42 as import("@earendil-works/pi-durable").ConversationId;

@@ -106,6 +106,8 @@ import {
     answeredText,
     answerKind,
     clerkOf,
+    deskAgentSessions,
+    type Clerk,
     digestConfig,
     digestMessages,
     deskTime,
@@ -1264,6 +1266,25 @@ describe("run-end answers", () => {
         assert.deepEqual(liveSupervisors(alone({ open: true })), [50], "an open thread");
         assert.deepEqual(liveSupervisors(alone({ sweeper: true })), [50], "a sweepers key");
         assert.deepEqual(liveSupervisors(alone({ clerk: true })), [50], "a clerks key");
+        const onlyRetired = alone({});
+
+        (
+            onlyRetired as typeof onlyRetired & {
+                retiredClerks: Record<string, Clerk[]>;
+            }
+        ).retiredClerks = {
+            "50": [{ session: 501, address: "session-retired", agent: "clerk", at: 1 }],
+        };
+        assert.deepEqual(
+            liveSupervisors(onlyRetired),
+            [],
+            "historical Clerk sessions keep no supervisor live",
+        );
+        assert.deepEqual(
+            deskSupervisors(onlyRetired),
+            [50],
+            "the supervisor's closed-thread run-end pass still has its own key",
+        );
         assert.deepEqual(
             liveSupervisors(alone({})),
             [],
@@ -14142,7 +14163,7 @@ describe("the digest's rules", () => {
 
     test("a Clerk is found by its supervisor, and a session by its supervisor's Clerk", () => {
         const state = empty();
-        const clerk = { session: 77, address: "session-a", agent: "clerk", at: 5 };
+        const clerk: Clerk = { session: 77, address: "session-a", agent: "clerk", at: 5 };
 
         state.clerks = { "5": clerk };
 
@@ -14152,6 +14173,64 @@ describe("the digest's rules", () => {
         assert.equal(supervisorOfClerk(state, 77), 5);
         assert.equal(supervisorOfClerk(state, 78), undefined);
         assert.equal(supervisorOfClerk(undefined, 77), undefined);
+
+        (clerk as Clerk & { history?: Clerk[] }).history = [
+            { session: 66, address: "session-old", agent: "clerk", at: 1 },
+        ];
+        assert.equal(clerkOf(state, 5)?.session, 77, "only the active Clerk is clerkOf");
+        assert.equal(supervisorOfClerk(state, 66), 5, "historical Clerk retains its supervisor");
+        assert.deepEqual(
+            [...deskAgentSessions(state)],
+            [
+                [77, "clerk"],
+                [66, "clerk"],
+            ],
+        );
+    });
+
+    test("Clerk rotation follows local dates, including midnight and DST, not elapsed hours", async () => {
+        const exports = await import("./desk.ts");
+        const rotate = Reflect.get(exports, "clerkRotationKey") as
+            | ((
+                  clerk: Clerk,
+                  supervisor: number,
+                  at: number,
+                  timeZone: string,
+              ) => string | undefined)
+            | undefined;
+
+        assert.equal(typeof rotate, "function", "the bounded rotation rule exists");
+        const at = Date.parse("2026-11-01T03:59:59Z");
+        const clerk: Clerk = {
+            session: 77,
+            address: "session-a",
+            agent: "clerk",
+            at,
+            digests: 6,
+            cycle: 2,
+        };
+        const key = (time: string, zone = "America/New_York") =>
+            rotate!(clerk, 5, Date.parse(time), zone);
+
+        assert.equal(key("2026-11-01T03:59:59Z"), "x.desk.clerk:5:2026-10-31:3");
+        clerk.digests = 5;
+        assert.equal(key("2026-11-01T04:00:00Z"), "x.desk.clerk:5:2026-11-01:3");
+        assert.equal(
+            key("2026-11-01T06:00:00Z"),
+            "x.desk.clerk:5:2026-11-01:3",
+            "DST repeats no date",
+        );
+        clerk.digests = 5;
+        assert.equal(
+            key("2026-10-30T04:00:00Z"),
+            undefined,
+            "a backwards clock cannot rotate back",
+        );
+        assert.equal(
+            key("2026-11-01T03:59:59Z", "UTC"),
+            undefined,
+            "the same instant is the same UTC day",
+        );
     });
 
     test("enqueue: an at-once kind asks for now, another for now plus the interval", () => {
@@ -15422,6 +15501,504 @@ function topLevelFields(selection: string): string[] {
 
     return words;
 }
+
+describe("Clerk bounded-context rotation", () => {
+    /** Real Team and Desk definitions, with an injected clock, durable documents, and host receipts. */
+    const fixture = () => {
+        const folder = join(root, "clerk-daily-rotation");
+
+        mkdirSync(folder, { recursive: true });
+        const savedEnv = {
+            agents: process.env.PI_POCKET_TEAM_AGENTS,
+            config: process.env.PI_POCKET_DESK_CONFIG,
+            zone: process.env.TZ,
+        };
+
+        process.env.TZ = "UTC";
+        process.env.PI_POCKET_TEAM_AGENTS = folder;
+        process.env.PI_POCKET_DESK_CONFIG = join(folder, "desk.json");
+        writeFileSync(
+            process.env.PI_POCKET_DESK_CONFIG,
+            JSON.stringify({ digest: { minutes: 15 } }),
+        );
+        writeFileSync(
+            join(folder, "clerk.md"),
+            `---\nrole: clerk\nmodel: faux/faux-2\nworkspace: ${folder}\n---\n# Clerk\nKeep the current Clerk rules.`,
+        );
+        const state = empty();
+        const old: Clerk = {
+            session: 77,
+            address: "session-old",
+            agent: "clerk",
+            at: Date.parse("2026-10-30T12:00:00Z"),
+        };
+
+        state.clerks = { "5": old };
+        const identities = new Map<number, { persona?: { id: string } }>();
+        const starts = new Map<string, { session: number; address: string }>();
+        const made: { key: string; request: { message: string; model: string; cwd: string } }[] =
+            [];
+        const admitted = new Map<string, { to: number; text: string }>();
+        const archived: string[] = [];
+        const attempts: number[] = [];
+        const unavailable = new Set<number>();
+        const notices: string[] = [];
+        let at = Date.parse("2026-10-31T12:00:00Z");
+        let failStart = false;
+        let failCheckpoint = false;
+        let failTerminal = false;
+        let checkpoint: {
+            phase: string;
+            messages?: { conversation: number; text: string; requestId: string }[];
+        } = { phase: "take" };
+        let terminal = false;
+        const tx = {
+            doc: async (kind: unknown, session: number) => {
+                if (kind === DeskThreads) {
+                    return state;
+                }
+
+                assert.equal(kind, Identity);
+
+                if (!identities.has(session)) {
+                    identities.set(session, {});
+                }
+
+                return identities.get(session)!;
+            },
+        };
+        const commit = async <T>(change: (tx: never) => T | Promise<T>) => change(tx as never);
+        const read = { snapshot: async () => state };
+        const web = {
+            conversationRoute() {},
+            route() {},
+            client() {},
+            command() {},
+            send() {},
+            onDispose() {},
+        };
+        const host = {
+            subagentModels: () => ["faux/faux-2"],
+            heldBack: () => undefined,
+            notice: (_level: string, text: string) => notices.push(text),
+            linkedSessions: {
+                archive: async (_source: number, request: { to: string }) => {
+                    archived.push(request.to);
+
+                    return { archived: true, repeating: 0 };
+                },
+                start: async (
+                    _source: number,
+                    request: (typeof made)[number]["request"],
+                    key: string,
+                ) => {
+                    if (failStart) {
+                        throw new Error("rotation refused");
+                    }
+
+                    if (starts.has(key)) {
+                        return starts.get(key)!;
+                    }
+
+                    const result = {
+                        session: 100 + made.length,
+                        address: `session-${String(made.length)}`,
+                    };
+
+                    made.push({ key, request });
+                    starts.set(key, result);
+
+                    return result;
+                },
+            },
+        };
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const teamKey = Symbol.for("pi-pocket-team.team");
+        const deskKey = Symbol.for("pi-pocket-team.desk");
+        const savedTeam = shared[teamKey];
+        const savedDesk = shared[deskKey];
+
+        type Phase = (task: unknown, runtime: unknown, context: unknown) => Promise<void>;
+        let phases: Record<string, Phase>;
+
+        const reload = () => {
+            const extension = createDesk(host as never, web as never) as unknown as {
+                tasks: { definition: { name: string; phases: Record<string, Phase> } }[];
+            };
+
+            createTeam(host as never, web as never);
+            phases = extension.tasks.find((each) => each.definition.name === "x.desk.digest")!
+                .definition.phases;
+        };
+
+        reload();
+        const runtime = {
+            now: () => at,
+            snapshot: read.snapshot,
+            commit: async (change: (tx: never) => Promise<unknown>) => {
+                const result = (await change(tx as never)) as
+                    | {
+                          status?: string;
+                          checkpoint?: typeof checkpoint;
+                      }
+                    | undefined;
+
+                if (result?.checkpoint !== undefined) {
+                    if (failCheckpoint) {
+                        failCheckpoint = false;
+
+                        throw new Error("restart before checkpoint");
+                    }
+
+                    checkpoint = structuredClone(result.checkpoint);
+                }
+
+                if (result?.status === "terminal") {
+                    if (failTerminal) {
+                        failTerminal = false;
+
+                        throw new Error("restart after submit");
+                    }
+
+                    terminal = true;
+                }
+            },
+            conversation: async (to: number) => {
+                if (unavailable.has(to)) {
+                    return undefined;
+                }
+
+                return {
+                    submit: async (request: { content: string; requestId: string }) => {
+                        attempts.push(to);
+                        admitted.set(`${String(to)}:${request.requestId}`, {
+                            to,
+                            text: request.content,
+                        });
+                    },
+                };
+            },
+        };
+        const phase = () =>
+            phases[checkpoint.phase]!(
+                {
+                    input: { supervisor: 5, due: at },
+                    state: { checkpoint: structuredClone(checkpoint) },
+                },
+                runtime,
+                context,
+            );
+
+        return {
+            state,
+            old,
+            folder,
+            made,
+            identities,
+            admitted,
+            archived,
+            attempts,
+            unavailable,
+            notices,
+            reload,
+            setTime: (time: string) => {
+                at = Date.parse(time);
+            },
+            failStart: () => {
+                failStart = true;
+            },
+            failCheckpoint: () => {
+                failCheckpoint = true;
+            },
+            failTerminal: () => {
+                failTerminal = true;
+            },
+            oldTeam: () => {
+                shared[teamKey] = { version: 1 };
+            },
+            rotate: async (key: string, time = at) => {
+                const api = shared[teamKey] as {
+                    rotateClerk: (request: unknown) => Promise<{ session: number }>;
+                };
+
+                return api.rotateClerk({ supervisor: 5, key, at: time, read, commit, context });
+            },
+            take: async (key = "report:1") => {
+                terminal = false;
+                checkpoint = { phase: "take" };
+                enqueueDigest(
+                    state,
+                    5,
+                    { key, thread: "", kind: "report", line: `[desk] ${key}`, at },
+                    at,
+                    { minutes: 15, now: [], clerk: ["report"] },
+                );
+                await phase();
+            },
+            phase,
+            deliver: async () => {
+                while (!terminal) {
+                    await phase();
+                }
+            },
+            restore: () => {
+                shared[teamKey] = savedTeam;
+                shared[deskKey] = savedDesk;
+
+                if (savedEnv.agents === undefined) {
+                    delete process.env.PI_POCKET_TEAM_AGENTS;
+                } else {
+                    process.env.PI_POCKET_TEAM_AGENTS = savedEnv.agents;
+                }
+
+                if (savedEnv.config === undefined) {
+                    delete process.env.PI_POCKET_DESK_CONFIG;
+                } else {
+                    process.env.PI_POCKET_DESK_CONFIG = savedEnv.config;
+                }
+
+                if (savedEnv.zone === undefined) {
+                    delete process.env.TZ;
+                } else {
+                    process.env.TZ = savedEnv.zone;
+                }
+
+                rmSync(folder, { recursive: true });
+            },
+        };
+    };
+
+    test("day change or six routine digests starts one current-profile Clerk; the key reuses it", async () => {
+        const f = fixture();
+
+        try {
+            await f.take();
+            await f.deliver();
+            assert.equal(f.made.length, 1);
+            assert.equal(f.made[0]!.key, "x.desk.clerk:5:2026-10-31:1");
+            assert.equal(f.made[0]!.request.model, "faux/faux-2");
+            assert.equal(
+                f.made[0]!.request.cwd,
+                f.folder,
+                "a legacy registration uses the current workspace",
+            );
+            assert.match(f.made[0]!.request.message, /Keep the current Clerk rules\./);
+            assert.equal(f.identities.get(100)?.persona?.id, "clerk");
+            assert.equal(clerkOf(f.state, 5)?.session, 100);
+            assert.deepEqual(
+                f.archived,
+                ["session-old"],
+                "the previous Clerk leaves the live list",
+            );
+            assert.deepEqual((clerkOf(f.state, 5) as Clerk & { history?: Clerk[] }).history, [
+                f.old,
+            ]);
+            assert.deepEqual(
+                [...f.admitted.values()].map((each) => each.to),
+                [100],
+            );
+            await f.take("report:2");
+            await f.deliver();
+            await f.rotate(f.made[0]!.key);
+            assert.equal(f.made.length, 1, "the rotation key replay never recreates the session");
+
+            for (let count = 3; count <= 6; count += 1) {
+                await f.take(`report:${String(count)}`);
+                await f.deliver();
+            }
+
+            assert.equal(f.made.length, 1, "six routine digests use one Clerk session");
+            await f.take("report:7");
+            await f.deliver();
+            assert.equal(f.made.length, 2, "the seventh routine digest starts the next batch");
+            assert.equal(f.made[1]!.key, "x.desk.clerk:5:2026-10-31:2");
+            f.setTime("2026-11-01T12:00:00Z");
+            await f.take("report:8");
+            await f.deliver();
+            assert.equal(f.made.length, 3, "a new day rotates once again");
+            const previous = await f.rotate(f.made[0]!.key);
+
+            assert.equal(previous.session, 102, "an old key delivers through the active Clerk");
+            assert.equal(
+                clerkOf(f.state, 5)?.session,
+                102,
+                "an old key cannot reactivate an earlier batch",
+            );
+            assert.equal((clerkOf(f.state, 5) as Clerk & { history?: Clerk[] }).history?.length, 3);
+            assert.equal(supervisorOfClerk(f.state, 77), 5);
+            assert.equal(deskAgentSessions(f.state).get(77), "clerk");
+        } finally {
+            f.restore();
+        }
+    });
+
+    test("history is bounded while the latest Clerk stays active", async () => {
+        const f = fixture();
+
+        try {
+            f.setTime("2026-11-20T12:00:00Z");
+            await f.take();
+            await f.deliver();
+            assert.equal(
+                (clerkOf(f.state, 5) as Clerk & { history?: Clerk[] }).history,
+                undefined,
+                "registrations older than the usage window leave the compact history",
+            );
+            assert.deepEqual(f.archived, ["session-old"]);
+        } finally {
+            f.restore();
+        }
+    });
+
+    test("restart after registration and after admission keeps one session and one digest", async () => {
+        const f = fixture();
+
+        try {
+            await f.take();
+            f.failCheckpoint();
+            await assert.rejects(f.phase(), /restart before checkpoint/);
+            assert.equal(f.made.length, 1, "registration committed before the failed checkpoint");
+            f.reload();
+            await f.phase();
+            assert.equal(f.made.length, 1);
+            f.failTerminal();
+            await assert.rejects(f.phase(), /restart after submit/);
+            f.reload();
+            await f.deliver();
+            assert.deepEqual(
+                f.attempts,
+                [100, 100],
+                "the submit is replayed to the recorded target",
+            );
+            assert.equal(f.admitted.size, 1, "the same request id admits the digest once");
+            assert.equal((clerkOf(f.state, 5) as Clerk & { history?: Clerk[] }).history?.length, 1);
+        } finally {
+            f.restore();
+        }
+    });
+
+    test("a digest taken before midnight stays with its recorded Clerk after midnight", async () => {
+        const f = fixture();
+
+        try {
+            f.setTime("2026-10-30T23:00:00Z");
+            await f.take();
+            f.setTime("2026-10-31T12:00:00Z");
+            await f.rotate("x.desk.clerk:5:2026-10-31:1");
+            await f.deliver();
+            assert.deepEqual(
+                [...f.admitted.values()].map((each) => each.to),
+                [77],
+            );
+            assert.equal(f.made.length, 1, "delivery did not recompute its take's date");
+        } finally {
+            f.restore();
+        }
+    });
+
+    test("rotation failure keeps the recorded Clerk, then uses the supervisor fallback", async () => {
+        for (const oldGone of [false, true]) {
+            const f = fixture();
+
+            try {
+                f.failStart();
+                clerkOf(f.state, 5)!.at = Date.parse("2026-10-31T12:00:00Z");
+                clerkOf(f.state, 5)!.digests = 6;
+                clerkOf(f.state, 5)!.cycle = 4;
+
+                if (oldGone) {
+                    f.unavailable.add(77);
+                }
+
+                await f.take();
+                await f.deliver();
+                assert.deepEqual(
+                    [...f.admitted.values()].map((each) => each.to),
+                    [oldGone ? 5 : 77],
+                );
+                assert.equal(f.made.length, 0);
+                assert.equal(clerkOf(f.state, 5)?.session, 77);
+                assert.equal(clerkOf(f.state, 5)?.digests, 6, "failure keeps the batch count");
+                assert.equal(clerkOf(f.state, 5)?.cycle, 4, "failure keeps the batch cycle");
+                assert(f.notices.some((text) => text.includes("rotation refused")));
+            } finally {
+                f.restore();
+            }
+        }
+    });
+
+    test("a legacy Clerk counts its first routine digest without rotating", async () => {
+        const f = fixture();
+
+        try {
+            clerkOf(f.state, 5)!.at = Date.parse("2026-10-31T12:00:00Z");
+            delete clerkOf(f.state, 5)!.digests;
+            delete clerkOf(f.state, 5)!.cycle;
+            await f.take();
+            await f.deliver();
+            assert.equal(f.made.length, 0);
+            assert.equal(clerkOf(f.state, 5)?.digests, 1);
+            assert.equal(clerkOf(f.state, 5)?.cycle, undefined);
+        } finally {
+            f.restore();
+        }
+    });
+
+    test("a rotated Clerk that cannot take news falls back to the supervisor, not its archived Clerk", async () => {
+        const f = fixture();
+
+        try {
+            f.unavailable.add(100);
+            await f.take();
+            await f.deliver();
+            assert.deepEqual(
+                [...f.admitted.values()].map((each) => each.to),
+                [5],
+            );
+            assert.deepEqual(f.archived, ["session-old"]);
+        } finally {
+            f.restore();
+        }
+    });
+
+    test("a persisted supervisor fallback cannot go to the new Clerk if it becomes available after a crash", async () => {
+        const f = fixture();
+
+        try {
+            f.unavailable.add(100);
+            await f.take();
+            await f.phase();
+            await f.phase();
+            f.reload();
+            f.unavailable.delete(100);
+            await f.deliver();
+            assert.deepEqual(
+                [...f.admitted.values()].map((each) => each.to),
+                [5],
+            );
+            assert.equal(f.attempts.includes(100), false);
+        } finally {
+            f.restore();
+        }
+    });
+
+    test("an older Team without rotation keeps the recorded Clerk", async () => {
+        const f = fixture();
+
+        try {
+            f.oldTeam();
+            await f.take();
+            await f.deliver();
+            assert.deepEqual(
+                [...f.admitted.values()].map((each) => each.to),
+                [77],
+            );
+            assert.equal(f.made.length, 0);
+        } finally {
+            f.restore();
+        }
+    });
+});
 
 /** The app's clock is this far ahead: the sweeper test moves it past its sleep. */
 let shift = 0;
@@ -30678,6 +31255,82 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
+        test("a day-boundary report reaches a fresh registered Clerk through the real digest task", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            writeClerk("faux/faux-2");
+            digestMinutes(15);
+
+            try {
+                const { source, linked, thread } = await delegated("clerk-daily");
+                const old = await startClerk(source);
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await clearDigests();
+                // The injected task clock is after this registration's local date in every zone.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).clerks![String(Number(source))]!.at =
+                        Date.now() - 2 * 24 * 3600_000;
+                }, context);
+                await say(app, linked, "report to supervisor test");
+                await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000);
+                await until(
+                    async () => {
+                        const active = await clerksOf(source);
+
+                        return (
+                            active !== undefined &&
+                            active.session !== old.session &&
+                            (await modelTexts(app, active.session as ConversationId)).some((text) =>
+                                text.includes("[desk] digest:"),
+                            )
+                        );
+                    },
+                    "the fresh Clerk's digest",
+                    20_000,
+                );
+                const active = (await clerksOf(source))!;
+
+                assert.deepEqual(
+                    (active as Clerk & { history?: Clerk[] }).history?.map((each) => each.session),
+                    [old.session],
+                );
+                assert.equal(app.cwdOf(active.session as ConversationId), clerkFolder);
+                assert.equal(
+                    (await modelTexts(app, active.session as ConversationId)).filter((text) =>
+                        text.includes("[desk] digest:"),
+                    ).length,
+                    1,
+                );
+                assert.equal(
+                    (await modelTexts(app, old.session as ConversationId)).filter((text) =>
+                        text.includes("[desk] digest:"),
+                    ).length,
+                    0,
+                );
+                assert.equal(
+                    (await modelTexts(app, source)).filter((text) =>
+                        text.includes("[desk] digest:"),
+                    ).length,
+                    0,
+                );
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestMinutes(0);
+                await app.setSubagentModels(owner(app), []);
+                removeClerk();
+            }
+        });
+
         test("a Clerk that cannot take its news: the supervisor gets it instead", async () => {
             digestMinutes(15);
 
@@ -30815,6 +31468,80 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
         const textOf = (result: unknown) =>
             (result as { output: { text: string }[] }).output.map((each) => each.text).join("\n");
+
+        test("a historical Clerk keeps escalation permission and its queued escalation remains deliverable", async () => {
+            const stub = stubDesk();
+
+            digestMinutes(15);
+
+            try {
+                const source = await supervisor("historical-clerk");
+                const old = await handClerk(source, "historical-clerk-old");
+
+                await stub.tool(
+                    { action: "escalate", text: "Waiting before rotation" },
+                    Number(old),
+                    "task-history",
+                    "before",
+                );
+                const active = await newSession(app, newFolder("historical-clerk-active"));
+
+                await command(active, "team-agent", "clerk");
+                const api = (
+                    globalThis as unknown as Record<
+                        symbol,
+                        {
+                            clerk: (tx: unknown, request: object) => Promise<void>;
+                        }
+                    >
+                )[Symbol.for("pi-pocket-team.desk")]!;
+
+                await app.harness.commit(
+                    (tx) =>
+                        api.clerk(tx, {
+                            supervisor: Number(source),
+                            session: Number(active),
+                            address: "session-history-active",
+                            agent: "clerk",
+                            at: Date.now(),
+                            key: "daily-history-key",
+                        }),
+                    context,
+                );
+                const result = textOf(
+                    await stub.tool(
+                        { action: "escalate", text: "Finish after rotation", urgent: true },
+                        Number(old),
+                        "task-history",
+                        "after",
+                    ),
+                );
+
+                assert.doesNotMatch(result, /not registered|not the Clerk|only the Clerk/i);
+                await until(
+                    async () =>
+                        (await modelTexts(app, source)).some((text) =>
+                            text.includes("Finish after rotation"),
+                        ),
+                    "the historical Clerk's escalation",
+                    20_000,
+                );
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.match(texts, /Waiting before rotation/);
+                assert.match(texts, /Finish after rotation/);
+                const state = await deskState();
+
+                assert.equal(supervisorOfClerk(state, Number(old)), Number(source));
+                assert.equal(deskAgentSessions(state).get(Number(old)), "clerk");
+                assert.equal(clerkOf(state, Number(source))?.session, Number(active));
+            } finally {
+                await stopDigests();
+                digestMinutes(0);
+                removeClerk();
+                stub.restore();
+            }
+        });
 
         test("a Clerk's escalation after the supervisor's desk send is dropped, recorded, and counted once", async () => {
             const stub = stubDesk();
@@ -32609,7 +33336,24 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
                 assert.equal(found, undefined, "the Clerk's session is known work");
 
-                // Archived: the sweep removes the registration, and adds nothing.
+                await app.harness.commit(async (tx) => {
+                    const clerk = (await tx.doc(DeskThreads)).clerks![
+                        String(Number(source))
+                    ]! as Clerk & {
+                        history?: Clerk[];
+                    };
+
+                    clerk.history = [
+                        {
+                            session: 998_877,
+                            address: "session-clerk-earlier",
+                            agent: "clerk",
+                            at: Date.now(),
+                        },
+                    ];
+                }, context);
+
+                // Archived: the active Clerk leaves, but retained history still maps work to its supervisor.
                 const before = Object.keys((await deskState())?.threads ?? {}).length;
                 const events = (await deskState())?.threads[thread.id]?.events.length ?? 0;
 
@@ -32618,7 +33362,13 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 });
                 await say(app, source, "desk sync test");
 
-                assert.equal(await clerksOf(source), undefined, "the Clerk left the desk");
+                assert.equal(await clerksOf(source), undefined, "the Clerk left the active desk");
+                assert.equal(
+                    supervisorOfClerk(await deskState(), Number(clerk.session)),
+                    Number(source),
+                );
+                assert.equal(supervisorOfClerk(await deskState(), 998_877), Number(source));
+                assert.equal(deskAgentSessions(await deskState()).get(998_877), "clerk");
                 assert.equal(Object.keys((await deskState())?.threads ?? {}).length, before);
                 assert.equal((await deskState())?.threads[thread.id]?.events.length, events);
             } finally {

@@ -107,6 +107,49 @@ The tool takes an optional `shift` object, `{ objective?, stop_when, start?, unt
 }
 ```
 
+## Wait for CI
+
+`team_wait_for_ci` waits for a PR's CI and returns the result in the same tool call. It is in Team's tools list for ordinary sessions, with no named identity required. The `subagents: "always"` marker also supplies it to subagents with a tool list when Team is enabled there. It blocks only that tool call, not the server or other sessions. It is read-only and safe to replay.
+
+The tool runs `gh` without a shell, in the calling session's current folder. It resolves the PR, its repository and its base branch (`baseRefName`) before polling checks.
+
+| Input             | Meaning                                                                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pr`              | Optional PR number (number or string), HTTPS pull request URL, or `owner/name#12` in a repository the tool can read. Default: the current branch's PR. |
+| `timeout_minutes` | Optional whole number from 1 to 60. Default: 30. The original deadline covers resolution, polling, rule and workflow reads, and log requests.          |
+
+For example:
+
+```json
+{ "pr": "example/repo#12", "timeout_minutes": 20 }
+```
+
+**Which checks count.** Each observation starts with `gh pr checks --required`. That command lists only checks that exist: it can omit an aggregator such as `Test` until its dependencies finish. Before `PASS`, the tool reads effective branch rules with `gh api repos/<owner>/<repo>/rules/branches/<base> --paginate --slurp` and takes the union of every `parameters.required_status_checks[].context` in rules with `type: "required_status_checks"`, removing duplicate names across rulesets and pages. Effective rules are paginated so a required check on a later page is not omitted; `--slurp` keeps the pages in one JSON document for validation. The API path excludes the repository's host prefix, and the base branch is URL-encoded. Every required context must be present in the observed checks and terminal `pass` or `skipping`.
+
+The all-checks fallback needs **both** a successful rules read with no required context names and `gh pr checks --required` exiting 1 with a line of **stderr** matching `no required checks reported on the .* branch`, for example `no required checks reported on the 'main' branch`. If the rules name required contexts, that message or an empty check list keeps waiting instead: it never means that no checks are required. A failed or malformed rules read returns `ERROR`, never a safe fallback. A failing check, a pending check or another command error does not enable the fallback.
+
+**Polling and completion.** The waits back off exactly: 30 seconds, 60 seconds, then 90 seconds thereafter, shortened only by the remaining timeout. This protects the shared GitHub budget. Pending checks and unknown buckets keep waiting. After each confirmed empty check observation, the tool reads the head workflows. An active workflow resets the no-checks timer and keeps waiting, even if a required aggregator has not appeared for more than 5 minutes. `NO CHECKS` needs at least 5 minutes of empty observations on the same confirmed head with no active head workflow. Checks appearing also reset that timer. A changed head discards the observation, resets the no-checks timer and starts checking again within the original deadline; it does not reset the polling backoff.
+
+A `fail` or `cancel` bucket returns `FAIL` without waiting for the other checks. The tool confirms the head and base branch after each check observation. A base change also discards the observation and resets the no-checks timer. A candidate `PASS` needs a non-empty set of terminal `pass` or `skipping` checks, a successful checks command and every required context from the rules. In fallback mode, the terminal-check rule applies to all checks.
+
+Before `PASS` or `NO CHECKS`, `gh run list --repo <canonical-repo> --commit <head> --limit 1000 --json status,conclusion` must also show no workflow with status `queued`, `pending`, `waiting`, `requested` or `in_progress` (case-insensitive). This closes the gap before an aggregator check exists. Run conclusions do not decide failure: failed or cancelled checks still produce `FAIL`. The workflow read is capped at 1000 runs. A list that reaches the cap is not trusted and returns `ERROR`, even if every listed run completed, because active runs could be omitted. A failed or malformed run-list read also returns `ERROR`. Finally, the head and base must still match after the rules and workflow reads; otherwise checking starts again within the original deadline.
+
+The result starts with one of:
+
+- `PASS`: every required context passed or skipped on the confirmed head and base, with no active head workflow; in fallback mode all observed checks passed or skipped.
+- `FAIL`: at least 1 check failed or was cancelled. The result includes at most 3 such checks and at most 3000 tail characters per job log, with an 8000-character total result limit. Actions run/job ids come only from `/actions/runs/<run>/job/<job>` or `/actions/runs/<run>/jobs/<job>` links in the same repository. Other links, or logs it cannot read, get a log-unavailable note.
+- `TIMEOUT`: the original deadline expired without a completed result. This never means pass.
+- `NO PR`: no pull request was found for the branch or selector.
+- `NO CHECKS`: the same confirmed head still has no checks after at least 5 minutes of empty observations with no active head workflow. An active workflow resets the timer. The next poll detects this threshold; the original timeout still takes precedence if it expires first. This never means pass, and it does not prove that no checks are required.
+- `ERROR`: the input, folder, PR resolution, check read, effective rules or workflow read could not be used. This never means pass.
+- `INTERRUPTED`: Team module disposal aborted the call. This never means pass.
+
+**Cancellation limit.** The tool API exposes no stop signal. Each call has a module-lifetime abort controller: disposing or reloading Team aborts active calls, ends their polling waits and kills their active `gh` children. A person stopping a session cannot directly cancel an already running tool call. The tool removes its controller when the call ends.
+
+**Not `watch_pr`.** Pocket's `watch_pr` starts an asynchronous event watch. It returns after starting, then sends later messages for failures, conflicts or reviewer activity; it returns no CI success result. `team_wait_for_ci` returns the CI result here and sends no later watch messages.
+
+The [implementation](../../team.ts) and [deterministic tests](../../team.test.ts) define the behavior. See also the [user summary](../../site/content/modules/team.md#wait-for-ci).
+
 ## Agent homes
 
 An agent can have a home: 1 folder of its own, such as `~/agents/duncan`, with an AGENTS.md, `notes/`, `plans/` and `reports/`, apart from every repository. The profile names it with `home:`. A home is a local git repository with no remote, and it never gets a worktree.
