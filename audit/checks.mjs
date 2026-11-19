@@ -2213,12 +2213,14 @@ const sortedKeys = (rows) =>
     Object.fromEntries(Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0])));
 
 /**
- * The reviewed heads of each PR in the window, from `reviewedHeads`: `{ rows, unattributed }`. A row is `{ ref, rounds,
- * heads, calls, first, last, at, items }`: `rounds` counts the distinct reviewed-head keys of its calls that are not
- * superseded (the head, or `unknown:<chain>` for a call with no head: all headless calls of 1 reviewer chain are 1
- * round); `heads` counts the distinct known heads of those calls; `calls` counts all its round calls, the superseded
- * ones too; `first` and `last` are the times of its first and last round call; `at` is the time of its last call that
- * is not superseded; `items` are its round calls. `unattributed` counts the round calls with no PR.
+ * The reviewed heads of each PR in the window, from `reviewedHeads`: `{ rows, unattributed, unheaded, checks }`.
+ * A row is `{ ref, rounds, heads, calls, first, last, at, items, checks, headless }`: `rounds` and `heads` count its
+ * distinct non-null reviewed heads from calls that are neither superseded nor exempt; `calls` counts all its round
+ * calls; `checks` counts non-superseded exempt calls; `headless` counts non-superseded, non-exempt calls with no head.
+ * `first` and `last` are the times of its first and last round call; `at` is the latest time of a call that adds a
+ * reviewed-head key; `items` are its round calls. `rows` includes only PRs with at least 1 key. `unattributed` counts
+ * round calls with no PR; `unheaded` counts PRs with round calls but no keys; `checks` sums checks over all PRs,
+ * including those omitted from `rows`.
  */
 function q1PrHeads(data, ctx) {
     const byRef = new Map();
@@ -2237,8 +2239,10 @@ function q1PrHeads(data, ctx) {
             calls: 0,
             first: item.at,
             last: item.at,
-            at: item.at,
+            at: -Infinity,
             items: [],
+            checks: 0,
+            headless: 0,
         };
 
         row.calls += 1;
@@ -2247,11 +2251,14 @@ function q1PrHeads(data, ctx) {
         row.items.push(item);
 
         if (!item.superseded) {
-            row.keys.add(item.head ?? `unknown:${item.chain}`);
-            row.at = Math.max(row.at, item.at);
-
-            if (item.head !== null) {
+            if (item.exempt) {
+                row.checks += 1;
+            } else if (item.head === null) {
+                row.headless += 1;
+            } else {
+                row.keys.add(item.head);
                 row.known.add(item.head);
+                row.at = Math.max(row.at, item.at);
             }
         }
 
@@ -2262,7 +2269,12 @@ function q1PrHeads(data, ctx) {
         .sort((a, b) => a.ref.localeCompare(b.ref))
         .map(({ keys, known, ...row }) => ({ ...row, rounds: keys.size, heads: known.size }));
 
-    return { rows, unattributed };
+    return {
+        rows: rows.filter((row) => row.rounds > 0),
+        unattributed,
+        unheaded: rows.filter((row) => row.rounds === 0).length,
+        checks: rows.reduce((total, row) => total + row.checks, 0),
+    };
 }
 
 /**
@@ -2659,13 +2671,16 @@ const round2 = (value) => Math.round(value * 100) / 100;
  * Q1's cross-review rounds per PR, from the session records (the session method; the PR-text method is elsewhere).
  * A round is 1 reviewed head of 1 PR (`q1PrHeads`, from `reviewedHeads`). A round call is a cross-review spawn, or a
  * send to a name whose latest spawn in that session was one. The PR of a call is the first desk-owner ref its message
- * names, else its bare PR number in its desk thread's repository; a send with none takes the PR of the latest earlier
- * call to that name. Per PR: `rounds` (its reviewed heads), `heads` (the distinct known heads of them), `calls` (all
- * its round calls, superseded ones too), `first` and `last` (its first and last round call), `worker` (`none`, 1 model,
- * or `mixed`) and `models` (the sorted distinct worker models). `totals.rounds` sums the reviewed heads,
- * `totals.calls` the round calls with a PR, and `unattributed` counts the round calls with no PR; `mean`, `median`,
- * `p90` and `atLeast3` are over the reviewed heads. `workers` groups PR counts and round statistics by worker label,
- * with `weeks` grouped by the Monday of each PR's last round call's New York date. No findings.
+ * names; a send with none takes the PR of the latest earlier call to that name. Calls with no reviewed head and
+ * exempt compatibility checks do not add rounds. PRs with no counted head are omitted. Per PR: `rounds` (its reviewed
+ * heads), `heads` (the distinct known heads of them), `calls` (all its round calls, superseded ones too), `checks`
+ * (non-superseded exempt calls), `headless` (non-superseded, non-exempt calls with no head), `first` and `last` (its
+ * first and last round call), `worker` (`none`, 1 model, or `mixed`) and `models` (the sorted distinct worker models).
+ * `totals.rounds` sums the reviewed heads, `totals.calls` the round calls of included PRs, `unattributed` counts round
+ * calls with no PR, `checks` counts non-superseded exempt calls over all PRs, and `unheaded` counts PRs with round
+ * calls but no counted head; `mean`, `median`, `p90` and `atLeast3` are over the reviewed heads. `workers` groups PR
+ * counts and round statistics by worker label, with `weeks` grouped by the Monday of each PR's last round call's
+ * New York date. No findings.
  */
 function q1PrRounds(data, ctx) {
     const unavailable = q1Unavailable(data, "reviews", "reviewCalls");
@@ -2674,7 +2689,7 @@ function q1PrRounds(data, ctx) {
         return unavailable;
     }
 
-    const { rows, unattributed } = q1PrHeads(data, ctx);
+    const { rows, unattributed, unheaded, checks } = q1PrHeads(data, ctx);
     const modelsOf = prWorkers(data, ctx);
     const workers = {};
     const prs = rows.map((row) => {
@@ -2692,6 +2707,8 @@ function q1PrRounds(data, ctx) {
             rounds: row.rounds,
             heads: row.heads,
             calls: row.calls,
+            checks: row.checks,
+            headless: row.headless,
             first: iso(row.first),
             last: iso(row.last),
             worker,
@@ -2726,6 +2743,8 @@ function q1PrRounds(data, ctx) {
             p90: p90(counts),
             atLeast3: counts.filter((count) => count >= 3).length,
             unattributed,
+            checks,
+            unheaded,
         },
         workers: sortedKeys(
             Object.fromEntries(

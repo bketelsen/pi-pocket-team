@@ -15,6 +15,7 @@ import {
     blockingItems,
     guardCacheOf,
     headIn,
+    isCompatibilityCheck,
     prRefsIn,
     reviewPoints,
     verdictIn,
@@ -670,10 +671,10 @@ export function loadParentEdits(db, sessions) {
 
 /**
  * Q1's review rounds: every `subagent` call with the action `spawn` or `send` from `since` on, oldest first. A row is
- * `{ id, c, at, action, name, refs, bare, head }`; a spawn row also has `model`, `tools`, `review` and `brief`, as
- * `spawnRows` makes them (so `isCrossReviewSpawn` reads it). `refs` and `bare` are the PRs the whole message names
- * (`prRefsIn`), `head` the reviewed head it names (`headIn`). No message text is kept but the first 300 characters of
- * a spawn's brief.
+ * `{ id, c, at, action, name, refs, bare, head, compat }`; a spawn row also has `model`, `tools`, `review` and `brief`,
+ * as `spawnRows` makes them (so `isCrossReviewSpawn` reads it). `refs` and `bare` are the PRs the whole message names
+ * (`prRefsIn`), `head` the reviewed head it names (`headIn`), and `compat` whether its opening names a compatibility
+ * check (`isCompatibilityCheck`). No message text is kept but the first 300 characters of a spawn's brief.
  */
 export function loadReviewCalls(db, since) {
     const out = [];
@@ -706,6 +707,7 @@ export function loadReviewCalls(db, since) {
                 refs,
                 bare,
                 head: headIn(message),
+                compat: isCompatibilityCheck(message),
             };
 
             if (action === "spawn") {

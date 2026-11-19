@@ -6,10 +6,12 @@ import { DAY, MINUTE, newYorkWeek } from "./common.mjs";
 import { NOW, ago, emptyData, thread, threadMap } from "./fixtures/builders.mjs";
 import {
     ANSWER,
+    COMPAT_LEAD,
     blockingItems,
     callPr,
     guardCacheOf,
     headIn,
+    isCompatibilityCheck,
     ownersOf,
     prRefsIn,
     prWorkers,
@@ -71,6 +73,20 @@ test("prRefsIn: bare numbers are `PR #N`, `PR N` and `pull request #N` that are 
     });
     assert.deepEqual(prRefsIn("acme/widgets, issue #4, PR #9"), { refs: [], bare: [9] });
     assert.deepEqual(prRefsIn(""), { refs: [], bare: [] });
+});
+
+test("isCompatibilityCheck: a singular check in the first 200 characters, ignoring case", () => {
+    assert.equal(COMPAT_LEAD, 200);
+    assert.equal(
+        isCompatibilityCheck("You do a short compatibility check (cross-review skill ...)"),
+        true,
+    );
+    assert.equal(isCompatibilityCheck("Compatibility Check for PR acme/widgets#12"), true);
+    assert.equal(isCompatibilityCheck("Keep secure assembly compatibility checks intact"), false);
+    assert.equal(isCompatibilityCheck(" ".repeat(181) + "compatibility check"), true);
+    assert.equal(isCompatibilityCheck(" ".repeat(182) + "compatibility check"), false);
+    assert.equal(isCompatibilityCheck(""), false);
+    assert.equal(isCompatibilityCheck(undefined), false);
 });
 
 // ---------- headIn ----------
@@ -215,6 +231,22 @@ test("callPr: the first desk-owner ref; else a bare number in the thread's repos
     // No thread for the session.
     assert.equal(callPr(call({ c: 999, bare: [9] }), data).ref, null);
     assert.equal(callPr(call({}), data).ref, null);
+});
+
+test("callPr: bare false rejects bare numbers, keeps desk-owner refs, and leaves the default unchanged", () => {
+    const data = { threads: threadMap(t1) };
+    const call = { c: t1.session, at: NOW, refs: [], bare: [9] };
+
+    assert.deepEqual(callPr(call, data, ownersOf(data), false), {
+        ref: null,
+        count: 0,
+        refs: [],
+    });
+    assert.deepEqual(
+        callPr({ ...call, refs: ["stranger/x#1", "acme/widgets#4"] }, data, ownersOf(data), false),
+        { ref: "acme/widgets#4", count: 1, refs: ["acme/widgets#4"] },
+    );
+    assert.equal(callPr(call, data).ref, "acme/widgets#9");
 });
 
 test("threadAt: the latest thread of a session started at or before the time", () => {
@@ -674,6 +706,7 @@ test("reviewedHeads: a call with no head takes the reviewed head of the call bef
             session: t1.session,
             reviewer: "rv",
             superseded: false,
+            exempt: false,
         },
         {
             ref: "acme/widgets#4",
@@ -683,6 +716,7 @@ test("reviewedHeads: a call with no head takes the reviewed head of the call bef
             session: t1.session,
             reviewer: "rv",
             superseded: false,
+            exempt: false,
         },
         {
             ref: "acme/widgets#5",
@@ -692,8 +726,54 @@ test("reviewedHeads: a call with no head takes the reviewed head of the call bef
             session: t1.session,
             reviewer: "rv",
             superseded: false,
+            exempt: false,
         },
     ]);
+});
+
+test("reviewedHeads: a bare number in a review brief is no PR", () => {
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            {
+                ...spawn(1, ago(DAY), { bare: [1, 2, 3], head: SHA_A }),
+                brief: "Review these items: PR 1:, PR 2:, PR 3:",
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        reviewedHeads(data, { now: NOW }).map((item: { ref: string | null }) => item.ref),
+        [null],
+    );
+});
+
+test("reviewedHeads: an exempt send does not supersede a round; worker compatibility calls are not rounds", () => {
+    const at = ago(DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            spawn(1, at, { refs: ["acme/widgets#4"], head: SHA_A }),
+            { ...send(2, at + MINUTE, { refs: ["acme/widgets#4"], head: SHA_B }), compat: true },
+            workerSpawn(3, at, "openai/gpt-6.1-sol", "coder", ["acme/widgets#4"]),
+            { ...send(4, at + 2 * MINUTE, { head: SHA_C }), name: "coder", compat: true },
+        ],
+        reviewAnswers: [answerTo(10, at + 3 * MINUTE)],
+    });
+
+    assert.deepEqual(
+        reviewedHeads(data, { now: NOW }).map(
+            (item: { head: string | null; superseded: boolean; exempt: boolean }) => [
+                item.head,
+                item.superseded,
+                item.exempt,
+            ],
+        ),
+        [
+            [SHA_A, false, false],
+            [SHA_B, false, true],
+        ],
+    );
 });
 
 test("reviewedHeads: a call is superseded when the next call of its chain, for the same PR, comes before any answer", () => {

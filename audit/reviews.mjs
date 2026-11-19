@@ -6,6 +6,14 @@ import { DAY } from "./common.mjs";
 /** The window of `prRounds` and `blockers`, in days. */
 export const REVIEW_WINDOW_DAYS = 30;
 
+/** The leading characters searched for the compatibility-check exemption. */
+export const COMPAT_LEAD = 200;
+
+/** Whether the first `COMPAT_LEAD` characters name a singular `compatibility check`, ignoring case. */
+export function isCompatibilityCheck(text) {
+    return /\bcompatibility check\b/i.test(String(text ?? "").slice(0, COMPAT_LEAD));
+}
+
 /**
  * A cross-review reviewer (Brian's cross-review policy): a read-only subagent with exactly the tools `read` and
  * `bash`, whose name or brief says "review". It runs on another model family by design.
@@ -206,9 +214,10 @@ const REPO = /^[\w.-]+\/[\w.-]+$/;
 
 /**
  * The PR of 1 review call: the first of its refs whose owner is a desk owner; with no such ref, its first bare number
- * in the repository of its desk thread. `count` is how many such refs it names, and `refs` lists them.
+ * in the repository of its desk thread when `bare` is true (the default), else null. `count` is how many such refs it
+ * names, and `refs` lists them.
  */
-export function callPr(call, data, owners = ownersOf(data)) {
+export function callPr(call, data, owners = ownersOf(data), bare = true) {
     const refs = [
         ...new Set(
             (Array.isArray(call.refs) ? call.refs : []).filter((ref) => owners.has(ownerOf(ref))),
@@ -219,11 +228,15 @@ export function callPr(call, data, owners = ownersOf(data)) {
         return { ref: refs[0], count: refs.length, refs };
     }
 
-    const bare = Array.isArray(call.bare) ? call.bare : [];
-    const repo = bare.length > 0 ? threadAt(data, call.c, call.at)?.repo : undefined;
+    if (!bare) {
+        return { ref: null, count: 0, refs };
+    }
+
+    const numbers = Array.isArray(call.bare) ? call.bare : [];
+    const repo = numbers.length > 0 ? threadAt(data, call.c, call.at)?.repo : undefined;
 
     return {
-        ref: typeof repo === "string" && REPO.test(repo) ? `${repo}#${bare[0]}` : null,
+        ref: typeof repo === "string" && REPO.test(repo) ? `${repo}#${numbers[0]}` : null,
         count: 0,
         refs,
     };
@@ -235,7 +248,8 @@ export function callPr(call, data, owners = ownersOf(data)) {
  * of the latest earlier call to the same name in the same session), `head` (the call's own) and `reviewedHead` (the
  * call's own head; else the `reviewedHead` of the latest earlier call to the same name in the same session, when that
  * call has the same `pr.ref`; else null). No window filter here: a spawn before the window still sets the round, the
- * PR and the reviewed head of a later send.
+ * PR and the reviewed head of a later send. Round calls use only named desk-owner refs, not bare PR numbers, before
+ * send inheritance. `exempt` is true only for a round call with `compat === true`.
  */
 function reviewCalls(data) {
     const owners = ownersOf(data);
@@ -251,17 +265,18 @@ function reviewCalls(data) {
     return calls.map((call) => {
         const key = `${call.c}\u0000${call.name}`;
         let round = false;
-        let pr = callPr(call, data, owners);
 
         if (call.action === "spawn") {
             round = isCrossReviewSpawn(call);
             latestSpawn.set(key, round);
         } else if (call.action === "send") {
             round = latestSpawn.get(key) === true;
+        }
 
-            if (pr.ref === null && pr.count === 0 && latestPr.has(key)) {
-                pr = latestPr.get(key);
-            }
+        let pr = callPr(call, data, owners, !round);
+
+        if (call.action === "send" && pr.ref === null && pr.count === 0 && latestPr.has(key)) {
+            pr = latestPr.get(key);
         }
 
         const head = typeof call.head === "string" ? call.head : null;
@@ -271,18 +286,19 @@ function reviewCalls(data) {
         latestPr.set(key, pr);
         latestHead.set(key, { ref: pr.ref, head: reviewedHead });
 
-        return { call, key, round, pr, head, reviewedHead };
+        return { call, key, round, pr, head, reviewedHead, exempt: round && call.compat === true };
     });
 }
 
 /**
  * The reviewed heads of the window, oldest first: each round call (a call `at` or after `now` minus
- * `REVIEW_WINDOW_DAYS`) as `{ ref, head, chain, at, session, reviewer, superseded }`. `head` is the call's
+ * `REVIEW_WINDOW_DAYS`) as `{ ref, head, chain, at, session, reviewer, superseded, exempt }`. `head` is the call's
  * `reviewedHead`; `chain` is the key of its session and name. A round call is `superseded` when the answers source is
  * usable (`data.reviewAnswers` is an array, and `data.sourceErrors.reviewAnswers` is not set), the next call of its
- * chain is a round with the same PR, and no answer of the chain has a time from the call's to the next call's (both
- * included): the reviewer got the next message in the same run, so the call is no reviewed head of its own. Without a
- * usable answers source, no call is superseded.
+ * chain is a non-exempt round with the same PR, and no answer of the chain has a time from the call's to the next
+ * call's (both included): the reviewer got the next message in the same run, so the call is no reviewed head of its
+ * own. Without a usable answers source, no call is superseded. `exempt` marks a compatibility check, not a reviewed
+ * head to count.
  */
 export function reviewedHeads(data, ctx) {
     const from = ctx.now - REVIEW_WINDOW_DAYS * DAY;
@@ -315,6 +331,7 @@ export function reviewedHeads(data, ctx) {
             usable &&
             after !== undefined &&
             after.round &&
+            !after.exempt &&
             after.pr.ref === item.pr.ref &&
             !(answersOf.get(item.key) ?? []).some((at) => at >= item.call.at && at <= after.call.at)
         );
@@ -330,6 +347,7 @@ export function reviewedHeads(data, ctx) {
             session: item.call.c,
             reviewer: item.call.name,
             superseded: superseded(item),
+            exempt: item.exempt,
         }));
 }
 
