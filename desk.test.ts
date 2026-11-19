@@ -614,6 +614,19 @@ describe("threads", () => {
 });
 
 describe("brief desk reads", () => {
+    test("the prompt change has a pre-registered beacon hypothesis", () => {
+        const beacon = readFileSync(join(import.meta.dirname, "docs", "beacon.md"), "utf8");
+
+        assert.match(beacon, /## Brief desk read prompt \(pre-registered 2026-11-18\)/);
+        assert.match(beacon, /18,000,000 characters in 4,127 `desk` tool results/);
+        assert.match(
+            beacon,
+            /617,000,000 tokens in Clerk sessions and 468,000,000 tokens in Supervisor sessions/,
+        );
+        assert.match(beacon, /at least 50% of brief reads are followed by\s+a full read/);
+        assert.match(beacon, /Review after 1 complete 7-day window, on\s+\*\*2026-11-25\*\*/);
+    });
+
     test("report prefixes keep the exact limit and mark only truncated text", () => {
         const atLimit = "x".repeat(300);
 

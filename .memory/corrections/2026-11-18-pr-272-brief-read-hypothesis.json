@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-18",
+  "scope": "desk",
+  "correction": "Pre-register a prompt hypothesis with the cost metric, baseline, quality guard, sample minimum, and review date before changing routine desk-read instructions.",
+  "evidence": "bketelsen/pi-pocket-team#272, owner review of d6518ac required a docs/beacon.md hypothesis for the prompt-only change.",
+  "promoted_to": "desk.test.ts"
+}

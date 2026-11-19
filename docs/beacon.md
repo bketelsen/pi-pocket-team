@@ -84,6 +84,37 @@ affected-agent/repository aggregate fails. Undo the rule if the quality guard fa
 share above 150,000 tokens are descriptive and cannot alone keep or undo the rule. Record the numbers, confounders and
 the keep/undo/extend decision here.
 
+## Brief desk read prompt (pre-registered 2026-11-18)
+
+**Hypothesis.** Routine Supervisor and Clerk thread reads use `desk read` with `brief: true`; full reads stay
+for details needed to make a decision. The shorter prompt results should reduce repeated Desk context without
+causing more escalations or routine full-read retries. [PR #272](https://github.com/bketelsen/pi-pocket-team/pull/272)
+changes no read API, authorization, stored field or result format.
+
+**Metric and baseline.** For `2026-11-11` through `2026-11-18`, Clerk and Supervisor sessions produced
+18,000,000 characters in 4,127 `desk` tool results: p50 3,400 characters and p90 10,000 characters. Digest-turn
+request context was 617,000,000 tokens in Clerk sessions and 468,000,000 tokens in Supervisor sessions. After
+install, report the same character counts, percentiles, result count and digest-turn context by role for the first
+full 7-day window. Also report total report lines, Clerk escalations per 100 report lines, and the share of turns
+that read a brief result and then read the same thread in full in that turn.
+
+**Success and quality guard.** There is no fixed character or token reduction threshold. Keep the prompt unless
+the Clerk escalation rate rises above its matched pre-install rate, or at least 50% of brief reads are followed by
+a full read of the same thread in the same turn; that follow-up rate means the brief form does not avoid the full
+context for most routine reads. The pre-install comparison uses the same 7-day duration and role split. Keep a
+lower result size only when the quality guard holds.
+
+**Collection and confounders.** Pocket session entries already hold `desk` tool calls and results, digest-turn
+usage, and report and escalation events; no new store or field is needed. Split the comparison by role, model,
+repository and task kind. Name traffic volume, the fresh-session rule, the message clock trial, Clerk rotation,
+#266, and other prompt or compaction changes as confounders.
+
+**Minimum sample and review.** Record the install time and commit. Review after 1 complete 7-day window, on
+**2026-11-25** if the change installs on 2026-11-18. Extend the review date if a complete window is not available.
+The review needs at least 100 `desk` results and 20 report lines in each role. If either role is below its sample
+minimum, extend rather than claim a result. Keep unless the quality guard fails; undo if it fails; record the
+numbers and the keep, undo or extend decision here.
+
 ## 1. Collect
 
 **Principle.** Record as much as possible at the moment it happens: cheaply, durably, and in a store that exists.
