@@ -150,6 +150,15 @@ The result starts with one of:
 
 The [implementation](../../team.ts) and [deterministic tests](../../team.test.ts) define the behavior. See also the [user summary](../../site/content/modules/team.md#wait-for-ci).
 
+## Tools in a subagent
+
+A subagent keeps the tools of the extensions it runs with, Team's too, but Pi Pocket gives it no linked sessions: it is no session in Pocket's list (`pocket.sessions`), and its final answer goes to the session that started it. Pocket refuses its linked-session calls with words that do not say so ("Linked sessions need a session where Pi works for someone.", "No linked session has that address here."). The daily audit (check A4) found subagents that called `team_sessions` again and again after that refusal.
+
+- The descriptions of `team_sessions` and `team_message` say "Not in a subagent", and that the final answer goes to the session that started it.
+- When Pocket refuses `team_sessions` or `team_message` and the caller is not in `pocket.sessions`, the error is `<tool> does not work in a subagent: a subagent has no linked sessions. Put your result in your final answer: it goes to the session that started you.` (`subagentText` in `team.ts`). A session, an empty list or a failed read keeps Pocket's own words. Team reads the list only after a refusal.
+
+[`team-subagent.test.ts`](../../team-subagent.test.ts) covers both tools in a subagent and in a session, and the descriptions.
+
 ## Agent homes
 
 An agent can have a home: 1 folder of its own, such as `~/agents/duncan`, with an AGENTS.md, `notes/`, `plans/` and `reports/`, apart from every repository. The profile names it with `home:`. A home is a local git repository with no remote, and it never gets a worktree.

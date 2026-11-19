@@ -1650,6 +1650,38 @@ const PocketSubagents = defineDoc<{ agents: JsonObject; reporters: JsonObject }>
     initial: () => ({ agents: {}, reporters: {} }),
 });
 
+/** The words a subagent gets from `tool`, a tool of linked sessions: what to do instead. */
+export function subagentText(tool: string): string {
+    return `${tool} does not work in a subagent: a subagent has no linked sessions. Put your result in your final answer: it goes to the session that started you.`;
+}
+
+/**
+ * The error of a refused linked-session call. Pi Pocket gives a subagent no linked sessions (it is no session in
+ * `pocket.sessions`), and its refusal ("Linked sessions need a session where Pi works for someone.", or "No linked
+ * session has that address here.") does not say that the caller is a subagent. So for a subagent the error is
+ * `subagentText(tool)`. Any other caller, an empty list, or a read that fails keeps the original error. Read only on
+ * the error path: a call that works reads nothing more.
+ */
+export async function linkedError(
+    tool: string,
+    error: unknown,
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+): Promise<unknown> {
+    try {
+        const items = (await read.snapshot(PocketSessions, context))?.items ?? {};
+
+        if (Object.keys(items).length > 0 && items[String(conversationId)] === undefined) {
+            return new Error(subagentText(tool));
+        }
+    } catch {
+        // The original error is the better answer than a guess.
+    }
+
+    return error;
+}
+
 /** The 3 tools of the `mcp` gallery module (TannerMidd/pocket-mcp): each names an MCP server in `server`. */
 export const MCP_TOOLS: readonly string[] = ["mcp_tools", "mcp_call", "mcp_call_read_only"];
 
@@ -5642,7 +5674,7 @@ export default function createTeam(host: Host, web: Web) {
     const message = defineTool({
         name: "team_message",
         description:
-            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A done or blocked report must send asks: [] when there is no decision. A plain merge or install request is no ask. List in prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }: the desk puts each on your thread, so Brian finds it in Ready to merge.",
+            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A done or blocked report must send asks: [] when there is no decision. A plain merge or install request is no ask. List in prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }: the desk puts each on your thread, so Brian finds it in Ready to merge. Not in a subagent: its final answer goes to the session that started it.",
         parameters: Type.Object({
             to: Type.String(),
             message: Type.String({ minLength: 1, maxLength: MESSAGE_LIMITS.message }),
@@ -5841,12 +5873,22 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             if (filed?.held !== true) {
-                await linkedSend(
-                    host,
-                    api.conversationId,
-                    { to: args.to, message: filed?.line ?? text },
-                    key,
-                );
+                try {
+                    await linkedSend(
+                        host,
+                        api.conversationId,
+                        { to: args.to, message: filed?.line ?? text },
+                        key,
+                    );
+                } catch (error) {
+                    throw await linkedError(
+                        "team_message",
+                        error,
+                        api,
+                        api.conversationId,
+                        context,
+                    );
+                }
             }
 
             // A desk that predates asks files none: the text still carries them.
@@ -6051,11 +6093,23 @@ export default function createTeam(host: Host, web: Web) {
         defineTool({
             name: "team_sessions",
             description:
-                "List linked teammates and their addresses when needed for the current task.",
+                "List linked teammates and their addresses when needed for the current task. Not in a subagent: a subagent has no linked sessions, and its final answer goes to the session that started it.",
             parameters: Type.Object({}),
             replay: "safe",
-            execute: async (_args, api) => {
-                const sessions = await host.linkedSessions.list(api.conversationId);
+            execute: async (_args, api, context) => {
+                let sessions: Awaited<ReturnType<typeof host.linkedSessions.list>>;
+
+                try {
+                    sessions = await host.linkedSessions.list(api.conversationId);
+                } catch (error) {
+                    throw await linkedError(
+                        "team_sessions",
+                        error,
+                        api,
+                        api.conversationId,
+                        context,
+                    );
+                }
 
                 return reply(
                     sessions
