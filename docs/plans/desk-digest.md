@@ -86,7 +86,7 @@ reload.
 ## 5. The message
 
 ```
-[desk] digest: 4 new. Read each with desk read <id> before you act.
+[desk] digest: 4 new. Read each with desk read <id> and brief: true before you act. Use a full read only when you need its details to make a decision.
 [desk] T12 frostyard/x · lucilla reported (420 chars) · desk read T12 · "PR #41 merged, …"
 [desk] T36 frostyard/y · closed: done, nothing remains · 1 report · desk read T36
 [desk] T35 · waits on you: silent session · desk read T35
