@@ -220,6 +220,17 @@ Selecting a person stores their identity in that conversation. It persists acros
 
 Pi Pocket sets the child's actual working directory before the first request: project instructions, relative file tools, shell commands, and folder navigation use the destination. Odrade's session is unchanged. The normal linked-session return address carries reports back across folders.
 
+**Structured review evidence.** `team_message` also takes optional `review: { kind, outcome, reviewer, ref?, head? }`.
+Kinds are `cross-review`, `owner-review` and `plan-review`; outcomes are `ready`, `not-ready` and `unclear`.
+PR reviews give both the `owner/name#N` ref and its reviewed 40-character lowercase head SHA; no-PR reviews omit both.
+The Desk supplies the time and replay key, and records the verdict on the thread and report in 1 commit.
+It shows current/superseded/stale status on read, list, the page and digests. A Ready-only report needs no prose
+escalation; Not-ready and unclear go urgently by default. Explicit status and asks still count. Whole-plan
+verification records the verdict with `plan verify` instead. An older Desk, or a message that is not a report on a
+Desk-tracked task, refuses structured review submission rather than silently losing it. For GitHub owner reviews,
+the reviewer task explicitly submits `kind: "owner-review"` after the review; no arbitrary GitHub prose implies Ready.
+See [Desk's schema and required call path](desk.md#structured-review-verdicts). Old reports remain valid.
+
 **What a report carries.** A linked session reports with `team_message`: `message`, `status` (`done`, `working`, or `blocked`), `asks` (at most 4 decisions for Brian, each a `question` with optional 2 to 6 `options`), and `prs` (at most 100, each `{ repo, number }` with `repo` as `owner/name`): the PRs the task created, changed, reviewed, or labelled. The desk checks each PR and puts it on the thread, so Brian finds it in Ready to merge, and the tool result names each one it attached or refused. The identity text asks each agent to list them, or to send `prs: []` when there is none. A message that is no report on a thread attaches none. See [Desk](desk.md#what-these-parts-do).
 
 **The built-in `ask` tool in a linked task.** An agent's identity text tells it never to call the built-in `ask` tool in a linked task: its card waits only in that session, and the desk does not see it, so each decision goes in the asks of `team_message`. A planning session (the session of a desk thread with `origin: "plan"`) gets 1 exception after that rule: in its own chat, it uses the built-in `ask` tool for a pick-one question to Brian, with the recommended option first, because Brian talks with it there before the plan is written. Team asks the desk's optional `planning` (no write) for each request's identity section, and the plan start's first message carries the exception too. A task session, a consult and every other linked task keep the rule with no exception; with no desk, an older desk, or a read that fails, no session gets it. See [plan threads, section 7.4](../plans/plan-threads.md#74-the-wake-ups).

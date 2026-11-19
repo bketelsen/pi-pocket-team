@@ -607,6 +607,11 @@ When every task is `done`, the desk sets `verifying` and sends `plan-verify` at 
   back to `ready` (their attempts stay as they ended); their repairs are new attempts in new task threads, and the next
   `verify` is a re-review. Past the budget, the plan waits on Brian (an ask).
 - `plan verify` records the round. A pass closes the plan thread as `verified`; the journal gets its 1 entry.
+- The same commit records a structured `plan-review` verdict on the plan thread: the round's time, reviewer and
+  replay key, with `ready` for a pass and `not-ready` for a fail, without a PR ref. The Ready digest is routine;
+  a fail adds urgent `review-blocked` news beside the existing repair/budget flow. Do not submit a duplicate
+  `team_message.review` from a verification thread. A drafting-plan review can submit that field, including
+  `unclear`. See [Desk's structured contract](../modules/desk.md#structured-review-verdicts).
 
 ## 10. What it reuses
 

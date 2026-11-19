@@ -2105,6 +2105,20 @@ export default function setup(pocket) {
                                             ${thread.queued.map((line) => html`<li>${line}</li>`)}
                                         </ul>`
                           }
+                          ${
+                              (thread.reviews ?? []).length === 0
+                                  ? null
+                                  : html`
+                              <h3>Reviews</h3>
+                              <ul class="desk-list small">${thread.reviews.map(
+                                  (review) => html`<li>
+                                  ${review.kind}: <strong>${review.outcome}</strong>
+                                  · ${review.stale ? "stale (PR head differs or is unknown) · " : ""}${review.ended ? "PR merged or closed · " : ""}${review.current ? "current" : review.ended || (review.stale && review.outcome === "ready") ? "not current" : "superseded"}
+                                  · reviewer ${JSON.stringify(review.reviewer)} · ${new Date(review.at).toISOString()}
+                                  <div class="mono">${review.ref ? `${review.ref}@${review.head}` : "no PR"}</div>
+                              </li>`,
+                              )}</ul>`
+                          }
                           <h3>Asks</h3>
                           ${
                               thread.asks.length === 0

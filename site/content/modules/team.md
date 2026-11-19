@@ -50,6 +50,18 @@ Before each desk-tracked start (a task, a shift, the Clerk, a plan, a plan consu
 
 The Desk's goal board starts its shift rows through Team too, with `startShift`: the same start as `team_delegate` with `shift`, from the supervisor's session, under the board's key, with the row's end as the shift's absolute stop (`until_at`): a wait before round 1 never moves it. A model's `team_delegate` cannot set `until_at`. A replay of the key starts nothing again. The board's start never takes the desk's last free slots or Brian's OKs, and a start whose result is unknown (Pocket's start threw) is never tried again by itself.
 
+## Explicit review reports
+
+A Desk-tracked reviewer task submits `team_message.review` with `kind` (`cross-review`, `owner-review` or
+`plan-review`), `outcome` (`ready`, `not-ready` or `unclear`), and `reviewer`. PR reviews give both `ref`
+(`owner/name#N`) and the reviewed `head` SHA; no-PR work omits both. The Desk adds the time and replay key.
+Ready alone needs no prose escalation; Not-ready and unclear go urgently by default. Old reports remain valid.
+An older Desk, or a message that is not a tracked report, refuses explicit verdicts instead of losing them.
+
+Whole-plan verification uses `plan verify`, not a duplicate report. GitHub owner reviews need an explicit
+`owner-review` submission from the reviewer task; arbitrary GitHub prose never implies Ready.
+See [Desk review verdicts](desk.md#review-verdicts) for stale-head and display rules.
+
 ## Wait for CI
 
 `team_wait_for_ci` returns a PR's CI result in the same call, without later watch messages. It is available in ordinary sessions and always supplied to subagents with a tool list when Team is enabled there. Only that tool call waits; other sessions keep running.
