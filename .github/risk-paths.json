@@ -116,6 +116,11 @@
             "glob": "bench/lib/sandbox.mjs",
             "level": "L1",
             "why": "secrets and credentials: binds the real auth.json into the bench sandbox with write access"
+        },
+        {
+            "glob": "_desk-dashboard.ts",
+            "level": "L1",
+            "why": "secrets and credentials: sends Pi's Anthropic OAuth token to the usage endpoint and keeps it out of errors"
         }
     ]
 }

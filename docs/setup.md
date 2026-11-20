@@ -5,8 +5,8 @@ version is [Install into Pi Pocket](https://bketelsen.github.io/pi-pocket-team/g
 
 ## Requirements
 
-- Pi Pocket v0.21.0 or later (Pi Durable 1.4: `runtime.sleepUntil` and `checkpointWhen`). It includes the linked-session working directory (PR #112) that Team delegation needs.
-- `team.ts`, `desk.ts` and `terminal.ts` declare `pocketApi = 2`, Pi Pocket's extension API version; the other modules declare none, and Pocket counts a module with none as version 1. Version 2 came with Pi Pocket v0.19.0, so the v0.21.0 floor above covers every module. A Pocket with a newer API version may refuse them or break them.
+- Pi Pocket v0.21.0 or later for every module (Pi Durable 1.4: `runtime.sleepUntil` and `checkpointWhen`). It includes the linked-session working directory (PR #112) that Team delegation needs. The model router needs v0.22.0 or later (its settings), and the events bridge needs v0.29.0 or later (`host.inbox`).
+- `team.ts`, `desk.ts`, `terminal.ts` and `events-bridge.ts` declare `pocketApi = 2`, Pi Pocket's extension API version; the other modules declare none, and Pocket counts a module with none as version 1. Version 2 came with Pi Pocket v0.19.0, so the API version needs no floor past those above. A Pocket with a newer API version may refuse them or break them.
 - Node.js 24, the one Pocket runs on.
 - A Pi Pocket checkout for the tests: `../pi-pocket-live` by default when it is a checkout, else `../pi-pocket`.
 
@@ -17,7 +17,7 @@ Clone this repository next to a Pi Pocket checkout, or set `PI_POCKET_CHECKOUT` 
 ```sh
 npm run link       # make node_modules, _pocket.d.ts, and _pocket point into the checkout
 npm test           # node --test, plus node --check of the browser modules
-npm run typecheck  # types of team.ts, homewiki.ts, night-shift.ts, desk.ts, and terminal.ts
+npm run typecheck  # the types of every file in tsconfig.json
 npm run lint       # Prettier and ESLint, Pi Pocket's config (npm run format fixes)
 make verify        # the template gate, then lint, tests, and type check (CI runs make ci)
 ```
