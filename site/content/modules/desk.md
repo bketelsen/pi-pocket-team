@@ -2,7 +2,7 @@
 
 One thread for each piece of work the team runs in the background: T13, T14, … A thread holds the work, its agents, its repository, its PRs, its asks, its dated check, its events and its reports. `team_delegate` opens the thread before the linked session starts, and the desk closes it when every part is closed.
 
-Files: `desk.ts`, `_tool-time.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `team_message`; the page is "Desk" on the rail, with a badge.
+Files: `desk.ts`, `_tool-time.ts`, the helpers `_desk-usage.ts`, `_desk-dashboard.ts`, `_desk-metrics.ts`, `_desk-board.ts` and `_desk-meter.ts`, and `desk-web/`. The tools are `desk`, `team_delegate` and `team_message`; the page is "Desk" on the rail, with a badge.
 
 ## The page
 

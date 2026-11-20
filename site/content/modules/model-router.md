@@ -2,7 +2,7 @@
 
 Every delegation can get a suggestion of the model that would suit its brief. The router sends the brief to TypeSafe Jev, which judges the work, and it records the tier and the model it would pick, with the brief's features. In the default mode `shadow` it is a record: nothing else changes. An eligible shift also gets the band of the bench's frozen rule, and in mode `assign`, on a band Brian made live, a worker.
 
-Files: `model-router.ts`. It has no page of its own; the route goes on the desk thread.
+Files: `model-router.ts` and `router-rule-v1.json` (the frozen rule v1, a copy of `bench/rule-v1.json`). It has no page of its own; the route goes on the desk thread.
 
 ## 3 rules
 

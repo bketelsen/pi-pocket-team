@@ -12,7 +12,7 @@ hide:
 
 # pi-pocket-team
 
-<p class="fy-hero__lede">Drop-in extensions for Pi Pocket, written for Brian Ketelsen's own server and shared as they are. Seven modules extend one server: named agents that delegate work, a desk that keeps the work in the background, GitHub webhooks that wake the desk, shifts that work in rounds at any hour, a wiki page, a terminal page, and a model router that records, and assigns a worker only on a tier Brian makes live.</p>
+<p class="fy-hero__lede">Drop-in extensions for Pi Pocket, written for Brian Ketelsen's own server and shared as they are. Eight modules extend one server: named agents that delegate work, a desk that keeps the work in the background, GitHub webhooks that wake the desk, shifts that work in rounds at any hour, a wiki page, a terminal page, a model router that records, and assigns a worker only on a tier Brian makes live, and an events bridge that brings lodge's app events to named agents.</p>
 
 [Install into Pi Pocket →](getting-started/install.md){ .md-button .md-button--primary }
 [Build and test](contributing/build.md){ .md-button }
